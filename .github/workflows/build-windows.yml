@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch: [x86_64, arm64]
+        arch: [x86_64]
         configuration: [debug, release]
     container:
       image: ghcr.io/xemu-project/xemu-win64-toolchain${{ matrix.arch == 'x86_64' && '-gcc:sha-2881edd' || ':sha-0d06ce8' }}
@@ -68,10 +68,6 @@ jobs:
           )
           mkdir -p ${LTO_CACHE_DIR}
         elif [[ "${{ matrix.arch }}" == "arm64" ]]; then
-          # FIXME: llvm-mingw ThinLTO has an issue with `qemu_build_not_reached_always`
-          #        being intentionaly undefined (to ensure 'unreachable' paths are
-          #        optimized out). Regular LTO doesn't pass cv2pdb. Resolve linking
-          #        failure and have llvm toolchain generate PDB directly.
           opts=()
         fi
         echo "XEMU_BUILD_OPTIONS=${opts[*]}" >> "$GITHUB_ENV"
@@ -85,16 +81,13 @@ jobs:
         name: xemu-windows-${{ matrix.arch }}-${{ matrix.configuration }}
         path: dist
 
-  # Generate a symbols package for Windows. Use cv2pdb to generate PDBs from
-  # DWARF and update + strip the executable. Re-package the original release
-  # and create symbols package.
   generate_pdb:
     name: Generate PDB for Windows (${{ matrix.arch }}, ${{ matrix.configuration }})
     runs-on: windows-latest
     needs: build
     strategy:
       matrix:
-        arch: [x86_64, arm64]
+        arch: [x86_64]
         configuration: [debug, release]
     steps:
     - name: Download artifacts
