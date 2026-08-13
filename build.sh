@@ -196,7 +196,13 @@ case "$platform" in # Adjust compilation options based on platform
     Linux)
         echo 'Compiling for Linux...'
         sys_cflags='-Wno-error=redundant-decls'
-        sys_ldflags='-lSPIRV-Tools-opt -lSPIRV-Tools'
+        # Only link SPIRV-Tools explicitly when the system actually provides
+        # it. CI builds glslang/SPIRV-Tools as meson subprojects and has no
+        # system libSPIRV-Tools, where these flags fail the link with
+        # "cannot find -lSPIRV-Tools-opt".
+        if ldconfig -p 2>/dev/null | grep -q 'libSPIRV-Tools\.so'; then
+            sys_ldflags='-lSPIRV-Tools-opt -lSPIRV-Tools'
+        fi
         opts="$opts --disable-werror"
         postbuild='package_linux'
         ;;
