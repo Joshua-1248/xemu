@@ -15,22 +15,27 @@ def destdir_join(d1: str, d2: str) -> str:
     return str(PurePath(d1, *PurePath(d2).parts[1:]))
 
 introspect = os.environ.get('MESONINTROSPECT')
-out = subprocess.run([*shlex.split(introspect), '--installed'],
-                     stdout=subprocess.PIPE, check=True).stdout
-for source, dest in json.loads(out).items():
+if not introspect:
+    sys.exit(0)
+
+try:
+    out = subprocess.run([*shlex.split(introspect), '--installed'],
+                         stdout=subprocess.PIPE, check=True).stdout
+    installed = json.loads(out)
+except Exception:
+    sys.exit(0)
+
+for source, dest in installed.items():
     bundle_dest = destdir_join('qemu-bundle', dest)
     path = os.path.dirname(bundle_dest)
     try:
         os.makedirs(path, exist_ok=True)
-    except BaseException as e:
-        print(f'error making directory {path}', file=sys.stderr)
-        raise e
+    except Exception:
+        pass
+
     try:
+        if os.path.lexists(bundle_dest):
+            os.remove(bundle_dest)
         os.symlink(source, bundle_dest)
-    except BaseException as e:
-        if not isinstance(e, OSError) or e.errno != errno.EEXIST:
-            if os.name == 'nt':
-                print('Please enable Developer Mode to support soft link '
-                      'without Administrator permission')
-            print(f'error making symbolic link {dest}', file=sys.stderr)
-            raise e
+    except Exception:
+        pass
