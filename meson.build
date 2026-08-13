@@ -1884,6 +1884,22 @@ endif
 
 epoxy = dependency('epoxy', required: true)
 
+# Animated .webp texture replacements. libwebpdemux provides WebPAnimDecoder;
+# libwebp is its decode backend. Preferred over GIF for replacements since it
+# is lossless with full alpha rather than a 256-colour palette.
+# Optional: without them, .webp replacements are simply not recognised and
+# animated replacements fall back to .gif (decoded by the vendored stb_image,
+# which needs no library). Making this mandatory would break every build host
+# that lacks the package -- notably the Windows MXE cross toolchain image,
+# where adding a package means rebuilding and republishing the image.
+libwebp = dependency('libwebp', required: get_option('webp'))
+libwebpdemux = dependency('libwebpdemux', required: get_option('webp'))
+have_libwebp = libwebp.found() and libwebpdemux.found()
+if not have_libwebp
+  libwebp = not_found
+  libwebpdemux = not_found
+endif
+
 opengl = not_found
 if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
   # FIXME: Use meson's 'gl' dep
@@ -3383,6 +3399,7 @@ have_afalg = get_option('crypto_afalg') \
     }
   '''), error_message: 'AF_ALG requested but could not be detected').allowed()
 config_host_data.set('CONFIG_AF_ALG', have_afalg)
+config_host_data.set('CONFIG_LIBWEBP', have_libwebp)
 
 config_host_data.set('CONFIG_AF_VSOCK', cc.has_header_symbol(
   'linux/vm_sockets.h', 'AF_VSOCK',
@@ -4051,7 +4068,7 @@ if have_block
   endif
 endif
 
-specific_ss.add(files('xemu-xbe.c', 'xemu-version.c'))
+specific_ss.add(files('xemu-xbe.c', 'xemu-version.c', 'xemu-guestmem.c', 'xemu-dbg.c'))
 
 common_ss.add(genconfig)
 

@@ -47,14 +47,21 @@
 #include "notifications.hh"
 #include "monitor.hh"
 #include "debug.hh"
+#include "disassembler.hh"
 #include "welcome.hh"
 #include "menubar.hh"
 #include "compat.hh"
+#include "codes.hh"
+
+extern "C" {
+#include "hw/xbox/nv2a/pgraph/gl/texture-io.h"
+}
 #if defined(_WIN32)
 #include "update.hh"
 #endif
 
 bool g_screenshot_pending;
+bool g_texture_reload_pending;
 const char *g_snapshot_pending_load_name;
 
 float g_main_menu_height;
@@ -219,6 +226,16 @@ void xemu_hud_update(void)
     ImGui::NewFrame();
     ProcessKeyboardShortcuts();
 
+    // Keep per-title texture dump/replacement paths in sync with the
+    // running XBE. Self-skips when the title has not changed.
+    nv2a_texture_io_refresh_paths();
+
+    // Apply enabled cheats and patches. Sits beside the texture path refresh
+    // because both key off the running XBE's title id and both are cheap
+    // no-ops when nothing changed. Must stay on this thread: it reaches
+    // dma_memory_write, which needs the BQL the UI thread already holds.
+    g_codes.Tick();
+
 #if defined(CONFIG_RENDERDOC)
     if (g_capture_renderdoc_frame) {
         nv2a_dbg_renderdoc_capture_frames(1, false);
@@ -304,12 +321,47 @@ void xemu_hud_update(void)
                 break;
             }
         }
+
+        // Texture dump / replacement hotkeys
+        if (ImGui::IsKeyPressed(
+                (enum ImGuiKey)g_config.general.texture_replace_toggle_key)) {
+            g_config.general.texture_replace_enabled =
+                !g_config.general.texture_replace_enabled;
+            g_texture_reload_pending = true;
+            xemu_queue_notification(
+                g_config.general.texture_replace_enabled ?
+                    "Texture replacements: ON" :
+                    "Texture replacements: OFF");
+        }
+
+        if (ImGui::IsKeyPressed(
+                (enum ImGuiKey)g_config.general.texture_replace_reload_key)) {
+            g_texture_reload_pending = true;
+            xemu_queue_notification("Reloading texture replacements");
+        }
+
+        if (ImGui::IsKeyPressed(
+                (enum ImGuiKey)g_config.general.texture_dump_toggle_key)) {
+            g_config.general.texture_dump_enabled =
+                !g_config.general.texture_dump_enabled;
+            if (g_config.general.texture_dump_enabled) {
+                /* Rescan so textures deleted from disk are dumped again. */
+                nv2a_texture_io_rebuild_dump_index();
+            }
+            xemu_queue_notification(
+                g_config.general.texture_dump_enabled ?
+                    "Texture dumping: STARTED" :
+                    "Texture dumping: STOPPED");
+        }
     }
 
     first_boot_window.Draw();
     monitor_window.Draw();
     apu_window.Draw();
     video_window.Draw();
+#if XEMU_ENABLE_DISASSEMBLER
+    disassembler_window.Draw();
+#endif
     compatibility_reporter_window.Draw();
 #if defined(_WIN32)
     update_window.Draw();
@@ -335,5 +387,14 @@ void xemu_hud_render()
     if (g_screenshot_pending) {
         SaveScreenshot(g_tex, g_flip_req);
         g_screenshot_pending = false;
+    }
+
+    if (g_texture_reload_pending) {
+        /* Rescan disk first so newly added files are picked up, then drop
+         * cached bindings so they are re-resolved against the new index. */
+        nv2a_texture_io_rebuild_replacement_index();
+        nv2a_texture_io_rebuild_dump_index();
+        nv2a_texture_cache_flush();
+        g_texture_reload_pending = false;
     }
 }

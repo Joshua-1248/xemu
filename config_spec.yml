@@ -19,6 +19,31 @@ general:
       f7: string
       f8: string
     filter_current_game: bool
+  texture_dump_enabled:
+    type: bool
+    default: false
+  texture_replace_enabled:
+    type: bool
+    default: false
+  texture_dump_skip_replaced:
+    type: bool
+    default: true
+  texture_dump_mipmaps:
+    type: bool
+    default: false
+  # Empty = use <xemu data dir>/textures/<TITLEID>/{dumps,replacements}
+  texture_dump_dir: string
+  texture_replace_dir: string
+  # ImGuiKey values (imgui.h, ImGuiKey_Tab = 512)
+  texture_dump_toggle_key:
+    type: integer
+    default: 600 # ImGuiKey_Slash  ( / )
+  texture_replace_toggle_key:
+    type: integer
+    default: 597 # ImGuiKey_Comma  ( , )
+  texture_replace_reload_key:
+    type: integer
+    default: 599 # ImGuiKey_Period ( . )
 
 input:
   bindings:
@@ -323,6 +348,23 @@ audio:
   volume_limit:
     type: number
     default: 1
+
+codes:
+  # Master switch. Per-cheat enabled flags live in the cheat files, not here,
+  # so turning this off stops everything without losing them.
+  enable:
+    type: bool
+    default: true
+  # Independent per kind, like texture_dump_dir / texture_replace_dir above.
+  # Empty = <xemu data dir>/codes/cheats/ and <xemu data dir>/codes/patches/.
+  # A set path is used as-is; no subfolder is appended.
+  cheats_dir: string
+  patches_dir: string
+  # How often enabled codes are re-applied, in ms. Re-applying at the frame
+  # rate is wasted work: a freeze only has to beat the game's own writes.
+  interval_ms:
+    type: integer
+    default: 16
 
 net:
   enable: bool

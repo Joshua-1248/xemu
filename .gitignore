@@ -26,3 +26,13 @@ build.log
 /macos-libs/
 /macos-pkgs/
 /xemu.iconset/
+*.bak
+*.orig.codes
+*.zip
+
+# Build output and artifacts
+build/
+dist/
+*.zip
+perf.data*
+perf-*.data

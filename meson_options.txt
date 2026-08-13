@@ -326,6 +326,8 @@ option('libvduse', type: 'feature', value: 'auto',
 option('vduse_blk_export', type: 'feature', value: 'auto',
        description: 'VDUSE block export support')
 
+option('webp', type: 'feature', value: 'auto',
+       description: 'WebP support for NV2A texture replacement')
 option('capstone', type: 'feature', value: 'auto',
        description: 'Whether and how to find the capstone library')
 option('fdt', type: 'combo', value: 'disabled',

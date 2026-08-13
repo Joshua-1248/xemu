@@ -1,8 +1,12 @@
 xemu_ss.add(files(
   'actions.cc',
   'animation.cc',
+  'cheatfile.cc',
+  'codes-engine.cc',
+  'codes.cc',
   'compat.cc',
   'debug.cc',
+  'disassembler.cc',
   'font-manager.cc',
   'gl-helpers.cc',
   'input-manager.cc',

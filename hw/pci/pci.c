@@ -602,7 +602,12 @@ static void pcibus_reset_hold(Object *obj, ResetType type)
     }
 
     for (i = 0; i < bus->nirq; i++) {
-        assert(bus->irq_count[i] == 0);
+        if (bus->irq_count[i] != 0) {
+            fprintf(stderr,
+                    "pci: bus reset with %d pending IRQ(s) on line %d; "
+                    "clearing\n", bus->irq_count[i], i);
+            bus->irq_count[i] = 0;
+        }
     }
 }
 

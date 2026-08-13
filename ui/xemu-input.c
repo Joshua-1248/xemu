@@ -260,6 +260,53 @@ static const char *get_bound_driver(int port)
 
 static const int port_map[4] = { 3, 4, 1, 2 };
 
+// Build a stable identifier used to remember/restore which port a controller
+// is bound to.
+//
+// Historically this was just the SDL GUID, which is derived from the
+// device's vendor/product/version IDs. That falls apart for adapters that
+// expose multiple logical controllers under an identical GUID -- e.g. a
+// USB<->PS2 dual adapter, where both ports report the same VID/PID and are
+// therefore indistinguishable by GUID alone. In that situation xemu could
+// only fall back to binding in connection order, which is not guaranteed to
+// be consistent across reconnects/relaunches and is exactly what caused
+// player 1/player 2 to keep swapping.
+//
+// To fix this, fold in SDL_GetJoystickPath() when it's available. On Linux
+// this reflects the underlying device node (evdev/hidraw) for that specific
+// logical interface, which stays tied to the physical port/interface on the
+// adapter rather than to enumeration order, so each PS2 port keeps a
+// distinct, stable key. If no path is available (some platforms/backends
+// don't provide one), we fall back to GUID-only, preserving old behavior.
+static char *xemu_input_get_bind_key(ControllerState *state)
+{
+    if (state == NULL) {
+        return g_strdup("");
+    }
+
+    if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
+        return g_strdup("keyboard");
+    }
+
+    if (state->type != INPUT_DEVICE_SDL_GAMEPAD) {
+        return g_strdup("");
+    }
+
+    char guid_buf[35] = { 0 };
+    SDL_GUIDToString(state->sdl_joystick_guid, guid_buf, sizeof(guid_buf));
+
+    const char *path = NULL;
+    if (state->sdl_joystick) {
+        path = SDL_GetJoystickPath(state->sdl_joystick);
+    }
+
+    if (path && path[0]) {
+        return g_strdup_printf("%s:%s", guid_buf, path);
+    }
+
+    return g_strdup(guid_buf);
+}
+
 void xemu_input_init(void)
 {
     if (g_config.input.background_input_capture) {
@@ -312,19 +359,35 @@ void xemu_input_init(void)
 
 int xemu_input_get_controller_default_bind_port(ControllerState *state, int start)
 {
-    char guid[35] = { 0 };
-    if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
-        SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
-    } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
-        snprintf(guid, sizeof(guid), "keyboard");
-    }
+    char *key = xemu_input_get_bind_key(state);
 
+    // First, look for an exact match (GUID+path for gamepads, or a config
+    // saved by a build that already stores GUID+path).
     for (int i = start; i < 4; i++) {
-        if (strcmp(guid, *port_index_to_settings_key_map[i]) == 0) {
+        if (strcmp(key, *port_index_to_settings_key_map[i]) == 0) {
+            g_free(key);
             return i;
         }
     }
 
+    // Fall back to matching on GUID alone. This covers configs saved before
+    // this key included the device path, as well as devices/platforms where
+    // no path is available.
+    if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+        char guid[35] = { 0 };
+        SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
+
+        for (int i = start; i < 4; i++) {
+            const char *saved = *port_index_to_settings_key_map[i];
+            if (strncmp(saved, guid, strlen(guid)) == 0 &&
+                (saved[strlen(guid)] == '\0' || saved[strlen(guid)] == ':')) {
+                g_free(key);
+                return i;
+            }
+        }
+    }
+
+    g_free(key);
     return -1;
 }
 
@@ -684,17 +747,11 @@ void xemu_input_bind(int index, ControllerState *state, int save)
         bound_controllers[index] = NULL;
     }
 
-    // Save this controller's GUID in settings for auto re-connect
+    // Save this controller's binding key in settings for auto re-connect
     if (save) {
-        char guid_buf[35] = { 0 };
-        if (state) {
-            if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
-                SDL_GUIDToString(state->sdl_joystick_guid, guid_buf, sizeof(guid_buf));
-            } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
-                snprintf(guid_buf, sizeof(guid_buf), "keyboard");
-            }
-        }
-        xemu_settings_set_string(port_index_to_settings_key_map[index], guid_buf);
+        char *key = xemu_input_get_bind_key(state);
+        xemu_settings_set_string(port_index_to_settings_key_map[index], key);
+        g_free(key);
         xemu_settings_set_string(port_index_to_driver_settings_key_map[index],
                                  bound_drivers[index]);
     }

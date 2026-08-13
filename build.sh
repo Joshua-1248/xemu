@@ -196,6 +196,7 @@ case "$platform" in # Adjust compilation options based on platform
     Linux)
         echo 'Compiling for Linux...'
         sys_cflags='-Wno-error=redundant-decls'
+        sys_ldflags='-lSPIRV-Tools-opt -lSPIRV-Tools'
         opts="$opts --disable-werror"
         postbuild='package_linux'
         ;;

@@ -34,6 +34,9 @@
 #include "../xemu-input.h"
 #include "../xemu-notifications.h"
 #include "../xemu-settings.h"
+extern "C" {
+#include "hw/xbox/nv2a/pgraph/gl/texture-io.h"
+}
 #include "../xemu-monitor.h"
 #include "../xemu-version.h"
 #include "../xemu-net.h"
@@ -737,6 +740,51 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
     }
 }
 
+// Click-to-capture hotkey binder. Stores raw ImGuiKey values so the value
+// can be compared directly against ImGui::IsKeyPressed() in the main loop.
+static void TextureHotkeyBinder(const char *label, int *key_value)
+{
+    static const char *capturing_label = nullptr;
+    bool capturing = (capturing_label == label);
+
+    const char *key_name = "(unset)";
+    if (!capturing && *key_value > 0) {
+        const char *n = ImGui::GetKeyName((ImGuiKey)*key_value);
+        if (n && n[0]) {
+            key_name = n;
+        }
+    }
+
+    ImGui::PushID(label);
+    ImGui::Text("%s", label);
+    ImGui::SameLine(ImGui::GetWindowWidth() * 0.5f);
+
+    char btn[128];
+    snprintf(btn, sizeof(btn), "%s##bind",
+             capturing ? "Press a key..." : key_name);
+
+    if (ImGui::Button(btn, ImVec2(ImGui::GetWindowWidth() * 0.35f, 0))) {
+        capturing_label = capturing ? nullptr : label;
+        capturing = !capturing;
+    }
+
+    if (capturing) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            capturing_label = nullptr;
+        } else {
+            for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END;
+                 k++) {
+                if (ImGui::IsKeyPressed((ImGuiKey)k)) {
+                    *key_value = k;
+                    capturing_label = nullptr;
+                    break;
+                }
+            }
+        }
+    }
+    ImGui::PopID();
+}
+
 void MainMenuDisplayView::Draw()
 {
     SectionTitle("Renderer");
@@ -833,6 +881,49 @@ void MainMenuDisplayView::Draw()
                  "4:3\0"
                  "16:9\0",
                  "Select the displayed aspect ratio");
+
+    SectionTitle("Texture Packs");
+    if (Toggle("Dump textures", &g_config.general.texture_dump_enabled,
+               "Write decoded textures to the dump directory as they are used")) {
+        if (g_config.general.texture_dump_enabled) {
+            nv2a_texture_io_rebuild_dump_index();
+        }
+    }
+    Toggle("Use texture replacements",
+           &g_config.general.texture_replace_enabled,
+           "Load replacement textures from the replacements directory");
+    Toggle("Skip already-replaced textures when dumping",
+           &g_config.general.texture_dump_skip_replaced,
+           "Do not dump textures that already have a replacement");
+    Toggle("Dump mipmaps", &g_config.general.texture_dump_mipmaps,
+           "Also dump smaller mip levels, not just the full-size texture");
+
+    FilePicker("Texture dump directory", g_config.general.texture_dump_dir,
+               nullptr, 0, true, [](const char *path) {
+                   xemu_settings_set_string(&g_config.general.texture_dump_dir,
+                                            path);
+                   nv2a_texture_io_refresh_paths();
+               });
+    FilePicker("Texture replacement directory",
+               g_config.general.texture_replace_dir, nullptr, 0, true,
+               [](const char *path) {
+                   xemu_settings_set_string(
+                       &g_config.general.texture_replace_dir, path);
+                   nv2a_texture_io_refresh_paths();
+               });
+
+    ImGui::Dummy(ImVec2(0, ImGui::GetStyle().WindowPadding.y));
+    ImGui::TextWrapped(
+        "Leave directories blank to use the default location inside the xemu "
+        "data directory. A per-title subfolder is always added.");
+    ImGui::Dummy(ImVec2(0, ImGui::GetStyle().WindowPadding.y));
+
+    TextureHotkeyBinder("Toggle dumping",
+                        &g_config.general.texture_dump_toggle_key);
+    TextureHotkeyBinder("Toggle replacements",
+                        &g_config.general.texture_replace_toggle_key);
+    TextureHotkeyBinder("Reload replacements",
+                        &g_config.general.texture_replace_reload_key);
 }
 
 void MainMenuAudioView::Draw()
@@ -1470,6 +1561,7 @@ void MainMenuSnapshotsView::DrawSnapshotContextMenu(
                 xemu_settings_set_string(g_snapshot_shortcut_index_key_map[i],
                                          snapshot->name);
                 current_snapshot_binding = i;
+                xemu_settings_save();
 
                 ImGui::CloseCurrentPopup();
             }
@@ -1483,6 +1575,7 @@ void MainMenuSnapshotsView::DrawSnapshotContextMenu(
                     g_snapshot_shortcut_index_key_map[current_snapshot_binding],
                     "");
                 current_snapshot_binding = -1;
+                xemu_settings_save();
             }
         }
         ImGui::EndMenu();
@@ -1711,6 +1804,7 @@ MainMenuScene::MainMenuScene()
       m_input_button("Input", ICON_FA_GAMEPAD),
       m_display_button("Display", ICON_FA_TV),
       m_audio_button("Audio", ICON_FA_VOLUME_HIGH),
+      m_codes_button("Codes", ICON_FA_SLIDERS),
       m_network_button("Network", ICON_FA_NETWORK_WIRED),
       m_snapshots_button("Snapshots", ICON_FA_CLOCK_ROTATE_LEFT),
       m_system_button("System", ICON_FA_MICROCHIP),
@@ -1722,6 +1816,7 @@ MainMenuScene::MainMenuScene()
     m_tabs.push_back(&m_input_button);
     m_tabs.push_back(&m_display_button);
     m_tabs.push_back(&m_audio_button);
+    m_tabs.push_back(&m_codes_button);
     m_tabs.push_back(&m_network_button);
     m_tabs.push_back(&m_snapshots_button);
     m_tabs.push_back(&m_system_button);
@@ -1731,6 +1826,7 @@ MainMenuScene::MainMenuScene()
     m_views.push_back(&m_input_view);
     m_views.push_back(&m_display_view);
     m_views.push_back(&m_audio_view);
+    m_views.push_back(&m_codes_view);
     m_views.push_back(&m_network_view);
     m_views.push_back(&m_snapshots_view);
     m_views.push_back(&m_system_view);
