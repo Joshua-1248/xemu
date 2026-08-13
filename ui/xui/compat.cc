@@ -16,7 +16,19 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
+#include <cstdint>
+#include <cstddef>
+#include <cinttypes>
+#include <cstring>
 #include <string>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include "common.hh"
 #include "compat.hh"
 #include "widgets.hh"
