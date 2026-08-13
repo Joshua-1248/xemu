@@ -89,9 +89,10 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get -qy update
-        sudo apt-get install ccache libfuse2 libusb-1.0-0-dev #clang-21 lld-21 llvm-21-dev
+        sudo apt-get install -qy ccache libfuse2 libusb-1.0-0-dev python3-packaging
         pushd src
         sudo apt-get -qy build-dep .
+        popd
     - name: Install LLVM 21
       shell: bash
       env:
@@ -100,8 +101,6 @@ jobs:
       run: |
         set -euxo pipefail
 
-        # Install the newest version that actually exists in the pool.
-        # We derive the exact version string from one known package filename.
         HTML="$(curl -fsSL --compressed "$POOL")"
         VER="$(grep -oE 'libllvm21_[0-9][^"]+_${{ env.ARCH }}\.deb' <<<"$HTML" | head -n1 \
           | sed -E 's/^libllvm21_//; s/_${{ env.ARCH }}\.deb$//')"
@@ -123,7 +122,6 @@ jobs:
           fetch "$pkg"
         done
 
-        # Install the downloaded LLVM debs. apt will resolve any non-LLVM deps from Ubuntu repos.
         sudo apt-get install -y --no-install-recommends ./*.deb
     - name: Setup ccache
       run: |
@@ -132,16 +130,15 @@ jobs:
         ccache -z
     - name: Compile
       run: |
-        # XXX: dpkg-genbuildinfo takes two minutes on GH runners. Nuke it for now.
-        sudo rm /usr/bin/dpkg-genbuildinfo
-        sudo ln -s /bin/true /usr/bin/dpkg-genbuildinfo
+        sudo rm -f /usr/bin/dpkg-genbuildinfo
+        sudo ln -sf /bin/true /usr/bin/dpkg-genbuildinfo
 
         pushd src
-        dpkg-buildpackage --no-sign -b
+        dpkg-buildpackage --no-sign -b -d
         popd
 
         mkdir -p deb
-        mv *.deb *.ddeb deb
+        mv *.deb *.ddeb deb 2>/dev/null || mv src/../*.deb deb/
     - name: Report ccache stats
       run: ccache -s
     - name: Generate AppImage
