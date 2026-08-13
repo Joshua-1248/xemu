@@ -17,6 +17,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 #include <inttypes.h>
+#include <cstdint>
+#include <cstddef>
 #include "debug.hh"
 #include "common.hh"
 #include "misc.hh"
@@ -480,7 +482,7 @@ void DebugVideoWindow::Draw()
         g_config.display.debug.video.transparency = m_transparent;
     }
     ImGui::End();
-    ImGui::PopStyleColor(5);
+    // Removed unbalanced ImGui::PopStyleColor(5);
 }
 
 DebugApuWindow apu_window;
