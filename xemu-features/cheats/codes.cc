@@ -22,6 +22,8 @@
 #include "xemu-xbe.h"
 #include "xemu-features/shared/guest-memory.h"
 
+#include <glib/gstdio.h>
+
 #include <cstdio>
 #include <cinttypes>
 
