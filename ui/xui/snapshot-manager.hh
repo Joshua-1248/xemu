@@ -29,6 +29,8 @@ public:
     bool m_load_failed;
     bool m_open_pending;
     int m_snapshots_len;
+    uint32_t m_last_refresh_ms;
+    bool m_refresh_requested;
 
     std::string m_pending_load_name;
     std::string m_current_disc_path;
@@ -37,6 +39,7 @@ public:
     SnapshotManager();
     ~SnapshotManager();
     void Refresh();
+    void RequestRefresh() { m_refresh_requested = true; }
     void LoadSnapshot(const char *name);
     void LoadSnapshotChecked(const char *name);
 

@@ -50,12 +50,28 @@ bool PageMap::rd32_phys(uint32_t pa, uint32_t *out) const
     return true;
 }
 
+void PageMap::Invalidate()
+{
+    /*
+     * Generation invalidation makes the once-per-apply reset O(1). A full
+     * unordered_map::clear() used to walk thousands of nodes and could free
+     * memory on the hottest Instantaneous-cheat path.
+     */
+    ++m_generation;
+    if (m_generation == 0) {
+        for (auto &entry : m_cache) {
+            entry.generation = 0;
+        }
+        m_generation = 1;
+    }
+}
+
 bool PageMap::ToPhys(uint32_t va, uint32_t *out) const
 {
-    uint32_t page = va >> 12;
-    auto it = m_cache.find(page);
-    if (it != m_cache.end()) {
-        *out = it->second + (va & 0xFFF);
+    const uint32_t page = va >> 12;
+    CacheEntry &entry = m_cache[page & (CACHE_ENTRIES - 1)];
+    if (entry.generation == m_generation && entry.page == page) {
+        *out = entry.base + (va & 0xFFF);
         return true;
     }
 
@@ -75,8 +91,11 @@ bool PageMap::ToPhys(uint32_t va, uint32_t *out) const
     }
     if (base >= m_ram_size) return false;
 
-    // Bounded, and cleared wholesale by Invalidate() when the guest re-pages.
-    if (m_cache.size() < 4096) m_cache[page] = base;
+    /* Direct-mapped, allocation-free cache. Collisions only cost another
+     * page-table walk; they can never change the translated result. */
+    entry.page = page;
+    entry.base = base;
+    entry.generation = m_generation;
     *out = base + (va & 0xFFF);
     return true;
 }
@@ -138,7 +157,7 @@ void Engine::W32(uint32_t off, uint32_t val)
 // _off() - fold the identity-mapped kernel window down to a RAM offset.
 bool Engine::RamOffset(uint32_t addr, uint32_t *out) const
 {
-    uint32_t maxb = m_mem->RamSize();
+    uint32_t maxb = m_ram_size;
     if (addr >= 0x80000000u && addr < 0x80000000u + maxb) {
         *out = addr - 0x80000000u;
         return true;
@@ -162,8 +181,9 @@ uint32_t Engine::PointerLines(const CodeList &codes, size_t idx)
 {
     if (idx + 1 >= codes.size()) return 1;
     uint32_t n = codes[idx + 1].cmd & 0xFF;
+    // NN is an 8-bit field: 0 preserves the legacy one-offset encoding, while
+    // 0x01..0xFF represent 1..255 offsets.
     if (n < 1) n = 1;
-    if (n > 8) n = 8;
     return 2 + (n / 2);
 }
 
@@ -227,24 +247,29 @@ bool Engine::TestCondition(uint32_t test, uint32_t mem_val, uint32_t cmp)
 
 bool Engine::EnsurePageMap()
 {
-    // The walker reads live tables on every lookup, so "staleness" reduces to
-    // dropping the small cache. The Python version compares a probe PDE first;
-    // clearing unconditionally here is cheaper than the probe read and cannot
-    // be wrong, only slightly slower.
+    // A block can contain many virtual conditions/pointer dereferences. The
+    // page tables are only invalidated once at the start of an apply pass, so
+    // validating the kernel page map repeatedly inside that same pass just
+    // rereads the same PDE/PTE. Cache that one validity result until the next
+    // explicit invalidation.
     if (m_pagemap_dirty) {
         m_pagemap.Invalidate();
         m_pagemap_dirty = false;
+        m_pagemap_checked = false;
     }
-    return m_pagemap.Valid();
+    if (!m_pagemap_checked) {
+        m_pagemap_valid = m_pagemap.Valid();
+        m_pagemap_checked = true;
+    }
+    return m_pagemap_valid;
 }
 
 // ---------------------------------------------------------------------------
 // Pointer chains
 // ---------------------------------------------------------------------------
 
-bool Engine::ResolvePhysicalChain(uint32_t base_off,
-                                  const std::vector<uint32_t> &offs,
-                                  uint32_t *out)
+bool Engine::ResolvePhysicalChain(uint32_t base_off, const uint32_t *offs,
+                                  size_t off_count, uint32_t *out)
 {
     // The base is physical, but every pointer *stored in guest memory* is a
     // guest virtual address - so each dereference folds back through the
@@ -252,11 +277,11 @@ bool Engine::ResolvePhysicalChain(uint32_t base_off,
     uint32_t cur;
     if (!R32(base_off, &cur) || cur == 0) return false;
 
-    for (size_t i = 0; i < offs.size(); i++) {
+    for (size_t i = 0; i < off_count; i++) {
         uint32_t ram;
         if (!RamOffset(cur, &ram)) return false;
         uint32_t target = ram + offs[i];
-        if (i == offs.size() - 1) {
+        if (i + 1 == off_count) {
             *out = target;
             return true;
         }
@@ -265,9 +290,8 @@ bool Engine::ResolvePhysicalChain(uint32_t base_off,
     return false;
 }
 
-bool Engine::ResolveVirtualChain(uint32_t base_va,
-                                 const std::vector<uint32_t> &offs,
-                                 uint32_t *out)
+bool Engine::ResolveVirtualChain(uint32_t base_va, const uint32_t *offs,
+                                 size_t off_count, uint32_t *out)
 {
     if (!EnsurePageMap()) return false;
 
@@ -275,9 +299,9 @@ bool Engine::ResolveVirtualChain(uint32_t base_va,
     if (!m_pagemap.ToPhys(base_va, &phys)) return false;
     if (!R32(phys, &cur) || cur == 0) return false;
 
-    for (size_t i = 0; i < offs.size(); i++) {
+    for (size_t i = 0; i < off_count; i++) {
         cur = (uint32_t)(cur + offs[i]);        // wraps at 32 bits, as Python's & 0xFFFFFFFF
-        if (i == offs.size() - 1) break;
+        if (i + 1 == off_count) break;
         if (!m_pagemap.ToPhys(cur, &phys)) return false;
         if (!R32(phys, &cur) || cur == 0) return false;
     }
@@ -374,8 +398,8 @@ size_t Engine::Type5(const CodeList &codes, size_t idx, uint32_t src_off,
     // short read writes a short buffer rather than nothing. Matched here, and
     // matched in the harness's FlatMemory, so a copy running off the end of RAM
     // behaves identically in both.
-    std::vector<uint8_t> buf(length);
-    size_t got = m_mem->ReadPartial(src_off, buf.data(), length);
+    m_copy_scratch.resize(length);
+    size_t got = m_mem->ReadPartial(src_off, m_copy_scratch.data(), length);
     // Called unconditionally, even for got == 0. The Python reference passes
     // whatever read_mem returned straight to write_mem without checking, so a
     // zero-length copy still performs a (no-op) write. Guarding it here made
@@ -383,7 +407,7 @@ size_t Engine::Type5(const CodeList &codes, size_t idx, uint32_t src_off,
     // ended up identical - and write COUNT is what the freeze loop and the
     // JIT invalidation cost scale with, so it is not a difference to paper
     // over.
-    m_mem->Write(dest_off, buf.data(), got);
+    m_mem->Write(dest_off, m_copy_scratch.data(), got);
     return idx + 2;
 }
 
@@ -397,15 +421,20 @@ size_t Engine::Type6(const CodeList &codes, size_t idx, uint32_t base,
     bool virtual_base  = ((hdr >> 24) & 0xFF) == 0x01;
     uint32_t size      = (hdr >> 16) & 0xFF;
     uint32_t n         = hdr & 0xFF;
+    // NN is the full low byte. 0 is the backward-compatible one-offset form;
+    // nonzero values directly encode 1..255 offsets.
     if (n < 1) n = 1;
-    if (n > 8) n = 8;
 
-    std::vector<uint32_t> offs;
-    offs.push_back(first_off);
+    /* Preserve the allocation-free hot path without changing the code type:
+     * the format can describe up to 255 offsets, which is only 1020 bytes of
+     * temporary stack storage. Only offs[0..off_count) are ever read. */
+    std::array<uint32_t, 0xFF> offs;
+    size_t off_count = 0;
+    offs[off_count++] = first_off;
     size_t consumed = 2;
-    while (offs.size() < n && idx + consumed < codes.size()) {
-        offs.push_back(codes[idx + consumed].cmd);
-        if (offs.size() < n) offs.push_back(codes[idx + consumed].val);
+    while (off_count < n && idx + consumed < codes.size()) {
+        offs[off_count++] = codes[idx + consumed].cmd;
+        if (off_count < n) offs[off_count++] = codes[idx + consumed].val;
         consumed++;
     }
 
@@ -414,8 +443,9 @@ size_t Engine::Type6(const CodeList &codes, size_t idx, uint32_t base,
     size_t total_lines = 2 + (n / 2);
 
     uint32_t target;
-    bool ok = virtual_base ? ResolveVirtualChain(base, offs, &target)
-                           : ResolvePhysicalChain(base, offs, &target);
+    bool ok = virtual_base
+                  ? ResolveVirtualChain(base, offs.data(), off_count, &target)
+                  : ResolvePhysicalChain(base, offs.data(), off_count, &target);
     if (!ok) return idx + total_lines;
 
     if (size == 0x00)      W8(target,  (uint8_t)(val & 0xFF));

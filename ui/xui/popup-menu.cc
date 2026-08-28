@@ -32,6 +32,7 @@
 #include "IconsFontAwesome6.h"
 #include "../xemu-snapshots.h"
 #include "main-menu.hh"
+#include "xemu-features/volume-amplifier/volume.h"
 
 PopupMenuItemDelegate::~PopupMenuItemDelegate() {}
 void PopupMenuItemDelegate::PushMenu(PopupMenu &menu) {}
@@ -112,7 +113,7 @@ static bool PopupMenuToggle(std::string text, std::string icon = "", bool *v = n
     return status;
 }
 
-static bool PopupMenuSlider(std::string text, std::string icon = "", float *v = NULL)
+static bool PopupMenuSlider(std::string text, std::string icon = "", float *v = NULL, float max_value = 1.0f)
 {
     bool status = PopupMenuButton(text, icon);
     ImVec2 p_min = ImGui::GetItemRectMin();
@@ -144,13 +145,14 @@ static bool PopupMenuSlider(std::string text, std::string icon = "", float *v = 
 
     if (ImGui::IsItemActive()) {
         ImVec2 mouse = ImGui::GetMousePos();
-        new_v = GetSliderValueForMousePos(mouse, slider_pos, slider_size);
+        new_v = GetSliderValueForMousePos(mouse, slider_pos, slider_size) *
+                max_value;
     }
 
-    DrawSlider(*v, ImGui::IsItemActive() || ImGui::IsItemHovered(), slider_pos,
+    *v = fmin(fmax(0.0f, new_v), max_value);
+    DrawSlider(*v / max_value,
+               ImGui::IsItemActive() || ImGui::IsItemHovered(), slider_pos,
                slider_size);
-
-    *v = fmin(fmax(0, new_v), 1.0);
 
     return status;
 }
@@ -311,7 +313,9 @@ public:
         if (m_focus && !m_pop_focus) {
             ImGui::SetKeyboardFocusHere();
         }
-        PopupMenuSlider("Volume", ICON_FA_VOLUME_HIGH, &g_config.audio.volume_limit);
+        PopupMenuSlider("Volume", ICON_FA_VOLUME_HIGH,
+                        &g_config.audio.volume_limit,
+                        xemu_volume_amplifier_max());
         bool fs = xemu_is_fullscreen();
         if (PopupMenuToggle("Fullscreen", ICON_FA_WINDOW_MAXIMIZE, &fs)) {
             xemu_toggle_fullscreen();

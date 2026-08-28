@@ -13,16 +13,15 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/xbox/nv2a/nv2a_int.h"
+#include "hw/xbox/nv2a/nv2a_regs.h"
 
-#include <epoxy/gl.h>
 #include <glib.h>
 #include <glib/gstdio.h>
 
 #include "xemu-xbe.h"
 #include "ui/xemu-settings.h"
 #include "qemu/timer.h"
-#include "texture-io.h"
+#include "xemu-features/texture-packs/texture-packs.h"
 
 /*
  * PNG encode/decode.
@@ -51,14 +50,41 @@
 #include <webp/demux.h>
 #endif
 
-static Nv2aTextureBackend g_backend = NV2A_TEXTURE_BACKEND_NONE;
+static XemuTexturePacksBackend g_backend = XEMU_TEXTURE_PACKS_BACKEND_NONE;
 
-void nv2a_texture_io_set_backend(Nv2aTextureBackend backend)
+bool xemu_texture_packs_dump_enabled(void)
+{
+    return g_config.general.texture_dump_enabled;
+}
+
+bool xemu_texture_packs_replace_enabled(void)
+{
+    return g_config.general.texture_replace_enabled;
+}
+
+bool xemu_texture_packs_dump_mipmaps(void)
+{
+    return g_config.general.texture_dump_mipmaps;
+}
+
+bool xemu_texture_packs_should_dump_level(unsigned int level)
+{
+    return xemu_texture_packs_dump_enabled() &&
+           (level == 0 || xemu_texture_packs_dump_mipmaps());
+}
+
+bool xemu_texture_packs_dynamic_enabled(void)
+{
+    return xemu_texture_packs_replace_enabled() &&
+           xemu_texture_packs_has_dynamic_replacements();
+}
+
+void xemu_texture_packs_set_backend(XemuTexturePacksBackend backend)
 {
     g_backend = backend;
 }
 
-Nv2aTextureBackend nv2a_texture_io_get_backend(void)
+XemuTexturePacksBackend xemu_texture_packs_get_backend(void)
 {
     return g_backend;
 }
@@ -92,7 +118,7 @@ static char *g_replace_dir;
  * concurrently with the UI thread.
  *
  * Every mutation therefore happens on the pfifo thread, at the single point
- * where nv2a_texture_io_consume_flush_request() is called -- the same place,
+ * where xemu_texture_packs_consume_flush_request() is called -- the same place,
  * and for the same reason, that the texture cache flush is already deferred
  * to. The UI thread only ever stages values here and raises a request flag.
  *
@@ -122,12 +148,12 @@ static char *g_pending_dump_dir;
 static char *g_pending_replace_dir;
 
 
-void nv2a_texture_cache_flush(void)
+void xemu_texture_packs_request_cache_flush(void)
 {
     g_flush_requested = true;
 }
 
-bool nv2a_texture_io_consume_flush_request(void)
+bool xemu_texture_packs_consume_flush_request(void)
 {
     /*
      * Called at the top of pgraph_{gl,vk}_bind_textures, i.e. on the pfifo
@@ -166,6 +192,14 @@ bool nv2a_texture_io_consume_flush_request(void)
     return true;
 }
 
+void xemu_texture_packs_renderer_sync(void (*flush_backend)(void))
+{
+    if (flush_backend != NULL && xemu_texture_packs_consume_flush_request()) {
+        flush_backend();
+    }
+}
+
+
 /*
  * Replacement index: filename stem -> full path on disk.
  *
@@ -184,7 +218,7 @@ static GHashTable *g_dumped_set;
 
 /* Decoded-frame cache for animated (.gif/.webp) replacements, keyed
  * identically to g_replace_index: build_key(hash, variant). Declared here
- * so it exists before nv2a_texture_io_rebuild_replacement_index() uses it. */
+ * so it exists before xemu_texture_packs_rebuild_replacement_index() uses it. */
 static GHashTable *g_anim_cache;
 
 /*
@@ -196,22 +230,33 @@ static GHashTable *g_anim_cache;
  */
 static GHashTable *g_shader_index;
 
-void nv2a_texture_io_refresh_paths(void)
+/* True when the current replacement pack contains at least one animated
+ * image or procedural shader. Renderer bind paths use this to avoid walking
+ * the entire texture cache for static-only packs. */
+static bool g_has_dynamic_replacements;
+
+bool xemu_texture_packs_has_dynamic_replacements(void)
 {
+    return g_has_dynamic_replacements;
+}
+
+void xemu_texture_packs_refresh_paths(void)
+{
+    /* With both features off there is no per-title texture work to maintain.
+     * This function is called once per host UI frame, so make the completely
+     * inactive case literally a couple of config reads. Paths are resolved on
+     * the first frame after either feature is enabled. */
+    if (!g_config.general.texture_dump_enabled &&
+        !g_config.general.texture_replace_enabled) {
+        return;
+    }
+
     /*
-     * PERFORMANCE: xemu_get_xbe_info() caches nothing. Every call free()s and
-     * malloc()s the header buffer and re-reads the whole XBE header (up to
-     * 8 pages) out of guest memory, with a page-table walk per page. This
-     * function is called once per frame from the UI, so an unthrottled call
-     * is that cost 60 times a second forever.
-     *
-     * The title cannot change without a disc swap or a reset, so checking a
-     * couple of times a second is plenty. Matches the 500 ms throttle already
-     * used by CodesManager::Tick() for exactly the same reason.
-     *
-     * The 500 ms is also the worst-case delay before a directory changed in
-     * the settings UI takes effect. That is not noticeable and is the same
-     * trade the codes engine already makes.
+     * Resolving the running title requires CPU-state synchronization and guest
+     * memory reads. This function is called once per host UI frame, but the
+     * title cannot change without a disc swap/reset, so 2 Hz identification is
+     * ample and avoids putting guest inspection into the ordinary frame path.
+     * Directory edits are still noticed within the same short interval.
      */
     static int64_t last_identify_us;
     static bool identified_once;
@@ -224,9 +269,8 @@ void nv2a_texture_io_refresh_paths(void)
     last_identify_us = now_us;
     identified_once = true;
 
-    struct xbe *xbe = xemu_get_xbe_info();
-
-    if (xbe == NULL || xbe->cert == NULL) {
+    uint32_t title_id = 0;
+    if (!xemu_get_xbe_title_id(&title_id)) {
         if (!g_staged_known || g_staged_valid) {
             g_free(g_pending_dump_dir);
             g_free(g_pending_replace_dir);
@@ -240,8 +284,6 @@ void nv2a_texture_io_refresh_paths(void)
         }
         return;
     }
-
-    uint32_t title_id = xbe->cert->m_titleid;
 
     /*
      * Re-resolve when either the title or a configured directory changes,
@@ -336,7 +378,7 @@ void nv2a_texture_io_refresh_paths(void)
             title_hex, g_pending_dump_dir, g_pending_replace_dir);
 }
 
-bool nv2a_texture_io_ready(void)
+bool xemu_texture_packs_ready(void)
 {
     return g_paths_valid;
 }
@@ -414,6 +456,7 @@ static void scan_hashed_pngs(GHashTable *table, bool store_path,
                 }
                 char *shader_stem = g_ascii_strdown(name, len - 7);
                 g_hash_table_insert(g_shader_index, shader_stem, full);
+                g_has_dynamic_replacements = true;
                 continue; /* table owns `full` */
             }
         }
@@ -432,6 +475,7 @@ static void scan_hashed_pngs(GHashTable *table, bool store_path,
              * indexing the webp would win on priority and then fail to
              * decode, losing a replacement that would otherwise have worked.
              */
+            g_free(full);
             continue;
 #endif
         } else if (g_str_has_suffix(name, ".gif")) {
@@ -455,6 +499,9 @@ static void scan_hashed_pngs(GHashTable *table, bool store_path,
                 char *stem = g_ascii_strdown(name, len - ext_len);
 
                 if (store_path) {
+                    if (priority >= 2) {
+                        g_has_dynamic_replacements = true;
+                    }
                     const char *existing = g_hash_table_lookup(table, stem);
 
                     if (existing != NULL) {
@@ -502,7 +549,7 @@ static void rebuild_dump_index_now(void)
         g_dumped_set = NULL;
     }
 
-    if (!g_paths_valid) {
+    if (!g_paths_valid || !g_config.general.texture_dump_enabled) {
         return;
     }
 
@@ -517,6 +564,8 @@ static void rebuild_dump_index_now(void)
 
 static void rebuild_replacement_index_now(void)
 {
+    g_has_dynamic_replacements = false;
+
     if (g_replace_index != NULL) {
         g_hash_table_destroy(g_replace_index);
         g_replace_index = NULL;
@@ -526,8 +575,17 @@ static void rebuild_replacement_index_now(void)
         return;
     }
 
-    g_replace_index = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                            g_free, g_free);
+    /* A replacement index is only useful while replacements are active, or
+     * while dumping is configured to skip textures that have replacements. */
+    const bool need_replace_index =
+        g_config.general.texture_replace_enabled ||
+        (g_config.general.texture_dump_enabled &&
+         g_config.general.texture_dump_skip_replaced);
+
+    if (need_replace_index) {
+        g_replace_index = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                g_free, g_free);
+    }
 
     /* Paths are about to be re-resolved, so drop any cached decoded frames
      * for the previous set of files -- otherwise a replaced/removed .gif or
@@ -542,22 +600,24 @@ static void rebuild_replacement_index_now(void)
         g_shader_index = NULL;
     }
 
-    scan_hashed_pngs(g_replace_index, true, g_replace_dir, 0);
-
-    fprintf(stderr, "nv2a: texture-io: indexed %u replacement texture(s)\n",
-            g_hash_table_size(g_replace_index));
+    if (g_replace_index != NULL) {
+        scan_hashed_pngs(g_replace_index, true, g_replace_dir, 0);
+        fprintf(stderr,
+                "nv2a: texture-io: indexed %u replacement texture(s)\n",
+                g_hash_table_size(g_replace_index));
+    }
 
     rebuild_dump_index_now();
 }
 
 /* Public entry points. Callable from any thread: they only raise the flag,
  * and the pfifo thread does the work in consume_flush_request(). */
-void nv2a_texture_io_rebuild_replacement_index(void)
+void xemu_texture_packs_rebuild_replacement_index(void)
 {
     g_reload_requested = true;
 }
 
-void nv2a_texture_io_rebuild_dump_index(void)
+void xemu_texture_packs_rebuild_dump_index(void)
 {
     g_reload_requested = true;
 }
@@ -566,22 +626,40 @@ void nv2a_texture_io_rebuild_dump_index(void)
  * Variant key: "<hash>" for a plain texture, "<hash>_<variant>" for cubemap
  * faces ("posx".."negz") and mip levels ("mip1"..).
  */
-static char *build_key(uint64_t hash, const char *variant)
+#define TEXTURE_KEY_STACK_SIZE 64
+
+/* Most variants are tiny (posx, mip1, ...), so lookup keys belong on the
+ * stack rather than on GLib's heap in a per-draw path. The heap fallback
+ * preserves the old behavior for an unexpectedly long variant. */
+static const char *build_key(uint64_t hash, const char *variant,
+                             char stack[TEXTURE_KEY_STACK_SIZE], char **heap)
 {
+    int n;
     if (variant && variant[0]) {
-        return g_strdup_printf("%016" PRIx64 "_%s", hash, variant);
+        n = snprintf(stack, TEXTURE_KEY_STACK_SIZE,
+                     "%016" PRIx64 "_%s", hash, variant);
+    } else {
+        n = snprintf(stack, TEXTURE_KEY_STACK_SIZE, "%016" PRIx64, hash);
     }
-    return g_strdup_printf("%016" PRIx64, hash);
+    if (n >= 0 && n < TEXTURE_KEY_STACK_SIZE) {
+        return stack;
+    }
+    *heap = variant && variant[0]
+        ? g_strdup_printf("%016" PRIx64 "_%s", hash, variant)
+        : g_strdup_printf("%016" PRIx64, hash);
+    return *heap;
 }
 
 static char *build_path(const char *dir, uint64_t hash, const char *variant)
 {
-    g_autofree char *key = build_key(hash, variant);
+    char key_stack[TEXTURE_KEY_STACK_SIZE];
+    g_autofree char *key_heap = NULL;
+    const char *key = build_key(hash, variant, key_stack, &key_heap);
     g_autofree char *name = g_strdup_printf("%s.png", key);
     return g_build_filename(dir, name, NULL);
 }
 
-void nv2a_texture_io_dump_variant(uint64_t hash, const char *variant,
+void xemu_texture_packs_dump_variant(uint64_t hash, const char *variant,
                                   unsigned int width, unsigned int height,
                                   const uint8_t *rgba_data)
 {
@@ -589,7 +667,9 @@ void nv2a_texture_io_dump_variant(uint64_t hash, const char *variant,
         return;
     }
 
-    g_autofree char *key = build_key(hash, variant);
+    char key_stack[TEXTURE_KEY_STACK_SIZE];
+    g_autofree char *key_heap = NULL;
+    const char *key = build_key(hash, variant, key_stack, &key_heap);
 
     /* Already dumped, this session or a previous one. */
     if (g_dumped_set != NULL && g_hash_table_contains(g_dumped_set, key)) {
@@ -623,13 +703,128 @@ void nv2a_texture_io_dump_variant(uint64_t hash, const char *variant,
     }
 }
 
-void nv2a_texture_io_dump(uint64_t hash, unsigned int width,
+void xemu_texture_packs_dump(uint64_t hash, unsigned int width,
                           unsigned int height, const uint8_t *rgba_data)
 {
-    nv2a_texture_io_dump_variant(hash, NULL, width, height, rgba_data);
+    xemu_texture_packs_dump_variant(hash, NULL, width, height, rgba_data);
 }
 
-bool nv2a_texture_io_get_replacement_size_variant(uint64_t hash,
+/*
+ * Xbox texture formats do not all live in memory as RGBA bytes. In
+ * particular A8R8G8B8/X8R8G8B8 are little-endian BGRA in guest memory.
+ * OpenGL/Vulkan know that from their upload format, but stb_image_write does
+ * not: handing those bytes straight to stbi_write_png swaps red and blue.
+ *
+ * Replacement images are decoded by stb_image as RGBA8, so dumps must also
+ * be canonical RGBA8 or a dump->replacement round trip changes the picture.
+ */
+void xemu_texture_packs_dump_guest32_variant(uint64_t hash, const char *variant,
+                                          unsigned int width,
+                                          unsigned int height,
+                                          unsigned int row_stride,
+                                          unsigned int color_format,
+                                          const uint8_t *pixel_data)
+{
+    if (pixel_data == NULL || width == 0 || height == 0) {
+        return;
+    }
+
+    enum {
+        DUMP_LAYOUT_RGBA,
+        DUMP_LAYOUT_BGRA,
+        DUMP_LAYOUT_ARGB_BYTES,
+        DUMP_LAYOUT_ABGR_BYTES,
+    } layout;
+    bool force_opaque = false;
+
+    switch (color_format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8:
+        layout = DUMP_LAYOUT_BGRA;
+        break;
+
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8:
+        layout = DUMP_LAYOUT_BGRA;
+        force_opaque = true;
+        break;
+
+    /* These paths have already been expanded/converted to RGBA8. */
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_CR8YB8CB8YA8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_YB8CR8YA8CB8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8:
+        layout = DUMP_LAYOUT_RGBA;
+        break;
+
+    /* Little-endian byte order for the remaining 32-bit packed formats. */
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8:
+        layout = DUMP_LAYOUT_ARGB_BYTES; /* bytes: A,R,G,B */
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8:
+        layout = DUMP_LAYOUT_ABGR_BYTES; /* bytes: A,B,G,R */
+        break;
+
+    default:
+        /* Depth and non-32bpp formats need format-specific expansion. */
+        return;
+    }
+
+    if (row_stride == 0) {
+        row_stride = width * 4;
+    }
+
+    /* Avoid an allocation when the source is already tightly packed RGBA. */
+    if (layout == DUMP_LAYOUT_RGBA && !force_opaque &&
+        row_stride == width * 4) {
+        xemu_texture_packs_dump_variant(hash, variant, width, height, pixel_data);
+        return;
+    }
+
+    g_autofree uint8_t *rgba = g_malloc((size_t)width * height * 4);
+    for (unsigned int y = 0; y < height; y++) {
+        const uint8_t *src = pixel_data + (size_t)y * row_stride;
+        uint8_t *dst = rgba + (size_t)y * width * 4;
+        for (unsigned int x = 0; x < width; x++, src += 4, dst += 4) {
+            switch (layout) {
+            case DUMP_LAYOUT_RGBA:
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = force_opaque ? 255 : src[3];
+                break;
+            case DUMP_LAYOUT_BGRA:
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = force_opaque ? 255 : src[3];
+                break;
+            case DUMP_LAYOUT_ARGB_BYTES:
+                dst[0] = src[1];
+                dst[1] = src[2];
+                dst[2] = src[3];
+                dst[3] = src[0];
+                break;
+            case DUMP_LAYOUT_ABGR_BYTES:
+                dst[0] = src[3];
+                dst[1] = src[2];
+                dst[2] = src[1];
+                dst[3] = src[0];
+                break;
+            }
+        }
+    }
+
+    xemu_texture_packs_dump_variant(hash, variant, width, height, rgba);
+}
+
+bool xemu_texture_packs_get_replacement_size_variant(uint64_t hash,
                                                   const char *variant,
                                                   int *width, int *height)
 {
@@ -637,7 +832,9 @@ bool nv2a_texture_io_get_replacement_size_variant(uint64_t hash,
         return false;
     }
 
-    g_autofree char *key = build_key(hash, variant);
+    char key_stack[TEXTURE_KEY_STACK_SIZE];
+    g_autofree char *key_heap = NULL;
+    const char *key = build_key(hash, variant, key_stack, &key_heap);
     const char *path = g_hash_table_lookup(g_replace_index, key);
     if (path == NULL) {
         return false;
@@ -649,7 +846,7 @@ bool nv2a_texture_io_get_replacement_size_variant(uint64_t hash,
      * the decode, which the caller is about to need anyway.
      */
     int aw = 0, ah = 0;
-    if (nv2a_texture_io_animated_frame_pixels(hash, variant, 0, &aw, &ah) !=
+    if (xemu_texture_packs_animated_frame_pixels(hash, variant, 0, &aw, &ah) !=
         NULL) {
         *width = aw;
         *height = ah;
@@ -666,14 +863,14 @@ bool nv2a_texture_io_get_replacement_size_variant(uint64_t hash,
     return true;
 }
 
-bool nv2a_texture_io_get_replacement_size(uint64_t hash, int *width,
+bool xemu_texture_packs_get_replacement_size(uint64_t hash, int *width,
                                           int *height)
 {
-    return nv2a_texture_io_get_replacement_size_variant(hash, NULL, width,
+    return xemu_texture_packs_get_replacement_size_variant(hash, NULL, width,
                                                         height);
 }
 
-bool nv2a_texture_io_has_all_cubemap_faces(uint64_t hash, int *width,
+bool xemu_texture_packs_has_all_cubemap_faces(uint64_t hash, int *width,
                                            int *height)
 {
     static const char *faces[6] = { "posx", "negx", "posy",
@@ -682,7 +879,7 @@ bool nv2a_texture_io_has_all_cubemap_faces(uint64_t hash, int *width,
 
     for (int i = 0; i < 6; i++) {
         int w = 0, h = 0;
-        if (!nv2a_texture_io_get_replacement_size_variant(hash, faces[i], &w,
+        if (!xemu_texture_packs_get_replacement_size_variant(hash, faces[i], &w,
                                                           &h)) {
             return false;
         }
@@ -702,14 +899,14 @@ bool nv2a_texture_io_has_all_cubemap_faces(uint64_t hash, int *width,
     return true;
 }
 
-const char *nv2a_texture_io_cubemap_face_name(int face)
+const char *xemu_texture_packs_cubemap_face_name(int face)
 {
     static const char *faces[6] = { "posx", "negx", "posy",
                                     "negy", "posz", "negz" };
     return (face >= 0 && face < 6) ? faces[face] : NULL;
 }
 
-uint8_t *nv2a_texture_io_load_replacement_rgba_variant(uint64_t hash,
+uint8_t *xemu_texture_packs_load_replacement_rgba_variant(uint64_t hash,
                                                        const char *variant,
                                                        int *width, int *height)
 {
@@ -717,7 +914,9 @@ uint8_t *nv2a_texture_io_load_replacement_rgba_variant(uint64_t hash,
         return NULL;
     }
 
-    g_autofree char *key = build_key(hash, variant);
+    char key_stack[TEXTURE_KEY_STACK_SIZE];
+    g_autofree char *key_heap = NULL;
+    const char *key = build_key(hash, variant, key_stack, &key_heap);
     const char *path = g_hash_table_lookup(g_replace_index, key);
     if (path == NULL) {
         return NULL;
@@ -735,84 +934,16 @@ uint8_t *nv2a_texture_io_load_replacement_rgba_variant(uint64_t hash,
     return (uint8_t *)pixels;
 }
 
-uint8_t *nv2a_texture_io_load_replacement_rgba(uint64_t hash, int *width,
+uint8_t *xemu_texture_packs_load_replacement_rgba(uint64_t hash, int *width,
                                                int *height)
 {
-    return nv2a_texture_io_load_replacement_rgba_variant(hash, NULL, width,
+    return xemu_texture_packs_load_replacement_rgba_variant(hash, NULL, width,
                                                          height);
 }
 
-void nv2a_texture_io_free_pixels(uint8_t *pixels)
+void xemu_texture_packs_free_pixels(uint8_t *pixels)
 {
     stbi_image_free(pixels);
-}
-
-bool nv2a_texture_io_try_upload_replacement_target(uint64_t hash,
-                                                   const char *variant,
-                                                   unsigned int gl_target,
-                                                   bool gen_mipmaps)
-{
-    if (!g_paths_valid || g_replace_index == NULL) {
-        return false;
-    }
-
-    g_autofree char *key = build_key(hash, variant);
-    const char *path = g_hash_table_lookup(g_replace_index, key);
-    if (path == NULL) {
-        return false;
-    }
-
-    /*
-     * Animated replacements take a separate path: the caller (generate_
-     * texture) still owns marking the resulting TextureBinding as animated
-     * via nv2a_texture_io_replacement_is_animated so it gets refreshed on
-     * later binds, but the initial frame upload happens here so callers
-     * don't need two different "did it work" checks.
-     */
-    int anim_frame;
-    if (nv2a_texture_io_upload_animated_frame(hash, variant, gl_target,
-                                              /*full_upload=*/true,
-                                              /*regen_mips=*/gen_mipmaps,
-                                              nv2a_texture_io_anim_now_us(),
-                                              &anim_frame)) {
-        return true;
-    }
-
-    int w = 0, h = 0, channels = 0;
-    /* Force RGBA; replacement packs may be RGB or indexed. */
-    unsigned char *pixels = stbi_load(path, &w, &h, &channels, 4);
-
-    if (pixels == NULL) {
-        fprintf(stderr, "nv2a: texture-io: could not decode %s\n", path);
-        return false;
-    }
-
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-    glTexImage2D((GLenum)gl_target, 0, GL_RGBA8, w, h, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, pixels);
-
-    if (gen_mipmaps) {
-        /*
-         * Replacement packs rarely ship a mip chain and their dimensions
-         * will not match the guest level count, so regenerate instead of
-         * trusting guest level data.
-         */
-        glGenerateMipmap(gl_target == GL_TEXTURE_2D ? GL_TEXTURE_2D :
-                                                      GL_TEXTURE_CUBE_MAP);
-    }
-
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-
-    stbi_image_free(pixels);
-    return true;
-}
-
-bool nv2a_texture_io_try_upload_replacement(uint64_t hash, bool gen_mipmaps)
-{
-    return nv2a_texture_io_try_upload_replacement_target(
-        hash, NULL, GL_TEXTURE_2D, gen_mipmaps);
 }
 
 /*
@@ -826,6 +957,7 @@ typedef struct AnimReplacement {
     int frame_count;
     uint8_t **frames;   /* frame_count buffers, each width*height*4 RGBA */
     int *delay_ms;      /* frame_count entries, each > 0 */
+    int64_t *end_ms;    /* cumulative exclusive end time for binary lookup */
     int64_t total_ms;   /* sum of delay_ms, for wraparound */
     bool decode_failed; /* cached so a broken file isn't retried every bind */
 } AnimReplacement;
@@ -841,13 +973,28 @@ static void anim_replacement_free(gpointer data)
         g_free(a->frames);
     }
     g_free(a->delay_ms);
+    g_free(a->end_ms);
     g_free(a);
 }
 
 static bool path_has_suffix_ci(const char *path, const char *suffix)
 {
-    g_autofree char *lower = g_ascii_strdown(path, -1);
-    return g_str_has_suffix(lower, suffix);
+    size_t path_len = strlen(path);
+    size_t suffix_len = strlen(suffix);
+    return path_len >= suffix_len &&
+           g_ascii_strcasecmp(path + path_len - suffix_len, suffix) == 0;
+}
+
+static void anim_build_timeline(AnimReplacement *a)
+{
+    g_free(a->end_ms);
+    a->end_ms = g_new(int64_t, a->frame_count);
+    int64_t total = 0;
+    for (int i = 0; i < a->frame_count; ++i) {
+        total += MAX(a->delay_ms[i], 1);
+        a->end_ms[i] = total;
+    }
+    a->total_ms = total;
 }
 
 static bool decode_gif(const char *path, AnimReplacement *out)
@@ -1007,7 +1154,19 @@ static AnimReplacement *get_animated(uint64_t hash, const char *variant)
         return NULL;
     }
 
-    g_autofree char *key = build_key(hash, variant);
+    char key_stack[TEXTURE_KEY_STACK_SIZE];
+    g_autofree char *key_heap = NULL;
+    const char *key = build_key(hash, variant, key_stack, &key_heap);
+
+    /* Cached animated hits are the normal path and must not inspect the file
+     * extension or allocate anything on every draw. */
+    if (g_anim_cache != NULL) {
+        AnimReplacement *cached = g_hash_table_lookup(g_anim_cache, key);
+        if (cached != NULL) {
+            return cached->decode_failed ? NULL : cached;
+        }
+    }
+
     const char *path = g_hash_table_lookup(g_replace_index, key);
     if (path == NULL) {
         return NULL;
@@ -1024,16 +1183,12 @@ static AnimReplacement *get_animated(uint64_t hash, const char *variant)
                                              anim_replacement_free);
     }
 
-    AnimReplacement *cached = g_hash_table_lookup(g_anim_cache, key);
-    if (cached != NULL) {
-        return cached->decode_failed ? NULL : cached;
-    }
-
     AnimReplacement *a = g_new0(AnimReplacement, 1);
     bool ok = is_gif ? decode_gif(path, a) : decode_webp(path, a);
     a->decode_failed = !ok;
 
     if (ok) {
+        anim_build_timeline(a);
         fprintf(stderr,
                 "nv2a: texture-io: decoded animated replacement %s "
                 "(%d frames, %dx%d, %" PRId64 "ms loop)\n",
@@ -1044,7 +1199,7 @@ static AnimReplacement *get_animated(uint64_t hash, const char *variant)
     return ok ? a : NULL;
 }
 
-bool nv2a_texture_io_replacement_is_animated(uint64_t hash,
+bool xemu_texture_packs_replacement_is_animated(uint64_t hash,
                                              const char *variant)
 {
     return get_animated(hash, variant) != NULL;
@@ -1052,29 +1207,36 @@ bool nv2a_texture_io_replacement_is_animated(uint64_t hash,
 
 static int frame_for_time(const AnimReplacement *a, int64_t now_us)
 {
-    if (a->total_ms <= 0) {
+    if (a->total_ms <= 0 || a->end_ms == NULL) {
         return 0;
     }
-    int64_t t = (now_us / 1000) % a->total_ms;
-    for (int i = 0; i < a->frame_count; i++) {
-        if (t < a->delay_ms[i]) {
-            return i;
+    const int64_t t = (now_us / 1000) % a->total_ms;
+
+    int lo = 0;
+    int hi = a->frame_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (t < a->end_ms[mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
         }
-        t -= a->delay_ms[i];
     }
-    return a->frame_count - 1;
+    return MIN(lo, a->frame_count - 1);
 }
 
 /*
  * Path of the shader attached to this hash, or NULL. The returned string is
  * owned by the index and is invalidated by a replacement-index rebuild.
  */
-const char *nv2a_texture_io_get_shader_path(uint64_t hash, const char *variant)
+const char *xemu_texture_packs_get_shader_path(uint64_t hash, const char *variant)
 {
     if (g_shader_index == NULL) {
         return NULL;
     }
-    g_autofree char *key = build_key(hash, variant);
+    char key_stack[TEXTURE_KEY_STACK_SIZE];
+    g_autofree char *key_heap = NULL;
+    const char *key = build_key(hash, variant, key_stack, &key_heap);
     return g_hash_table_lookup(g_shader_index, key);
 }
 
@@ -1088,7 +1250,7 @@ const char *nv2a_texture_io_get_shader_path(uint64_t hash, const char *variant)
  * lasted. It also keeps animation in step with the guest when emulation runs
  * fast or slow rather than drifting against real time.
  */
-int64_t nv2a_texture_io_anim_now_us(void)
+int64_t xemu_texture_packs_anim_now_us(void)
 {
     return qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
 }
@@ -1099,7 +1261,7 @@ int64_t nv2a_texture_io_anim_now_us(void)
  * this to skip redundant re-uploads, which matters a great deal because
  * bind_textures runs per draw call, not per frame.
  */
-int nv2a_texture_io_animated_frame_index(uint64_t hash, const char *variant,
+int xemu_texture_packs_animated_frame_index(uint64_t hash, const char *variant,
                                          int64_t now_us)
 {
     AnimReplacement *a = get_animated(hash, variant);
@@ -1114,7 +1276,7 @@ int nv2a_texture_io_animated_frame_index(uint64_t hash, const char *variant,
  * index is rebuilt; do not free. Returns NULL when absent or out of range.
  * Lets the Vulkan backend feed its staging buffer without a disk reload.
  */
-const uint8_t *nv2a_texture_io_animated_frame_pixels(uint64_t hash,
+const uint8_t *xemu_texture_packs_animated_frame_pixels(uint64_t hash,
                                                      const char *variant,
                                                      int frame, int *width,
                                                      int *height)
@@ -1128,35 +1290,4 @@ const uint8_t *nv2a_texture_io_animated_frame_pixels(uint64_t hash,
     return a->frames[frame];
 }
 
-bool nv2a_texture_io_upload_animated_frame(uint64_t hash, const char *variant,
-                                           unsigned int gl_target,
-                                           bool full_upload, bool regen_mips,
-                                           int64_t now_us, int *out_frame)
-{
-    AnimReplacement *a = get_animated(hash, variant);
-    if (a == NULL) {
-        return false;
-    }
 
-    int frame = frame_for_time(a, now_us);
-    *out_frame = frame;
-
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-    if (full_upload) {
-        glTexImage2D((GLenum)gl_target, 0, GL_RGBA8, a->width, a->height, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, a->frames[frame]);
-    } else {
-        glTexSubImage2D((GLenum)gl_target, 0, 0, 0, a->width, a->height,
-                        GL_RGBA, GL_UNSIGNED_BYTE, a->frames[frame]);
-    }
-
-    if (regen_mips) {
-        glGenerateMipmap(gl_target == GL_TEXTURE_2D ? GL_TEXTURE_2D :
-                                                      GL_TEXTURE_CUBE_MAP);
-    }
-
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    return true;
-}

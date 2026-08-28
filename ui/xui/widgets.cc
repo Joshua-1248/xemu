@@ -222,7 +222,8 @@ bool Toggle(const char *str_id, bool *v, const char *description)
     return status;
 }
 
-void Slider(const char *str_id, float *v, const char *description)
+void Slider(const char *str_id, float *v, const char *description,
+            float min_value, float max_value, float step)
 {
     ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32_BLACK_TRANS);
 
@@ -255,19 +256,25 @@ void Slider(const char *str_id, float *v, const char *description)
 
     ImGui::InvisibleButton("###slider", slider_size, 0);
 
+    if (max_value <= min_value) {
+        max_value = min_value + 1.0f;
+    }
+    if (step <= 0.0f) {
+        step = 0.05f;
+    }
 
     if (ImGui::IsItemHovered()) {
         if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) ||
             ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) ||
             ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft) ||
             ImGui::IsKeyPressed(ImGuiKey_GamepadRStickLeft)) {
-                *v -= 0.05;
+                *v -= step;
         }
         if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) ||
             ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight) ||
             ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight) ||
             ImGui::IsKeyPressed(ImGuiKey_GamepadRStickRight)) {
-                *v += 0.05;
+                *v += step;
         }
 
         if (
@@ -286,11 +293,17 @@ void Slider(const char *str_id, float *v, const char *description)
 
     if (ImGui::IsItemActive()) {
         ImVec2 mouse = ImGui::GetMousePos();
-        *v = GetSliderValueForMousePos(mouse, slider_pos, slider_size);
+        float normalized =
+            GetSliderValueForMousePos(mouse, slider_pos, slider_size);
+        normalized = fmax(0.0f, fmin(normalized, 1.0f));
+        *v = min_value + normalized * (max_value - min_value);
     }
-    *v = fmax(0, fmin(*v, 1));
-    DrawSlider(*v, ImGui::IsItemHovered() || ImGui::IsItemActive(), slider_pos,
-               slider_size);
+
+    *v = fmax(min_value, fmin(*v, max_value));
+    float normalized = (*v - min_value) / (max_value - min_value);
+    DrawSlider(normalized,
+               ImGui::IsItemHovered() || ImGui::IsItemActive(),
+               slider_pos, slider_size);
 
     ImVec2 slider_max = ImVec2(slider_pos.x + slider_size.x, slider_pos.y + slider_size.y);
     ImGui::RenderNavHighlight(ImRect(slider_pos, slider_max), window->GetID("###slider"));

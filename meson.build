@@ -2491,6 +2491,18 @@ subdir('thirdparty')
 config_host_data = configuration_data()
 
 config_host_data.set('CONFIG_HAVE_RUST', have_rust)
+
+# xemu custom fork feature compile switches. These are deliberately emitted
+# into config-host.h so public hook headers can collapse to inline neutral
+# defaults when a feature is physically omitted from the build.
+config_host_data.set('CONFIG_XEMU_FEATURE_AUDIO_PACKS', get_option('xemu_feature_audio_packs'))
+config_host_data.set('CONFIG_XEMU_FEATURE_TEXTURE_PACKS', get_option('xemu_feature_texture_packs'))
+config_host_data.set('CONFIG_XEMU_FEATURE_CHEATS', get_option('xemu_feature_cheats'))
+config_host_data.set('CONFIG_XEMU_FEATURE_TAS', get_option('xemu_feature_tas'))
+config_host_data.set('CONFIG_XEMU_FEATURE_SCRIPTING', get_option('xemu_feature_scripting'))
+config_host_data.set('CONFIG_XEMU_FEATURE_DEBUG_TOOLS', get_option('xemu_feature_debug_tools'))
+config_host_data.set('CONFIG_XEMU_FEATURE_FAST_FORWARD', get_option('xemu_feature_fast_forward'))
+config_host_data.set('CONFIG_XEMU_FEATURE_VOLUME_AMPLIFIER', get_option('xemu_feature_volume_amplifier'))
 audio_drivers_selected = []
 if have_system
   audio_drivers_available = {
@@ -4068,7 +4080,19 @@ if have_block
   endif
 endif
 
-specific_ss.add(files('xemu-xbe.c', 'xemu-version.c', 'xemu-guestmem.c', 'xemu-dbg.c'))
+specific_ss.add(files('xemu-xbe.c', 'xemu-version.c'))
+
+# Fork-local guest-memory services are shared only by optional tooling.
+if (get_option('xemu_feature_cheats') or
+    get_option('xemu_feature_tas') or
+    get_option('xemu_feature_scripting') or
+    get_option('xemu_feature_debug_tools'))
+  specific_ss.add(files('xemu-features/shared/guest-memory.c'))
+endif
+
+if get_option('xemu_feature_debug_tools')
+  specific_ss.add(files('xemu-features/debug-tools/debug-api.c'))
+endif
 
 common_ss.add(genconfig)
 

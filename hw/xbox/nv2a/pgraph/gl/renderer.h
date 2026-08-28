@@ -4,7 +4,6 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2025 Matt Borgerson
- * Copyright (c) 2026 Joshua-1248 (texture replacement, animation, shaders)
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -82,54 +81,6 @@ typedef struct TextureBinding {
     bool border_color_set;
     GLenum gl_target;
     GLuint gl_texture;
-
-    /*
-     * Set when this binding's pixels came from an animated replacement
-     * (.gif/.webp). anim_variant is owned (g_strdup'd) since cubemap faces
-     * need distinct keys; NULL for a plain texture. anim_frame is the last
-     * frame index uploaded, used to skip redundant glTexSubImage2D calls.
-     */
-    bool is_animated;
-    uint64_t anim_hash;
-    char *anim_variant;
-    int anim_frame;
-    /*
-     * Whether this binding was created with a mip chain (s.levels > 1),
-     * so per-frame updates know whether to regenerate mips.
-     */
-    bool anim_has_mips;
-
-    /*
-     * Procedural shader replacement (<hash>.shader). The shader renders into
-     * gl_texture via shader_fbo each refresh, so the rest of the pipeline
-     * sees an ordinary texture. shader_src is an optional iChannel0 holding
-     * the image replacement for the same hash, when one exists.
-     */
-    bool has_shader;
-    GLuint shader_program;
-    GLuint shader_fbo;
-    GLuint shader_src;
-    int shader_width;
-    int shader_height;
-    int shader_frame;
-    int64_t shader_last_us;
-    /*
-     * iChannel0 animation: when the same hash also has a .gif or .webp,
-     * shader_src is refreshed from the decoded frame cache so the shader
-     * distorts a moving source rather than a frozen first frame.
-     */
-    bool shader_src_animated;
-    int shader_src_frame;
-    /* Hash owning this shader; anim_hash is 0 when the shader supersedes. */
-    uint64_t shader_hash;
-    /*
-     * Hot reload: mtime of the .shader file as last compiled, and the time
-     * of the last check. Recompiling on save avoids a restart+reload cycle
-     * for every edit, which is the difference between shaders being
-     * tweakable and not.
-     */
-    int64_t shader_mtime;
-    int64_t shader_check_us;
 } TextureBinding;
 
 typedef struct ShaderModuleCacheKey {

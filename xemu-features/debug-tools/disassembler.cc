@@ -16,13 +16,13 @@
 #include <algorithm>
 
 #include "disassembler.hh"
-#include "common.hh"
-#include "misc.hh"
-#include "font-manager.hh"
-#include "viewport-manager.hh"
+#include "ui/xui/common.hh"
+#include "ui/xui/misc.hh"
+#include "ui/xui/font-manager.hh"
+#include "ui/xui/viewport-manager.hh"
 
-#include "../xemu-dbg.h"
-#include "../xemu-guestmem.h"
+#include "xemu-features/debug-tools/debug-api.h"
+#include "xemu-features/shared/guest-memory.h"
 
 DisassemblerWindow disassembler_window;
 
@@ -197,6 +197,7 @@ void DisassemblerWindow::DrawToolbar()
     if (ImGui::Button("Refresh")) {
         m_dirty = true;
         m_regs_fresh = false;
+        m_mem_cache_valid = false;
     }
     ImGui::SameLine();
 
@@ -465,6 +466,7 @@ void DisassemblerWindow::DrawMemory()
                          ImGuiInputTextFlags_EnterReturnsTrue)) {
         m_mem_addr = (uint32_t)strtoul(m_mem_buf, NULL, 16);
         m_mem_region = 0;
+        m_mem_cache_valid = false;
     }
     ImGui::SameLine();
 
@@ -477,6 +479,7 @@ void DisassemblerWindow::DrawMemory()
                     m_mem_virtual = kRegions[i].virt;
                     m_mem_addr = kRegions[i].base;
                     snprintf(m_mem_buf, sizeof(m_mem_buf), "%08X", m_mem_addr);
+                    m_mem_cache_valid = false;
                 }
             }
         }
@@ -502,6 +505,7 @@ void DisassemblerWindow::DrawMemory()
             m_status_ms = SDL_GetTicks();
         }
         m_mem_region = 0;
+        m_mem_cache_valid = false;
     }
     ImGui::SameLine();
     ImGui::TextDisabled(m_mem_virtual ? "(guest virtual)" : "(physical RAM)");
@@ -509,7 +513,9 @@ void DisassemblerWindow::DrawMemory()
     ImGui::Checkbox("Big endian", &m_mem_big_endian);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(80 * g_viewport_mgr.m_scale);
-    ImGui::SliderInt("bytes/row", &m_mem_bytes_per_row, 8, 32);
+    if (ImGui::SliderInt("bytes/row", &m_mem_bytes_per_row, 8, 32)) {
+        m_mem_cache_valid = false;
+    }
 
     if (!m_status.empty() && SDL_GetTicks() - m_status_ms < 5000) {
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%s",
@@ -518,14 +524,29 @@ void DisassemblerWindow::DrawMemory()
 
     // --- the dump ---
     const int per = m_mem_bytes_per_row;
+    if (!m_mem_cache_valid || m_poll_now ||
+        m_mem_cache_addr != m_mem_addr || m_mem_cache_per != per ||
+        m_mem_cache_virtual != m_mem_virtual) {
+        for (int row = 0; row < 24; ++row) {
+            uint32_t a = m_mem_addr + (uint32_t)(row * per);
+            ssize_t got = xemu_dbg_read_space(a, m_mem_cache[row],
+                                              (size_t)per, m_mem_virtual);
+            m_mem_cache_got[row] = got > 0 ? (int)got : 0;
+        }
+        m_mem_cache_addr = m_mem_addr;
+        m_mem_cache_per = per;
+        m_mem_cache_virtual = m_mem_virtual;
+        m_mem_cache_valid = true;
+    }
+
     ImGui::BeginChild("##memdump",
                       ImVec2(0, 300.0f * g_viewport_mgr.m_scale), true);
     ImGui::PushFont(g_font_mgr.m_fixed_width_font);
 
     for (int row = 0; row < 24; row++) {
         uint32_t a = m_mem_addr + (uint32_t)(row * per);
-        uint8_t buf[32];
-        ssize_t got = xemu_dbg_read_space(a, buf, (size_t)per, m_mem_virtual);
+        const uint8_t *buf = m_mem_cache[row];
+        const int got = m_mem_cache_got[row];
 
         char hex[128] = { 0 };
         char asc[40] = { 0 };
@@ -562,6 +583,7 @@ void DisassemblerWindow::DrawMemory()
         if (wheel != 0.0f) {
             m_mem_addr -= (uint32_t)(wheel * per * 3);
             snprintf(m_mem_buf, sizeof(m_mem_buf), "%08X", m_mem_addr);
+            m_mem_cache_valid = false;
         }
     }
 

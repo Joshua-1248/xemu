@@ -23,45 +23,55 @@
 
 NotificationManager notification_manager;
 
-NotificationManager::NotificationManager()
-{
-    m_active = false;
-}
+NotificationManager::NotificationManager() = default;
 
 void NotificationManager::QueueNotification(const char *msg)
 {
-    m_notification_queue.push_back(strdup(msg));
+    /* Status is newest-wins. Reuse std::string capacity instead of strdup/free
+     * plus deque nodes whenever a hotkey is tapped rapidly. */
+    m_pending_msg.assign(msg ? msg : "");
+    m_pending = true;
+    m_active = false;
+    m_msg.clear();
 }
 
 void NotificationManager::QueueError(const char *msg)
 {
-    m_error_queue.push_back(strdup(msg));
+    m_error_queue.emplace_back(msg ? msg : "");
 }
 
 void NotificationManager::Draw()
 {
+    /* This is called every host UI frame. When no status/error notification
+     * exists, avoid even the clock query and ImGui popup bookkeeping. */
+    if (!m_active && !m_pending && m_error_queue.empty()) {
+        return;
+    }
+
     uint32_t now = SDL_GetTicks();
 
     if (m_active) {
-        // Currently displaying a notification
+        // Currently displaying a notification. Unsigned subtraction preserves
+        // SDL tick-wrap behavior used by the original implementation.
         float t =
             (m_notification_end_time - now) / (float)kNotificationDuration;
-        if (t > 1.0) {
-            // Notification delivered, free it
-            free((void *)m_msg);
+        if (t > 1.0f) {
+            m_msg.clear();
             m_active = false;
         } else {
-            // Notification should be displayed
-            DrawNotification(t, m_msg);
+            DrawNotification(t, m_msg.c_str());
         }
-    } else {
-        // Check to see if a notification is pending
-        if (m_notification_queue.size() > 0) {
-            m_msg = m_notification_queue[0];
-            m_active = true;
-            m_notification_end_time = now + kNotificationDuration;
-            m_notification_queue.pop_front();
-        }
+    }
+
+    if (!m_active && m_pending) {
+        m_msg.swap(m_pending_msg);
+        m_pending_msg.clear();
+        m_pending = false;
+        m_active = true;
+        m_notification_end_time = now + kNotificationDuration;
+
+        // Draw the replacement immediately on this frame.
+        DrawNotification(1.0f, m_msg.c_str());
     }
 
     ImGuiIO& io = ImGui::GetIO();
@@ -73,14 +83,13 @@ void NotificationManager::Draw()
     }
     if (ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize))
     {
-        ImGui::Text("%s", m_error_queue[0]);
+        ImGui::Text("%s", m_error_queue[0].c_str());
         ImGui::Dummy(ImVec2(0,16));
         ImGui::SetItemDefaultFocus();
         ImGuiStyle &style = ImGui::GetStyle();
         ImGui::SetCursorPosX(ImGui::GetWindowWidth()-(120+2*style.FramePadding.x));
         if (ImGui::Button("Ok", ImVec2(120, 0))) {
             ImGui::CloseCurrentPopup();
-            free((void*)m_error_queue[0]);
             m_error_queue.pop_front();
         }
         ImGui::EndPopup();

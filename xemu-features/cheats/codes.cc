@@ -13,18 +13,134 @@
 // the Free Software Foundation; either version 2 of the License, or
 // (at your option) any later version.
 //
-#include "common.hh"
-#include "widgets.hh"
+#include "ui/xui/common.hh"
+#include "ui/xui/widgets.hh"
 #include "codes.hh"
-#include "../xemu-notifications.h"
-#include "../xemu-settings.h"
-#include "../xemu-xbe.h"
-#include "../xemu-guestmem.h"
+#include "ui/xemu-notifications.h"
+#include "ui/xemu-settings.h"
+#include "xemu-xbe.h"
+#include "xemu-features/shared/guest-memory.h"
 
 #include <cstdio>
 #include <cinttypes>
 
 CodesManager g_codes;
+
+// ---------------------------------------------------------------------------
+// Built-in cheat / patch text editor
+// ---------------------------------------------------------------------------
+// Work directly on the same text representation used on disk. This keeps the
+// editor lossless with respect to the existing parser/writer and lets users
+// add, remove, rename, regroup, and change codes without leaving xemu.
+namespace {
+
+struct CodesEditorState {
+    CodesManager::Section *section = nullptr;
+    std::string label;
+    std::string stem;
+    std::string text;
+    std::string error;
+    bool open_requested = false;
+};
+
+CodesEditorState g_codes_editor;
+
+void OpenCodesEditor(CodesManager::Section &sec, const char *label)
+{
+    if (g_codes.Stem().empty()) {
+        return;
+    }
+
+    g_codes_editor.section = &sec;
+    g_codes_editor.label = label ? label : "Codes";
+    g_codes_editor.stem = g_codes.Stem();
+    g_codes_editor.error.clear();
+    g_codes_editor.text = xcheat::RenderCheatText(
+        sec.meta.game.empty() ? g_codes.Title() : sec.meta.game,
+        sec.meta.serial, sec.meta.titleid, sec.root, g_codes.Stem());
+    g_codes_editor.open_requested = true;
+}
+
+void DrawCodesEditor()
+{
+    if (g_codes_editor.open_requested) {
+        ImGui::OpenPopup("Code file editor###xemu_codes_editor");
+        g_codes_editor.open_requested = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(760.0f, 560.0f),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::BeginPopupModal("Code file editor###xemu_codes_editor",
+                                nullptr)) {
+        return;
+    }
+
+    ImGui::Text("%s - %s", g_codes_editor.label.c_str(),
+                g_codes_editor.stem.c_str());
+    ImGui::TextWrapped(
+        "Edit the code file directly. Save and reload validates the text "
+        "before it is written and activated.");
+
+    ImVec2 editor_size(ImGui::GetContentRegionAvail().x, 360.0f);
+    ImGui::InputTextMultiline("###xemu_codes_text", &g_codes_editor.text,
+                              editor_size,
+                              ImGuiInputTextFlags_AllowTabInput);
+
+    if (!g_codes_editor.error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              ImVec4(1.0f, 0.45f, 0.45f, 1.0f));
+        ImGui::TextWrapped("%s", g_codes_editor.error.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (ImGui::Button("Save and reload")) {
+        g_codes_editor.error.clear();
+
+        if (g_codes_editor.section == nullptr ||
+            g_codes_editor.stem != g_codes.Stem()) {
+            g_codes_editor.error =
+                "The running game changed while the editor was open. "
+                "Close this editor and reopen it for the current game.";
+        } else {
+            xcheat::NodeList parsed_root;
+            xcheat::Meta parsed_meta;
+            xcheat::ParseCheatText(g_codes_editor.text,
+                                   &parsed_root, &parsed_meta);
+
+            if (!parsed_meta.warnings.empty()) {
+                g_codes_editor.error =
+                    "Fix these parser warnings before saving:\n";
+                for (const auto &warning : parsed_meta.warnings) {
+                    g_codes_editor.error += "- " + warning + "\n";
+                }
+            } else {
+                CodesManager::Section *sec = g_codes_editor.section;
+                sec->root = std::move(parsed_root);
+                sec->meta = std::move(parsed_meta);
+
+                // Save atomically through the existing writer, then reload the
+                // tree. LoadForCurrentGame() also clears interpreter switch
+                // and one-shot state, which is required when node addresses
+                // may have changed.
+                g_codes.Save(*sec);
+                g_codes.LoadForCurrentGame();
+
+                ImGui::CloseCurrentPopup();
+                g_codes_editor = CodesEditorState{};
+            }
+        }
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+        ImGui::CloseCurrentPopup();
+        g_codes_editor = CodesEditorState{};
+    }
+
+    ImGui::EndPopup();
+}
+
+} // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // GuestMemory - the bridge between the interpreter and the machine
@@ -75,17 +191,19 @@ uint32_t GuestMemory::RamSize() const
 
 bool CodesManager::IdentifyGame()
 {
-    struct xbe *xbe = xemu_get_xbe_info();
-    if (!xbe || !xbe->cert) {
+    uint32_t tid = 0;
+    if (!xemu_get_xbe_title_id(&tid)) {
         m_stem.clear();
         m_title.clear();
+        m_live.clear();
         return false;
     }
 
-    uint32_t tid = xbe->cert->m_titleid;
     std::string serial;
     if (!xcheat::SerialFromTitleId(tid, &serial)) {
         m_stem.clear();
+        m_title.clear();
+        m_live.clear();
         return false;
     }
 
@@ -95,6 +213,19 @@ bool CodesManager::IdentifyGame()
 
     if (stem == m_stem) {
         return true;                    // unchanged, nothing to reload
+    }
+
+    /* The cheap query above avoids copying the whole XBE header every poll.
+     * We only need the full certificate once, when the title actually changes,
+     * to refresh the human-readable UTF-16 title string. Preserve the original
+     * failure semantics: if that full read is transiently unavailable, do not
+     * install a new game's code tree until identification is complete. */
+    struct xbe *xbe = xemu_get_xbe_info();
+    if (!xbe || !xbe->cert) {
+        m_stem.clear();
+        m_title.clear();
+        m_live.clear();
+        return false;
     }
     m_stem = stem;
 
@@ -187,6 +318,36 @@ void CodesManager::LoadForCurrentGame()
     LoadOne(m_cheats, "cheats");
     LoadOne(m_patches, "patches");
     m_engine.ClearSwitches(0, true);
+    RebuildLive();
+}
+
+void CodesManager::RebuildLiveFrom(const xcheat::NodeList &nodes)
+{
+    for (const auto &n : nodes) {
+        if (n->is_group) {
+            RebuildLiveFrom(n->children);
+            continue;
+        }
+        if (!n->enabled || n->codes.empty()) {
+            continue;
+        }
+
+        CompiledBlock block;
+        block.node = n.get();
+        block.bid = (uint32_t)(uintptr_t)n.get();
+        block.codes.reserve(n->codes.size());
+        for (const auto &c : n->codes) {
+            block.codes.push_back({ c.cmd, c.val });
+        }
+        m_live.push_back(std::move(block));
+    }
+}
+
+void CodesManager::RebuildLive()
+{
+    m_live.clear();
+    RebuildLiveFrom(m_cheats.root);
+    RebuildLiveFrom(m_patches.root);
 }
 
 // ---------------------------------------------------------------------------
@@ -245,31 +406,15 @@ void CodesManager::Save(Section &sec)
 // Applying
 // ---------------------------------------------------------------------------
 
-static void CollectEnabled(const xcheat::NodeList &nodes,
-                           std::vector<const xcheat::Node *> *out)
-{
-    for (const auto &n : nodes) {
-        if (n->is_group) {
-            CollectEnabled(n->children, out);
-        } else if (n->enabled && !n->codes.empty()) {
-            out->push_back(n.get());
-        }
-    }
-}
-
 void CodesManager::Tick()
 {
     if (!g_config.codes.enable) return;
 
     /*
-     * NOT cheap, despite what the old comment here claimed.
-     * xemu_get_xbe_info() free()s and malloc()s the header buffer and
-     * re-reads the whole XBE header out of guest memory on EVERY call - it
-     * caches nothing. Calling it once per frame was a measurable chunk of the
-     * stutter.
-     *
+     * Game identification synchronizes CPU state and reads guest XBE fields.
+     * Even the lightweight title-ID helper does not belong on every UI tick.
      * A game cannot change without a disc swap or reset, so checking a few
-     * times a second is plenty.
+     * times a second preserves responsiveness without continual guest reads.
      */
     uint32_t now = SDL_GetTicks();
     if (now - m_last_identify_ms >= 500 || m_stem.empty()) {
@@ -285,32 +430,40 @@ void CodesManager::Tick()
      * tight interval, while a one-shot patch is fine at 1000 ms.
      */
     int interval = g_config.codes.interval_ms;
-    if (interval < 1) interval = 1;
+    if (interval < 0) interval = 0;
     if (interval > 1000) interval = 1000;
-    if (now - m_last_apply_ms < (uint32_t)interval) {
-        return;
+
+    /*
+     * interval == 0 is the explicit Instantaneous mode.  It removes the
+     * millisecond throttle completely, so enabled cheats/patches are applied
+     * on every CodesManager::Tick() call (the fastest safe rate supported by
+     * the existing UI-thread/BQL integration).
+     */
+    if (interval != 0) {
+        if (now - m_last_apply_ms < (uint32_t)interval) {
+            return;
+        }
+        m_last_apply_ms = now;
     }
-    m_last_apply_ms = now;
 
-    std::vector<const xcheat::Node *> live;
-    CollectEnabled(m_cheats.root, &live);
-    CollectEnabled(m_patches.root, &live);
-    if (live.empty()) return;
+    /* Enabled blocks are compiled when the tree changes, never in the apply
+     * loop. Instantaneous mode can call Tick hundreds/thousands of times per
+     * second, so recursive tree walks and CodeList allocation/copying do not
+     * belong here. */
+    if (m_live.empty()) return;
 
-    /* The cache assumes paging is stable for the pass; drop it each time. */
+    /* The caches assume paging is stable for one apply pass. Invalidate in
+     * O(1); the engine's Memory attachment itself never changes. */
     xemu_guestmem_invalidate_cache();
+    if (!m_engine_attached) {
+        m_engine.Attach(&m_mem);
+        m_engine_attached = true;
+    } else {
+        m_engine.InvalidatePageMap();
+    }
 
-    m_engine.Attach(&m_mem);
-
-    // Block ids are the node pointer, narrowed. Type 3's once-per-activation
-    // latch and type E's switch state are keyed on this, so it has to be
-    // stable for as long as the tree is - which it is, since the tree only
-    // rebuilds on a game change, and that clears the state anyway.
-    for (const auto *n : live) {
-        xcodes::CodeList codes;
-        codes.reserve(n->codes.size());
-        for (const auto &c : n->codes) codes.push_back({c.cmd, c.val});
-        m_engine.ExecuteBlock(codes, (uint32_t)(uintptr_t)n);
+    for (const auto &block : m_live) {
+        m_engine.ExecuteBlock(block.codes, block.bid);
     }
 }
 
@@ -344,6 +497,7 @@ void CodesManager::DrawTree(xcheat::NodeList &nodes, int depth, Section *sec)
                     // and a type E switch does not come back on.
                     m_engine.ClearSwitches((uint32_t)(uintptr_t)n.get(), false);
                 }
+                RebuildLive();
             }
             if (!n->desc.empty() && ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("%s", n->desc.c_str());
@@ -383,14 +537,46 @@ void MainMenuCodesView::Draw()
     }
 
     int iv = g_config.codes.interval_ms;
-    ImGui::SetNextItemWidth(180.0f);
-    if (ImGui::SliderInt("Apply interval (ms)", &iv, 1, 1000)) {
-        if (iv < 1) iv = 1;
-        if (iv > 1000) iv = 1000;
-        g_config.codes.interval_ms = iv;
+    if (iv < 0) iv = 0;
+    if (iv > 1000) iv = 1000;
+
+    /* Preserve the user's last timed interval when Instantaneous is toggled. */
+    static int last_timed_interval = 16;
+    if (iv > 0) {
+        last_timed_interval = iv;
     }
-    ImGui::TextDisabled("How often enabled codes are re-applied. Lower is "
-                        "more responsive, higher is faster.");
+
+    bool instantaneous = (iv == 0);
+    if (ImGui::Checkbox("Instantaneous", &instantaneous)) {
+        if (instantaneous) {
+            g_config.codes.interval_ms = 0;
+            iv = 0;
+        } else {
+            iv = last_timed_interval;
+            if (iv < 1) iv = 1;
+            if (iv > 1000) iv = 1000;
+            g_config.codes.interval_ms = iv;
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Remove the apply-rate throttle and run enabled "
+                          "cheats/patches on every codes tick.");
+    }
+
+    if (instantaneous) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("No interval throttle (maximum apply rate)");
+    } else {
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::SliderInt("Apply interval (ms)", &iv, 1, 1000)) {
+            if (iv < 1) iv = 1;
+            if (iv > 1000) iv = 1000;
+            last_timed_interval = iv;
+            g_config.codes.interval_ms = iv;
+        }
+        ImGui::TextDisabled("How often enabled codes are re-applied. Lower is "
+                            "more responsive, higher is faster.");
+    }
 
     ImGui::Dummy(ImVec2(0, ImGui::GetStyle().WindowPadding.y));
     ImGui::TextWrapped(
@@ -404,6 +590,21 @@ void MainMenuCodesView::Draw()
                    xemu_settings_set_string(&g_config.codes.cheats_dir, path);
                    g_codes.LoadForCurrentGame();
                });
+
+    if (g_codes.Stem().empty()) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Edit cheats...")) {
+        OpenCodesEditor(g_codes.Cheats(), "Cheats");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload cheats")) {
+        g_codes.LoadForCurrentGame();
+    }
+    if (g_codes.Stem().empty()) {
+        ImGui::EndDisabled();
+    }
+
     g_codes.DrawSection(g_codes.Cheats(), "No cheats for this game.");
 
     SectionTitle("Patches");
@@ -412,5 +613,21 @@ void MainMenuCodesView::Draw()
                    xemu_settings_set_string(&g_config.codes.patches_dir, path);
                    g_codes.LoadForCurrentGame();
                });
+
+    if (g_codes.Stem().empty()) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Edit patches...")) {
+        OpenCodesEditor(g_codes.Patches(), "Patches");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload patches")) {
+        g_codes.LoadForCurrentGame();
+    }
+    if (g_codes.Stem().empty()) {
+        ImGui::EndDisabled();
+    }
+
     g_codes.DrawSection(g_codes.Patches(), "No patches for this game.");
+    DrawCodesEditor();
 }

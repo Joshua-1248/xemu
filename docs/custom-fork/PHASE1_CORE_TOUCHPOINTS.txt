@@ -1,0 +1,20 @@
+Feature Isolation Phase 1 — generic files intentionally modified
+
+ui/xui/main.cc
+  Narrow frame/UI calls only: codes tick, texture sync/hotkeys/commit,
+  fast-forward hotkey, TAS/script windows, debug windows.
+
+ui/xui/main-menu.cc
+  Delegates feature-specific settings sections to feature modules.
+
+ui/xui/menubar.cc
+  Generic menu shell plus narrow TAS/script/debug frontend calls.
+
+ui/xui/menubar.hh
+  TAS declarations removed; TAS feature header owns its API.
+
+ui/xui/meson.build
+  Adds subdir('features').
+
+Everything else added in Phase 1 lives under ui/xui/features/, docs/custom-fork/
+or scripts/.

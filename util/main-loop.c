@@ -34,6 +34,21 @@
 #include "block/thread-pool.h"
 #include "qemu/error-report.h"
 #include "qemu/queue.h"
+#include "xemu-features/fast-forward/fast-forward.h"
+
+/*
+ * libqemuutil is also linked into standalone QEMU tests/benchmarks. When
+ * Fast Forward is part of the build, keep one weak integration fallback so
+ * those binaries do not need the Xemu UI object. With the feature compiled
+ * out, fast-forward.h provides an inline false result and this symbol is not
+ * emitted at all.
+ */
+#ifdef CONFIG_XEMU_FEATURE_FAST_FORWARD
+bool __attribute__((weak)) xemu_fast_forward_can_unblock_main_loop(void)
+{
+    return false;
+}
+#endif
 #include "qom/object.h"
 
 #ifdef XBOX
@@ -670,6 +685,16 @@ void main_loop_wait(int nonblocking)
     timeout_ns = qemu_soonest_timeout(timeout_ns,
                                       timerlistgroup_deadline_ns(
                                           &main_loop_tlg));
+
+    /*
+     * Unlimited fast-forward is QEMU turbo mode: never block the host main
+     * loop waiting for a real-time deadline. Event/timer processing still
+     * runs every iteration, but the loop is allowed to consume the host as
+     * fast as possible.
+     */
+    if (xemu_fast_forward_can_unblock_main_loop()) {
+        timeout_ns = 0;
+    }
 
     ret = os_host_main_loop_wait(timeout_ns);
     mlpoll.state = ret < 0 ? MAIN_LOOP_POLL_ERR : MAIN_LOOP_POLL_OK;

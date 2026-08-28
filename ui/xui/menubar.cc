@@ -22,13 +22,17 @@
 #include "menubar.hh"
 #include "misc.hh"
 #include "widgets.hh"
+#include "actions.hh"
+#include "snapshot-manager.hh"
 #include "monitor.hh"
 #include "debug.hh"
-#include "disassembler.hh"
-#include "actions.hh"
 #include "compat.hh"
+#include "xemu-features/tas/studio.hh"
+#include "xemu-features/scripting/frontend.hh"
+#include "xemu-features/debug-tools/frontend.hh"
 #include "update.hh"
-#include "../xemu-os-utils.h"
+#include "../xemu-snapshots.h"
+
 
 extern float g_main_menu_height; // FIXME
 
@@ -85,6 +89,7 @@ void ProcessKeyboardShortcuts(void)
 #endif
 }
 
+
 void ShowMainMenu()
 {
     bool running = runstate_is_running();
@@ -99,6 +104,7 @@ void ShowMainMenu()
             if (ImGui::BeginMenu("Snapshot")) {
                 if (ImGui::MenuItem("Create Snapshot")) {
                     xemu_snapshots_save(NULL, NULL);
+                    TasNotifySnapshotCreated();
                     xemu_queue_notification("Created new snapshot");
                 }
 
@@ -216,15 +222,18 @@ void ShowMainMenu()
             ImGui::EndMenu();
         }
 
+        DrawTasMenu();
+
+
+        FeatureScriptToolsDrawMenu();
+
+
         if (ImGui::BeginMenu("Debug"))
         {
             ImGui::MenuItem("Monitor", "~", &monitor_window.is_open);
-            ImGui::MenuItem("Audio", NULL, &apu_window.m_is_open);
-            ImGui::MenuItem("Video", NULL, &video_window.m_is_open);
-#if XEMU_ENABLE_DISASSEMBLER
-            ImGui::MenuItem("Disassembler", NULL,
-                            &disassembler_window.m_is_open);
-#endif
+            ImGui::MenuItem("Audio", nullptr, &apu_window.m_is_open);
+            ImGui::MenuItem("Video", nullptr, &video_window.m_is_open);
+            FeatureDebugToolsDrawMenuItems();
 #ifdef CONFIG_RENDERDOC
             if (nv2a_dbg_renderdoc_available()) {
                 ImGui::MenuItem("RenderDoc: Capture", NULL, &g_capture_renderdoc_frame);
@@ -253,4 +262,6 @@ void ShowMainMenu()
         g_main_menu_height = ImGui::GetWindowHeight();
         ImGui::EndMainMenuBar();
     }
+
 }
+

@@ -54,6 +54,8 @@
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
 #include "ui/xemu-notifications.h"
+#include "xemu-features/fast-forward/timing.h"
+#include "xemu-features/tas/tas.h"
 
 #include <stb_image.h>
 #include <locale.h>
@@ -725,51 +727,83 @@ static void process_vblank(struct xemu_console *scon)
 {
     assert(bql_locked());
 
-    update_fps();
+    /* Canonical TAS frame boundary. Normal emulation pays only one cheap
+     * disabled check; all TAS bookkeeping stays off the VBLANK hot path until
+     * TAS is actually enabled. */
+    if (G_UNLIKELY(xemu_tas_enabled())) {
+        xemu_tas_on_vblank();
+        if (xemu_tas_consume_pause_request()) {
+            vm_stop(RUN_STATE_PAUSED);
+        }
+    }
 
-#if 0
-    static uint64_t last_ns = 0;
-    uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    uint64_t delta_ns = last_ns ? now_ns - last_ns : 0;
-    fprintf(stderr, "%s delta_ns=%"PRId64"\n", __func__, delta_ns);
-    last_ns = now_ns;
-#endif
+    bool tas_stepping = xemu_tas_frame_advance_remaining() > 0;
+    bool do_render = xemu_fast_forward_should_render_vblank(
+        vblank_interval_ns, runstate_is_running(), tas_stepping,
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
 
-    graphic_hw_update(scon->dcl.con);
+    if (do_render) {
+        update_fps();
+        graphic_hw_update(scon->dcl.con);
+    } else {
+        nv2a_trigger_vblank();
+    }
 }
 
 static void vblank_timer_callback(void *opaque)
 {
     struct xemu_console *scon = (struct xemu_console *)opaque;
-
+    bool tas_stepping = xemu_tas_frame_advance_remaining() > 0;
+    bool running = runstate_is_running();
+    int64_t interval_ns = xemu_fast_forward_timer_interval_ns(
+        vblank_interval_ns, running, tas_stepping);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    xemu_fast_forward_advance_guest_clock(vblank_interval_ns, running,
+                                           tas_stepping);
     process_vblank(scon);
-    timer_mod_ns(vblank_timer, now + vblank_interval_ns);
+    timer_mod_ns(vblank_timer, now + interval_ns);
 }
 
 static void *vblank_timer_thread(void *opaque)
 {
     struct xemu_console *scon = (struct xemu_console *)opaque;
     int64_t next_vblank = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t last_interval_ns = vblank_interval_ns;
 
     while (!qatomic_read(&qemu_exiting)) {
-        // Schedule next vblank at fixed interval (absolute deadline)
-        next_vblank += vblank_interval_ns;
-
-        // Wait until deadline
+        bool running = runstate_is_running();
+        int64_t interval_ns = xemu_fast_forward_thread_interval_ns(
+            vblank_interval_ns, running);
+        bool unlimited = interval_ns == 0;
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        if (now < next_vblank) {
-            SDL_DelayPrecise(next_vblank - now);
-        } else if (now > next_vblank + vblank_interval_ns) {
-            // We've fallen behind by more than one frame, reset to avoid
-            // rapid-fire catch-up
+
+        if (interval_ns != last_interval_ns) {
             next_vblank = now;
+            last_interval_ns = interval_ns;
+        }
+
+        if (!unlimited) {
+            next_vblank += interval_ns;
+            if (now < next_vblank) {
+                SDL_DelayPrecise(next_vblank - now);
+            } else if (now > next_vblank + interval_ns) {
+                next_vblank = now;
+            }
         }
 
         if (!qatomic_read(&qemu_exiting)) {
             xemu_main_loop_lock();
+            bool tas_stepping = xemu_tas_frame_advance_remaining() > 0;
+            xemu_fast_forward_advance_guest_clock(vblank_interval_ns, running,
+                                                   tas_stepping);
             process_vblank(scon);
             xemu_main_loop_unlock();
+        }
+
+        if (unlimited) {
+            /* Yield without adding a pacing delay in Unlimited mode. */
+            SDL_Delay(0);
         }
     }
 

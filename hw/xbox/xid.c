@@ -20,6 +20,7 @@
  */
 
 #include "xid.h"
+#include "xemu-features/tas/tas.h"
 
 /*
  * http://xbox-linux.cvs.sourceforge.net/viewvc/xbox-linux/kernel-2.6/drivers/usb/input/xpad.c
@@ -101,6 +102,14 @@ void update_input(USBXIDGamepadState *s)
     s->in_state.sThumbLY = state->axis[CONTROLLER_AXIS_LSTICK_Y];
     s->in_state.sThumbRX = state->axis[CONTROLLER_AXIS_RSTICK_X];
     s->in_state.sThumbRY = state->axis[CONTROLLER_AXIS_RSTICK_Y];
+
+    /* Keep normal XID polling essentially unchanged. Only enter the TAS core
+     * when TAS is actually enabled; the TAS core then performs only the active
+     * features (lag-note, automation, playback/overdub and/or capture). */
+    if (G_UNLIKELY(xemu_tas_enabled())) {
+        xemu_tas_process_xid_report(s->device_index, &s->in_state,
+                                    sizeof(s->in_state));
+    }
 }
 
 void usb_xid_handle_reset(USBDevice *dev)

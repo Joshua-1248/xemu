@@ -18,9 +18,9 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
-#include <map>
-#include <set>
 #include <unordered_map>
+#include <unordered_set>
+#include <array>
 
 namespace xcodes {
 
@@ -52,22 +52,44 @@ class PageMap {
 public:
     static constexpr uint32_t PD_PHYS = 0x0000F000;
 
-    void Attach(Memory *mem) { m_mem = mem; m_ram_size = mem->RamSize(); m_cache.clear(); }
+    void Attach(Memory *mem)
+    {
+        m_mem = mem;
+        m_ram_size = mem->RamSize();
+        Invalidate();
+    }
     bool ToPhys(uint32_t va, uint32_t *out) const;
-    void Invalidate() { m_cache.clear(); }
+    void Invalidate();
     bool Valid() const;
 
 private:
     bool rd32_phys(uint32_t pa, uint32_t *out) const;
 
+    struct CacheEntry {
+        uint32_t page = 0;
+        uint32_t base = 0;
+        uint32_t generation = 0;
+    };
+    static constexpr size_t CACHE_ENTRIES = 4096;
+
     Memory *m_mem = nullptr;
     uint32_t m_ram_size = 0;
-    mutable std::unordered_map<uint32_t, uint32_t> m_cache;
+    uint32_t m_generation = 1;
+    mutable std::array<CacheEntry, CACHE_ENTRIES> m_cache {};
 };
 
 class Engine {
 public:
-    void Attach(Memory *mem) { m_mem = mem; m_pagemap.Attach(mem); m_pagemap_dirty = true; }
+    void Attach(Memory *mem) {
+        m_mem = mem;
+        m_ram_size = mem->RamSize();
+        m_pagemap.Attach(mem);
+        m_pagemap_dirty = true;
+        m_pagemap_checked = false;
+        m_pagemap_valid = false;
+        m_switches.reserve(64);
+        m_increment_applied.reserve(64);
+    }
 
     // Run one cheat's code list once. `bid` identifies the cheat block and is
     // what type 3's once-per-activation latch and type E's switch state are
@@ -80,13 +102,21 @@ public:
     void ClearSwitches(uint32_t bid = 0, bool all = true);
 
     // Tell the translator the guest may have re-paged (level load).
-    void InvalidatePageMap() { m_pagemap_dirty = true; }
+    void InvalidatePageMap() {
+        m_pagemap_dirty = true;
+        m_pagemap_checked = false;
+    }
 
 private:
     struct SwitchKey {
         uint32_t bid, line;
-        bool operator<(const SwitchKey &o) const {
-            return bid != o.bid ? bid < o.bid : line < o.line;
+        bool operator==(const SwitchKey &o) const {
+            return bid == o.bid && line == o.line;
+        }
+    };
+    struct SwitchKeyHash {
+        size_t operator()(const SwitchKey &k) const {
+            return (size_t)k.bid * (size_t)0x9e3779b1u ^ (size_t)k.line;
         }
     };
     struct SwitchState { bool on = false; bool prev = false; };
@@ -106,8 +136,10 @@ private:
 
     bool EnsurePageMap();
     bool DReadValue(uint32_t offset, bool is_8bit, bool is_virtual, uint32_t *out);
-    bool ResolvePhysicalChain(uint32_t base_off, const std::vector<uint32_t> &offs, uint32_t *out);
-    bool ResolveVirtualChain(uint32_t base_va, const std::vector<uint32_t> &offs, uint32_t *out);
+    bool ResolvePhysicalChain(uint32_t base_off, const uint32_t *offs,
+                              size_t off_count, uint32_t *out);
+    bool ResolveVirtualChain(uint32_t base_va, const uint32_t *offs,
+                             size_t off_count, uint32_t *out);
 
     size_t Type3(const CodeList &codes, size_t idx, uint32_t offset, uint32_t bid);
     size_t Type4(const CodeList &codes, size_t idx, uint32_t offset, uint32_t val);
@@ -119,10 +151,18 @@ private:
     size_t TypeE(size_t idx, uint32_t cmd, uint32_t val, uint32_t bid);
 
     Memory *m_mem = nullptr;
+    uint32_t m_ram_size = 0;
     PageMap m_pagemap;
     bool m_pagemap_dirty = true;
-    std::map<SwitchKey, SwitchState> m_switches;
-    std::set<uint32_t> m_increment_applied;
+    bool m_pagemap_checked = false;
+    bool m_pagemap_valid = false;
+    std::unordered_map<SwitchKey, SwitchState, SwitchKeyHash> m_switches;
+    std::unordered_set<uint32_t> m_increment_applied;
+
+    /* Type 5 block copies can execute every Instantaneous tick. Reuse the
+     * largest buffer already allocated instead of malloc/free churn on every
+     * pass. resize() only grows capacity when a larger copy is encountered. */
+    std::vector<uint8_t> m_copy_scratch;
 };
 
 } // namespace xcodes

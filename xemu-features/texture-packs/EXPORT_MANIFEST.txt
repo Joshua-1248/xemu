@@ -1,0 +1,18 @@
+Texture Packs — Phase 4 independent export manifest
+
+COPY DIRECTORY:
+  xemu-features/texture-packs/
+
+BUILD OPTION:
+  xemu_feature_texture_packs
+
+CONFIG MACRO:
+  CONFIG_XEMU_FEATURE_TEXTURE_PACKS
+
+CORE/FRONTEND INTEGRATION SITES:
+- hw/xbox/nv2a/pgraph/gl/texture.c — binding lifecycle, sampler override, replacement upload, dumps, dynamic refresh and backend sync.
+- hw/xbox/nv2a/pgraph/vk/texture.c — creation plan, binding lifecycle, replacement upload, dumps, dynamic refresh and backend sync.
+- ui/xui/main.cc / ui/xui/main-menu.cc — frame/hotkey/render-commit and settings hooks.
+- hw/xbox/nv2a/pgraph/{meson.build,gl/meson.build,vk/meson.build} and ui/xui/meson.build — conditional source inclusion.
+
+See README.md for API, dependencies, threading, hot-path and disabled behavior.

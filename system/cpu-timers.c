@@ -101,6 +101,29 @@ int64_t cpu_get_clock(void)
 }
 
 /*
+ * Xemu fast-forward clock advance.
+ *
+ * Advance QEMU's real, migrated VM clock offset directly instead of wrapping
+ * QEMU_CLOCK_VIRTUAL in a fork-local transform. The timer VMState already
+ * serializes cpu_clock_offset, so the accelerated timeline remains
+ * self-consistent across snapshot save/load.
+ *
+ * Callers use this only while the VM is running.
+ */
+void xemu_virtual_clock_advance_ns(int64_t delta_ns)
+{
+    if (delta_ns <= 0) {
+        return;
+    }
+
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    timers_state.cpu_clock_offset += delta_ns;
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+/*
  * enable cpu_get_ticks()
  * Caller must hold BQL which serves as mutex for vm_clock_seqlock.
  */

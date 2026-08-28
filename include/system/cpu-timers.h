@@ -41,6 +41,15 @@ void qemu_timer_notify_cb(void *opaque, QEMUClockType type);
 /* get/set VIRTUAL clock and VM elapsed ticks via the cpus accel interface */
 int64_t cpus_get_virtual_clock(void);
 void cpus_set_virtual_clock(int64_t new_time);
+
+/*
+ * Xemu fast-forward virtual-clock control.
+ *
+ * Advance QEMU's ordinary migrated VM clock offset directly. There is no
+ * hidden clock-scale transform, so snapshots restore the same virtual
+ * timeline that guest/device timers were saved against.
+ */
+void xemu_virtual_clock_advance_ns(int64_t delta_ns);
 int64_t cpus_get_elapsed_ticks(void);
 
 #endif /* SYSTEM_CPU_TIMERS_H */

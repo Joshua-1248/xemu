@@ -17,6 +17,11 @@ specific_ss.add([gl_deps, files(
 	'shaders.c',
 	'surface.c',
 	'texture.c',
-	'texture-io.c',
 	'vertex.c',
 	)])
+
+if get_option('xemu_feature_texture_packs')
+	specific_ss.add([gl_deps, files(
+		'../../../../../xemu-features/texture-packs/texture-packs-gl.c',
+	)])
+endif

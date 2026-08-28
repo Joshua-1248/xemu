@@ -1,0 +1,17 @@
+0–200% Volume Amplifier — Phase 4 independent export manifest
+
+COPY DIRECTORY:
+  xemu-features/volume-amplifier/
+
+BUILD OPTION:
+  xemu_feature_volume_amplifier
+
+CONFIG MACRO:
+  CONFIG_XEMU_FEATURE_VOLUME_AMPLIFIER
+
+CORE/FRONTEND INTEGRATION SITES:
+- hw/xbox/mcpx/apu/monitor.c — one gain-application/reset boundary, with the native 0–100% fallback retained in core.
+- ui/xui/main-menu.cc and ui/xui/popup-menu.cc — slider maximum query.
+- hw/xbox/mcpx/apu/meson.build — conditional source inclusion.
+
+See README.md for API, dependencies, threading, hot-path and disabled behavior.
