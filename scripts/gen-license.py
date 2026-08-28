@@ -34,6 +34,15 @@ current_platform = linux
 versions = {}
 
 
+def version_from_file(path, pattern):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        head = f.read(4096)
+    match = re.search(pattern, head)
+    if not match:
+        raise RuntimeError(f"Failed to determine version from {path}")
+    return match.group(1)
+
+
 def banner(s):
     space = 1
     width = 80
@@ -61,6 +70,7 @@ class Lib:
         pkg_win=None,
         pkg_mac=None,
         pkg_ubuntu=None,
+        optional=False,
     ):
         self.name = name
         self.url = url
@@ -79,6 +89,7 @@ class Lib:
         self.pkg_win = pkg_win
         self.pkg_mac = pkg_mac
         self.pkg_ubuntu = pkg_ubuntu
+        self.optional = optional
 
     @property
     def version(self):
@@ -136,7 +147,8 @@ class Lib:
         if self.license_lines:
             start, end = self.license_lines
             d = "\n".join(d.splitlines()[start - 1 : end + 1])
-        with open(fname, "w") as f:
+        os.makedirs(os.path.dirname(self.license_path) or ".", exist_ok=True)
+        with open(self.license_path, "w", encoding="utf-8") as f:
             f.write(d)
         return d
 
@@ -154,7 +166,11 @@ class Lib:
 
     @property
     def does_ship(self):
-        return self.is_active and (self.does_ship_static or self.does_ship_dynamic)
+        if not (self.is_active and (self.does_ship_static or self.does_ship_dynamic)):
+            return False
+        if self.optional and self.pkgconfig and not self.pkgconfig.exists:
+            return False
+        return True
 
 
 class PkgConfig:
@@ -162,14 +178,32 @@ class PkgConfig:
         self.name = name
 
     @property
-    def modversion(self):
-        pkg_config = {
+    def command(self):
+        return {
             linux: "pkg-config",
             windows: "x86_64-w64-mingw32.static-pkg-config",
             macos: "pkg-config",
         }[current_platform]
+
+    @property
+    def exists(self):
+        try:
+            result = subprocess.run(
+                [self.command, "--exists", self.name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except FileNotFoundError:
+            return False
+        return result.returncode == 0
+
+    @property
+    def modversion(self):
         ver = subprocess.run(
-            [pkg_config, "--modversion", self.name], capture_output=True, check=True
+            [self.command, "--modversion", self.name],
+            capture_output=True,
+            check=True,
         )
         return ver.stdout.decode("utf-8").strip()
 
@@ -191,7 +225,18 @@ class Submodule:
                 )
                 if wrapdb_version:
                     return wrapdb_version.group(1)
-            assert False, "revision not found for subproject"
+                directory = re.search(
+                    r"^directory\s*=\s*(.*)", contents, re.MULTILINE
+                )
+                if directory:
+                    # wrap-file projects such as SDL3 encode their released
+                    # version in the extracted directory name (e.g.
+                    # SDL3-3.4.10).  Keep outbound license metadata tied to
+                    # the wrap instead of a stale hand-written version.
+                    match = re.search(r"(\d+(?:\.\d+)+)$", directory.group(1).strip())
+                    if match:
+                        return match.group(1)
+            assert False, "revision/version not found for subproject"
 
         try:
             return (
@@ -221,7 +266,7 @@ LIBS = [
         "https://www.qemu.org/",
         gplv2,
         "https://raw.githubusercontent.com/xemu-project/xemu/master/LICENSE",
-        version="6.0.0",
+        version=open("QEMU_VERSION", "r", encoding="utf-8").read().strip(),
     ),
     #
     # Built from source with xemu
@@ -261,7 +306,45 @@ LIBS = [
         "https://raw.githubusercontent.com/nothings/stb/master/LICENSE",
         license_lines=(4, 19),
         ships_static=all_platforms,
-        version="2.25",
+        version=version_from_file(
+            "ui/thirdparty/stb_image/stb_image.h",
+            r"stb_image - v([0-9.]+)",
+        ),
+    ),
+    Lib(
+        "stb_image_write",
+        "https://github.com/nothings/stb",
+        mit,
+        license_path="licenses/stb_image_write.license.txt",
+        ships_static=all_platforms,
+        version=version_from_file(
+            "ui/thirdparty/stb_image/stb_image_write.h",
+            r"stb_image_write - v([0-9.]+)",
+        ),
+    ),
+    Lib(
+        "nlohmann_json",
+        "https://github.com/nlohmann/json",
+        mit,
+        license_path="subprojects/json-3.2.0/LICENSE.MIT",
+        ships_static=all_platforms,
+        submodule=Submodule("subprojects/json.wrap"),
+    ),
+    Lib(
+        "genconfig",
+        "https://github.com/mborgerson/genconfig",
+        mit,
+        license_path="subprojects/genconfig/LICENSE.txt",
+        ships_static=all_platforms,
+        submodule=Submodule("subprojects/genconfig.wrap"),
+    ),
+    Lib(
+        "keycodemapdb-generated",
+        "https://gitlab.com/qemu-project/keycodemapdb",
+        bsd_3clause,
+        license_path="subprojects/keycodemapdb/LICENSE.BSD",
+        ships_static=all_platforms,
+        submodule=Submodule("subprojects/keycodemapdb.wrap"),
     ),
     Lib(
         "tomlplusplus",
@@ -329,6 +412,30 @@ LIBS = [
         submodule=Submodule("subprojects/glslang.wrap"),
     ),
     Lib(
+        "RenderDoc in-application API",
+        "https://renderdoc.org/",
+        mit,
+        license_path="licenses/renderdoc.license.txt",
+        ships_static=all_platforms,
+        version="in-tree API header",
+    ),
+    Lib(
+        "gloffscreen",
+        "https://github.com/xemu-project/xemu",
+        mit,
+        license_path="licenses/gloffscreen.license.txt",
+        ships_static=all_platforms,
+        version="in-tree",
+    ),
+    Lib(
+        "Xemu-Cheat-Engine-and-Trainer",
+        "https://github.com/Joshua-1248/Xemu-Cheat-Engine-and-Trainer",
+        mit,
+        license_path="licenses/xemu_trainer_lib.license.txt",
+        ships_static=all_platforms,
+        version="source-port provenance",
+    ),
+    Lib(
         "NVIDIA NVAPI",
         "https://github.com/NVIDIA/nvapi",
         mit,
@@ -369,7 +476,30 @@ LIBS = [
         pkg_win="sdl3",
         pkg_mac="sdl3",
         pkg_ubuntu="libsdl3-dev",
-        version="3.4.8",
+        submodule=Submodule("subprojects/sdl3.wrap"),
+    ),
+    # Optional dependencies introduced by this fork.  They are listed in the
+    # outbound notice when present on a platform where the xemu package ships
+    # or links the library.
+    Lib(
+        "libwebp",
+        "https://chromium.googlesource.com/webm/libwebp",
+        bsd_3clause,
+        license_path="licenses/libwebp.license.txt",
+        ships_static={windows},
+        ships_dynamic={macos, linux},
+        pkgconfig=PkgConfig("libwebp"),
+        optional=True,
+    ),
+    Lib(
+        "Capstone",
+        "https://www.capstone-engine.org/",
+        bsd_3clause,
+        license_path="licenses/capstone.license.txt",
+        ships_static={windows},
+        ships_dynamic={macos, linux},
+        pkgconfig=PkgConfig("capstone"),
+        optional=True,
     ),
     Lib(
         "glib-2.0",

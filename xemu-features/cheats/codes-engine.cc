@@ -14,6 +14,12 @@
 //
 // codes-engine.cc - Original Xbox cheat code interpreter.
 //
+// Source/reference project: Joshua-1248/Xemu-Cheat-Engine-and-Trainer
+// https://github.com/Joshua-1248/Xemu-Cheat-Engine-and-Trainer
+// Source project license: MIT (notice retained in
+// licenses/xemu_trainer_lib.license.txt). This native C++ port is
+// distributed under this file's GPL-2.0-or-later license.
+//
 // Direct port of xemu_trainer_lib/codes.py's execute_block() and helpers,
 // intended to drop into xemu as ui/xui/codes-engine.cc. Kept free of ImGui and
 // of QEMU headers so it can be built and differentially tested on the host

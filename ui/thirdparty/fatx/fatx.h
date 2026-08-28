@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Thin xemu-facing helper declaration; see fatx.c for libfatx provenance. */
 #ifndef FATX_H
 #define FATX_H
 

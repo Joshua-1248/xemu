@@ -168,7 +168,9 @@ Default Linux paths:
 The filename stem is derived from the XBE title information without requiring an
 external game database.
 
-The interpreter is a C++ port of the earlier Python implementation and was
+The interpreter is a native C++ port of the earlier MIT-licensed Python
+implementation in [Joshua-1248/Xemu-Cheat-Engine-and-Trainer](https://github.com/Joshua-1248/Xemu-Cheat-Engine-and-Trainer), principally
+`xemu_trainer_lib/codes.py` and `xemu_trainer_lib/cheatfiles.py`. It was
 validated differentially against that reference across fuzz seeds, directed edge
 cases, the reference game database, and parser files, including sanitizer runs.
 
@@ -445,43 +447,54 @@ them as named keys.
 
 This fork preserves the licensing structure of upstream xemu/QEMU. The emulator
 as a whole is distributed under the **GNU General Public License, version 2**,
-while individual source files may carry other GPL-compatible licenses of their
-own. See `LICENSE`, `COPYING`, and `COPYING.LIB` in the repository.
+while individual files and third-party components may carry other compatible
+licenses. See `LICENSE`, `COPYING`, `COPYING.LIB`, `licenses/`, and the notices
+retained beside third-party source.
 
-The root QEMU `LICENSE` also defines the fallback for source files with no
-per-file licensing information: those files are GPL version 2 or, at the
-recipient's option, any later version. Fork-owned source now carries explicit
-SPDX identifiers wherever practical instead of relying on that fallback.
+QEMU's root `LICENSE` defines the fallback for source files with no per-file
+licensing information: those files are GPL version 2 or, at the recipient's
+option, any later version. Fork-owned source carries explicit SPDX identifiers
+where practical instead of relying on that fallback. Existing upstream files
+retain their original copyright and license notices. Code moved or materially
+derived from differently licensed upstream components retains that lineage; for
+example, the isolated MCPX audio bridge and NV2A OpenGL/Vulkan texture adapters
+retain LGPL-2.1-or-later attribution.
 
-Existing upstream files retain their original copyright and license notices.
-Fork-specific source is normally GPL-2.0-or-later, but code moved or materially
-derived from differently licensed upstream components retains that lineage. In
-particular, the feature-owned MCPX audio bridge and NV2A OpenGL/Vulkan texture
-adapters are explicitly marked LGPL-2.1-or-later and preserve the relevant
-upstream attribution.
-
-Third-party components used by the custom features include:
+Important fork-relevant third-party components include:
 
 | Component | Use | License |
 | --- | --- | --- |
+| [SDL3](https://github.com/libsdl-org/SDL) | xemu host windowing, input, audio, and platform integration | zlib |
+| [Xemu Cheat Engine and Trainer](https://github.com/Joshua-1248/Xemu-Cheat-Engine-and-Trainer) / `xemu_trainer_lib` | Source/reference implementation for the native cheat parser/interpreter | MIT |
+| [libfatx](https://github.com/mborgerson/fatx) | Provenance for the FATX image helper | GPL-2.0-or-later |
 | [stb_image](https://github.com/nothings/stb) | PNG/GIF replacement decoding | MIT or Public Domain |
 | [stb_image_write](https://github.com/nothings/stb) | PNG texture dumping | MIT or Public Domain |
-| [libwebp](https://developers.google.com/speed/webp) | WebP replacement decoding | BSD-3-Clause |
+| [libwebp](https://developers.google.com/speed/webp) | WebP replacement decoding | BSD-3-Clause + WebM patent grant |
 | [Capstone](https://www.capstone-engine.org/) | x86 disassembly | BSD-3-Clause |
+| [glslang](https://github.com/KhronosGroup/glslang) | GLSL/SPIR-V toolchain used by Vulkan shader replacement support | See retained upstream license |
 
-`stb_image.h` already ships with upstream xemu. `stb_image_write.h` is included
-by this fork and retains its own license notice. libwebp and Capstone are not
-bundled; they are linked from the system when enabled/available.
+SDL3 is inherited from upstream xemu and retains its zlib notice in
+`licenses/SDL3.license.txt` and the SDL source distribution. `stb_image.h` ships
+with upstream xemu; `stb_image_write.h` is used by this fork and retains the stb
+notice. libwebp and Capstone are optional system libraries rather than bundled
+runtimes; if a distributor ships or statically links them, their notices must
+be shipped with that build.
 
-The Lua and Python consoles launch external system interpreters and do not bundle
-Lua or Python runtimes.
+The cheat/patch engine's native C++ implementation is GPL-2.0-or-later in this
+repository, while preserving the provenance and MIT notice of the earlier
+`xemu_trainer_lib` implementation from the Joshua-1248 Xemu Cheat Engine and
+Trainer project.
 
-Texture packs, replacement images, replacement WAVs, shader files, scripts, TAS
-movies, cheat files, and other user-authored content are not relicensed by this
-repository; their authors retain their own rights in that content.
+The Lua and Python consoles launch external system interpreters and do not
+bundle Lua or Python runtimes. Texture packs, replacement images, replacement
+WAVs, shader files, scripts, TAS movies, cheat files, and other user-authored
+content are not relicensed by this repository; their authors retain their own
+rights in that content.
 
-See `CREDITS.md`, `THIRD_PARTY_NOTICES.md`, and
-`docs/custom-fork/LICENSING_AND_PROVENANCE.md` for attribution and provenance.
+For the wider inherited dependency inventory and source provenance, see
+`CREDITS.md`, `THIRD_PARTY_NOTICES.md`,
+`docs/custom-fork/LICENSING_AND_PROVENANCE.md`, and the repository's `licenses/`
+directory.
 
 ---
 

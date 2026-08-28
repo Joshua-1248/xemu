@@ -14,6 +14,12 @@
 //
 // cheatfile.cc - Xbox cheat/patch .txt parser.
 //
+// Source/reference project: Joshua-1248/Xemu-Cheat-Engine-and-Trainer
+// https://github.com/Joshua-1248/Xemu-Cheat-Engine-and-Trainer
+// Source project license: MIT (notice retained in
+// licenses/xemu_trainer_lib.license.txt). This native C++ port is
+// distributed under this file's GPL-2.0-or-later license.
+//
 // Direct port of xemu_trainer_lib/cheatfiles.py's parse_cheat_text() and the
 // helpers it depends on. Intended as ui/xui/cheatfile.cc.
 //

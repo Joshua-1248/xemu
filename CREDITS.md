@@ -73,20 +73,38 @@ licensing and upstream attribution in its header.
 helpers. The retained source notices credit **Matt Borgerson** for the original
 xemu virtual-to-physical helper work.
 
-## Cheat-engine development reference
+## Cheat-engine source lineage
 
-The C++ cheat interpreter/parser in `xemu-features/cheats/` was developed from
-and differentially validated against an earlier Python development reference
-named `xemu_trainer_lib`, specifically `codes.py` and `cheatfiles.py`. That
-Python reference is **not distributed in this repository**.
+The native C++ cheat interpreter/parser in `xemu-features/cheats/` is a port of
+Joshua-1248's earlier Python project:
 
-The source materials available in this repository do not identify a separate
-public upstream URL or third-party license for `xemu_trainer_lib`. Accordingly,
-this repository does not claim or redistribute the Python package itself. The
-C++ files carry their own GPL-2.0-or-later notices. If an external upstream for
-that Python reference is identified later, its author, URL, and license should
-be added here and to `THIRD_PARTY_NOTICES.md` before redistributing that upstream
-source.
+- **Xemu Cheat Engine and Trainer** —
+  <https://github.com/Joshua-1248/Xemu-Cheat-Engine-and-Trainer>
+- source modules used as the principal behavioral/implementation reference:
+  `xemu_trainer_lib/codes.py` and `xemu_trainer_lib/cheatfiles.py`;
+- source-project license: **MIT**.
+
+The Python project is not bundled with this xemu fork. The native C++ files are
+distributed here under GPL-2.0-or-later, while the MIT source provenance and
+notice for the earlier implementation are retained in
+`THIRD_PARTY_NOTICES.md` and `licenses/xemu_trainer_lib.license.txt`.
+
+## FATX helper lineage
+
+`ui/thirdparty/fatx/fatx.c` contains FATX image-creation definitions derived
+from **libfatx**, part of Matt Borgerson's FATX project:
+<https://github.com/mborgerson/fatx>. The source project is
+GPL-2.0-or-later. The xemu helper now carries an explicit provenance comment
+and GPL-2.0-or-later SPDX identifier instead of only the historical
+`This is from libfatx` comment.
+
+## SDL3
+
+Upstream xemu uses **SDL3 / Simple DirectMedia Layer** for host platform,
+windowing, input, audio, and related integration. SDL3 is licensed under the
+**zlib license** and credits **Sam Lantinga and SDL contributors**. Its retained
+license is `licenses/SDL3.license.txt` and the SDL source distribution also
+contains its own `LICENSE.txt`.
 
 ## Third-party libraries and tools
 
@@ -97,10 +115,14 @@ Their own licenses remain controlling for those components.
 | --- | --- | --- |
 | [stb_image](https://github.com/nothings/stb) | PNG/GIF replacement decoding | MIT or Public Domain; upstream xemu copy retains its notice |
 | [stb_image_write](https://github.com/nothings/stb) | PNG texture dumping | MIT or Public Domain; bundled header retains its notice |
-| [libwebp](https://developers.google.com/speed/webp) | WebP still/animated replacement decoding | BSD-3-Clause; system library, not bundled by this fork |
+| [libwebp](https://developers.google.com/speed/webp) | WebP still/animated replacement decoding | BSD-3-Clause + retained WebM patent grant; system library, not bundled by this fork |
 | [Capstone](https://www.capstone-engine.org/) | x86 disassembly | BSD-3-Clause; system library, not bundled by this fork |
+| [Xemu Cheat Engine and Trainer](https://github.com/Joshua-1248/Xemu-Cheat-Engine-and-Trainer) | Source/reference implementation for native cheat engine | MIT; source project not bundled |
+| [libfatx](https://github.com/mborgerson/fatx) | Source provenance for FATX image helper | GPL-2.0-or-later |
 | [glslang](https://github.com/KhronosGroup/glslang) | GLSL-to-SPIR-V compilation used by Vulkan shader replacements | Upstream subproject; see `licenses/glslang.license.txt` |
-| [SDL](https://www.libsdl.org/) | Existing xemu host audio/input/window infrastructure used by fork hooks | Upstream xemu dependency; see repository license inventory |
+| [SDL3](https://github.com/libsdl-org/SDL) | Host windowing/input/audio/platform infrastructure used by xemu and fork hooks | zlib; see `licenses/SDL3.license.txt` |
+| [RenderDoc](https://renderdoc.org/) in-application API | Graphics capture API header compiled into xemu integration | MIT; Baldur Karlsson; see `licenses/renderdoc.license.txt` |
+| gloffscreen | Offscreen OpenGL abstraction used by NV2A | MIT; Intel/Collabora/Wayo/Matt Borgerson notices; see `licenses/gloffscreen.license.txt` |
 | Lua interpreters | Optional scripting-console runtime | External system executable; not bundled by this fork |
 | Python interpreters | Optional scripting-console runtime | External system executable; not bundled by this fork |
 

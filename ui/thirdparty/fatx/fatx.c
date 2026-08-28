@@ -1,10 +1,21 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * FATX helper provenance:
+ * Derived from libfatx in Matt Borgerson's FATX project:
+ * https://github.com/mborgerson/fatx
+ * Copyright (C) 2015 Matt Borgerson
+ *
+ * libfatx is GPL-2.0-or-later. The repository's COPYING file contains the
+ * GPLv2 text. The upstream FATX project also credits FATX research by
+ * Andrew de Quincey, Lucien Murray-Pitts, and Michael Steil.
+ */
 #include "fatx.h"
 
 #include "qemu/bswap.h"
 
 #define FATX_SIGNATURE 0x58544146
 
-// This is from libfatx
+// Structure/layout derived from libfatx (see provenance header above).
 #pragma pack(1)
 struct fatx_superblock {
     uint32_t signature;
