@@ -1,3 +1,13 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * Portions of this bridge are derived from the xemu/QEMU MCPX Audio
+ * Processing Unit voice-processing implementation. Original notices:
+ * Copyright (c) 2012 espes
+ * Copyright (c) 2018-2019 Jannik Vogel
+ * Copyright (c) 2019-2025 Matt Borgerson
+ *
+ * Feature isolation/integration changes are part of the Joshua-1248 fork.
+ */
 /*
  * xemu custom fork - isolated MCPX audio-pack bridge
  *

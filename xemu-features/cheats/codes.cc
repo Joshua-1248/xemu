@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // xemu User Interface - Codes (cheats and patches)
 //

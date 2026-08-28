@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* xemu custom fork - Original Xbox APU source audio dump/replacement */
 #ifndef XEMU_FEATURES_AUDIO_PACKS_H
 #define XEMU_FEATURES_AUDIO_PACKS_H

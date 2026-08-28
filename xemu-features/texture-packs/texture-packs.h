@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* xemu custom fork - texture dump/replacement public boundary */
 #ifndef XEMU_FEATURES_TEXTURE_PACKS_H
 #define XEMU_FEATURES_TEXTURE_PACKS_H

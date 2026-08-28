@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* xemu custom fork - Fast Forward host-audio transform */
 #include "qemu/osdep.h"
 #include <SDL3/SDL.h>

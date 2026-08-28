@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* xemu custom fork - optional Fast Forward public state API. */
 #ifndef XEMU_FAST_FORWARD_H
 #define XEMU_FAST_FORWARD_H

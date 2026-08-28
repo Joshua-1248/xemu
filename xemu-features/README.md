@@ -40,3 +40,14 @@ Example all-off configure arguments:
 - Shared guest-memory support is under `shared/` and is linked only when at least one tool that needs it is built.
 
 See each feature directory's `README.md` and `EXPORT_MANIFEST.txt` for its exact integration surface.
+
+## Licensing and attribution
+
+Fork-owned feature source is explicitly SPDX-tagged. Most feature code is
+`GPL-2.0-or-later`; adapter files that contain or are materially derived from
+upstream LGPL MCPX/NV2A implementation code retain `LGPL-2.1-or-later` and the
+relevant upstream attribution. Individual file headers are authoritative.
+
+See `../CREDITS.md`, `../THIRD_PARTY_NOTICES.md`, and
+`../docs/custom-fork/LICENSING_AND_PROVENANCE.md` before moving code across an
+upstream/custom ownership boundary.

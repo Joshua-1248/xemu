@@ -1,3 +1,12 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * Adapter for the xemu NV2A OpenGL renderer. The renderer lineage includes:
+ * Copyright (c) 2012 espes
+ * Copyright (c) 2015 Jannik Vogel
+ * Copyright (c) 2018-2024 Matt Borgerson
+ *
+ * Feature isolation/integration changes are part of the Joshua-1248 fork.
+ */
 /*
  * OpenGL adapter for the isolated texture-pack feature.
  */

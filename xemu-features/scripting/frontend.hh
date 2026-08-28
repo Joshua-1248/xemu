@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // xemu custom fork - Scripting frontend boundary
 #pragma once
 #include "config-host.h"

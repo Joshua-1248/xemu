@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * xemu custom CPU debug access - see debug-api.h.
  *

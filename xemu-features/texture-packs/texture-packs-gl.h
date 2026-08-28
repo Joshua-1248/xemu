@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * NV2A OpenGL texture-pack boundary. Renderer lineage and attribution are
+ * preserved in CREDITS.md and THIRD_PARTY_NOTICES.md.
+ */
 #ifndef XEMU_FEATURES_TEXTURE_PACKS_GL_H
 #define XEMU_FEATURES_TEXTURE_PACKS_GL_H
 #include "config-host.h"

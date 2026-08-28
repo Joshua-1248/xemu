@@ -443,15 +443,22 @@ them as named keys.
 
 ## Licensing
 
-This fork is distributed under the same overall licensing structure as upstream
-xemu, which is based on [QEMU](https://www.qemu.org/). The emulator as a whole is
-under the **GNU General Public License, version 2**. See `LICENSE`, `COPYING`, and
-`COPYING.LIB` in the repository.
+This fork preserves the licensing structure of upstream xemu/QEMU. The emulator
+as a whole is distributed under the **GNU General Public License, version 2**,
+while individual source files may carry other GPL-compatible licenses of their
+own. See `LICENSE`, `COPYING`, and `COPYING.LIB` in the repository.
 
-Each source file retains its own licensing information. New fork-specific source
-files are GPL-2.0-or-later. Modifications to existing files retain the license of
-the file being modified; for example, the NV2A renderer code extended by this
-fork includes LGPL-2.1-or-later files.
+The root QEMU `LICENSE` also defines the fallback for source files with no
+per-file licensing information: those files are GPL version 2 or, at the
+recipient's option, any later version. Fork-owned source now carries explicit
+SPDX identifiers wherever practical instead of relying on that fallback.
+
+Existing upstream files retain their original copyright and license notices.
+Fork-specific source is normally GPL-2.0-or-later, but code moved or materially
+derived from differently licensed upstream components retains that lineage. In
+particular, the feature-owned MCPX audio bridge and NV2A OpenGL/Vulkan texture
+adapters are explicitly marked LGPL-2.1-or-later and preserve the relevant
+upstream attribution.
 
 Third-party components used by the custom features include:
 
@@ -473,7 +480,8 @@ Texture packs, replacement images, replacement WAVs, shader files, scripts, TAS
 movies, cheat files, and other user-authored content are not relicensed by this
 repository; their authors retain their own rights in that content.
 
-See `CREDITS.md` for attribution.
+See `CREDITS.md`, `THIRD_PARTY_NOTICES.md`, and
+`docs/custom-fork/LICENSING_AND_PROVENANCE.md` for attribution and provenance.
 
 ---
 

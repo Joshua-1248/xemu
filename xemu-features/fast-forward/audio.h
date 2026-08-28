@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef XEMU_FEATURES_FAST_FORWARD_AUDIO_H
 #define XEMU_FEATURES_FAST_FORWARD_AUDIO_H
 #include "config-host.h"

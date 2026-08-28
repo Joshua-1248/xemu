@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Structural audit for xemu custom-fork Feature Isolation Phase 4."""
 from pathlib import Path
 import re, sys, tempfile, subprocess

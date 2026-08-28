@@ -1,3 +1,9 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * MCPX/APU feature boundary associated with code derived from the xemu/QEMU
+ * MCPX Audio Processing Unit implementation by espes, Jannik Vogel,
+ * Matt Borgerson, and contributors.
+ */
 #ifndef XEMU_FEATURES_AUDIO_PACKS_APU_H
 #define XEMU_FEATURES_AUDIO_PACKS_APU_H
 #include "config-host.h"

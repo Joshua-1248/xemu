@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* xemu custom fork - optional 0-200% host output amplifier */
 #include "qemu/osdep.h"
 #include <math.h>
