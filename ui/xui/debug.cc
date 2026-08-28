@@ -368,7 +368,7 @@ void DebugVideoWindow::Draw()
     }
 
     float alpha = m_transparent ? 0.2 : 1.0;
-    PushWindowTransparencySettings(m_transparent, 0.2);
+    int style_pop_cnt = PushWindowTransparencySettings(m_transparent, 0.2);
 
     if (!m_resize_init_complete || (g_viewport_mgr.m_scale != m_prev_scale)) {
         ImGui::SetNextWindowSize(ImVec2(
@@ -482,7 +482,7 @@ void DebugVideoWindow::Draw()
         g_config.display.debug.video.transparency = m_transparent;
     }
     ImGui::End();
-    // Removed unbalanced ImGui::PopStyleColor(5);
+    ImGui::PopStyleColor(style_pop_cnt);
 }
 
 DebugApuWindow apu_window;
