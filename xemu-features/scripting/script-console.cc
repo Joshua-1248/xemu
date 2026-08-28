@@ -36,7 +36,17 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+// QEMU maps close() to qemu_close_wrap() on Windows.  Keep that macro out
+// of libstdc++'s <fstream>, where it would otherwise rename
+// std::basic_filebuf::close() and produce release/LTO link failures.
+#ifdef _WIN32
+#pragma push_macro("close")
+#undef close
+#endif
 #include <fstream>
+#ifdef _WIN32
+#pragma pop_macro("close")
+#endif
 #include <sstream>
 #include <iomanip>
 #include <cstdint>
