@@ -4,8 +4,7 @@
  * Everything here needs cpu.h (CPUX86State) or capstone, both of which are
  * only available to TARGET-SPECIFIC sources. ui/xui is compiled
  * target-agnostic, so the debugger UI cannot touch either directly - it calls
- * through this plain C API instead, and xemu-dbg.c lives in specific_ss
- * beside xemu-xbe.c and xemu-guestmem.c.
+ * through this plain C API instead, and the implementation is built only with the optional debug-tools feature.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

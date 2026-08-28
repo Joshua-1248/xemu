@@ -396,3 +396,22 @@ option('rust', type: 'feature', value: 'disabled',
        description: 'Rust support')
 option('strict_rust_lints', type: 'boolean', value: false,
        description: 'Enable stricter set of Rust warnings')
+
+# xemu custom fork optional features. Each option controls physical source
+# inclusion; disabled features expose only compile-time neutral/no-op hooks.
+option('xemu_feature_audio_packs', type: 'boolean', value: true,
+       description: 'Build xemu custom source-audio dump/replacement packs')
+option('xemu_feature_texture_packs', type: 'boolean', value: true,
+       description: 'Build xemu custom texture dump/replacement packs')
+option('xemu_feature_cheats', type: 'boolean', value: true,
+       description: 'Build xemu custom cheats/patches engine and UI')
+option('xemu_feature_tas', type: 'boolean', value: true,
+       description: 'Build xemu custom TAS/TAStudio tools')
+option('xemu_feature_scripting', type: 'boolean', value: true,
+       description: 'Build xemu custom Lua/Python scripting consoles')
+option('xemu_feature_debug_tools', type: 'boolean', value: true,
+       description: 'Build xemu custom disassembler/debugger extension')
+option('xemu_feature_fast_forward', type: 'boolean', value: true,
+       description: 'Build xemu custom fast-forward system')
+option('xemu_feature_volume_amplifier', type: 'boolean', value: true,
+       description: 'Build xemu custom 0-200% host output volume extension')

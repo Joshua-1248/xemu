@@ -17,7 +17,7 @@
 //
 #pragma once
 
-#include "main-menu.hh"
+#include "ui/xui/main-menu.hh"
 #include "cheatfile.hh"
 #include "codes-engine.hh"
 
@@ -25,7 +25,7 @@
 #include <vector>
 
 // Guest RAM as the engine sees it: physical offsets, forwarded to the shared
-// accessor in xemu-guestmem.h. The engine never learns whether it is talking
+// accessor in xemu-features/shared/guest-memory.h. The engine never learns whether it is talking
 // to a real machine or the test harness's flat buffer, which is what let the
 // interpreter be verified on the host before any of this existed.
 class GuestMemory : public xcodes::Memory {
@@ -66,15 +66,25 @@ private:
     // Resolve the directory for one kind. Caller frees.
     static char *DirFor(const char *folder);
 
+    struct CompiledBlock {
+        const xcheat::Node *node = nullptr;
+        xcodes::CodeList codes;
+        uint32_t bid = 0;
+    };
+
     void LoadOne(Section &sec, const char *folder);
     void SaveOne(Section &sec, const char *folder);
+    void RebuildLive();
+    void RebuildLiveFrom(const xcheat::NodeList &nodes);
 
     std::string m_stem, m_title;
     uint32_t    m_last_identify_ms = 0;
     uint32_t    m_last_apply_ms = 0;
     Section m_cheats, m_patches;
+    std::vector<CompiledBlock> m_live;
     GuestMemory m_mem;
     xcodes::Engine m_engine;
+    bool m_engine_attached = false;
 };
 
 extern CodesManager g_codes;

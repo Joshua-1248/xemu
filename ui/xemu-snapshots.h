@@ -47,8 +47,18 @@ typedef struct XemuSnapshotData {
 char *xemu_get_currently_loaded_disc_path(void);
 int xemu_snapshots_list(QEMUSnapshotInfo **info, XemuSnapshotData **extra_data,
                         Error **err);
+/* Lightweight metadata query for TAS caches: snapshot names only, with no
+ * PNG/extra-data decoding or GL texture creation. Caller frees with g_strfreev. */
+char **xemu_snapshots_list_names(int *count, Error **err);
 void xemu_snapshots_load(const char *vm_name, Error **err);
+/* Load a snapshot while keeping the VM stopped. Returns true on success and
+ * reports whether the VM had been running before the restore. TAS uses this to
+ * install the matching movie/input state before guest execution resumes. */
+bool xemu_snapshots_load_paused(const char *vm_name, bool *was_running, Error **err);
 void xemu_snapshots_save(const char *vm_name, Error **err);
+/* Internal TAS/automation checkpoints do not need a PNG preview. Avoiding the
+ * framebuffer readback + PNG encode makes frequent cached states much cheaper. */
+void xemu_snapshots_save_no_thumbnail(const char *vm_name, Error **err);
 void xemu_snapshots_delete(const char *vm_name, Error **err);
 
 void xemu_snapshots_save_extra_data(QEMUFile *f);

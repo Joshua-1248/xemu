@@ -36,7 +36,9 @@ float GetSliderValueForMousePos(ImVec2 mouse, ImVec2 pos, ImVec2 size);
 void DrawSlider(float v, bool hovered, ImVec2 pos, ImVec2 size);
 void DrawToggle(bool enabled, bool hovered, ImVec2 pos, ImVec2 size);
 bool Toggle(const char *str_id, bool *v, const char *description = nullptr);
-void Slider(const char *str_id, float *v, const char *description = nullptr);
+void Slider(const char *str_id, float *v, const char *description = nullptr,
+            float min_value = 0.0f, float max_value = 1.0f,
+            float step = 0.05f);
 void FilePicker(const char *str_id, const char *current_path,
                 const SDL_DialogFileFilter *filters, int nfilters, bool dir,
                 std::function<void(const char *new_path)> on_select);

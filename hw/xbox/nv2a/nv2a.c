@@ -193,16 +193,24 @@ int nv2a_get_screen_off(void)
     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
 }
 
+void nv2a_trigger_vblank(void)
+{
+    NV2AState *d = g_nv2a;
+    if (d == NULL) {
+        return;
+    }
+
+    d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    d->pcrtc.raster = 0;
+    nv2a_update_irq(d);
+}
+
 static void nv2a_vga_gfx_update(void *opaque)
 {
     VGACommonState *vga = opaque;
     vga->hw_ops->gfx_update(vga);
 
-    NV2AState *d = container_of(vga, NV2AState, vga);
-    d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
-    d->pcrtc.raster = 0;
-
-    nv2a_update_irq(d);
+    nv2a_trigger_vblank();
 }
 
 static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)

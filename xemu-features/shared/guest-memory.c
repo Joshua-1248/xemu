@@ -32,7 +32,7 @@
 #include "system/hw_accel.h"
 #include "cpu.h"
 #include "exec/target_page.h"
-#include "xemu-guestmem.h"
+#include "xemu-features/shared/guest-memory.h"
 
 #ifdef CONFIG_TCG
 #include "exec/tb-flush.h"
@@ -58,14 +58,21 @@
 static struct {
     uint64_t va_page;
     uint64_t pa_page;
-    bool valid;
+    uint32_t generation;
 } xlate_cache[XLATE_CACHE_ENTRIES];
 
+static uint32_t xlate_generation = 1;
 static bool xlate_synced;
 
 void xemu_guestmem_invalidate_cache(void)
 {
-    memset(xlate_cache, 0, sizeof(xlate_cache));
+    /* O(1) invalidation: this is called once per cheat/TAS memory batch and
+     * can be extremely hot in Instantaneous mode. */
+    ++xlate_generation;
+    if (xlate_generation == 0) {
+        memset(xlate_cache, 0, sizeof(xlate_cache));
+        xlate_generation = 1;
+    }
     xlate_synced = false;
 }
 
@@ -77,7 +84,8 @@ int xemu_virt_to_phys(uint64_t vaddr_in, uint64_t *phys_addr)
     uint64_t va_page = vaddr_in & TARGET_PAGE_MASK;
     unsigned slot = (unsigned)((va_page >> 12) & (XLATE_CACHE_ENTRIES - 1));
 
-    if (xlate_cache[slot].valid && xlate_cache[slot].va_page == va_page) {
+    if (xlate_cache[slot].generation == xlate_generation &&
+        xlate_cache[slot].va_page == va_page) {
         *phys_addr = xlate_cache[slot].pa_page + (vaddr_in & ~TARGET_PAGE_MASK);
         return 0;
     }
@@ -101,7 +109,7 @@ int xemu_virt_to_phys(uint64_t vaddr_in, uint64_t *phys_addr)
 
     xlate_cache[slot].va_page = va_page;
     xlate_cache[slot].pa_page = gpa;
-    xlate_cache[slot].valid = true;
+    xlate_cache[slot].generation = xlate_generation;
 
     *phys_addr = gpa + (vaddr_in & ~TARGET_PAGE_MASK);
     return 0;
@@ -109,16 +117,20 @@ int xemu_virt_to_phys(uint64_t vaddr_in, uint64_t *phys_addr)
 
 uint64_t xemu_guest_ram_size(void)
 {
-    /*
-     * Retail is 64 MB, devkit 128 MB. Only used to reject an out-of-range
-     * address before it reaches dma_memory_write, so falling back to the
-     * smaller value fails closed.
-     */
+    /* RAM size is immutable for the lifetime of an Xbox machine. Cache it so
+     * every tiny cheat/script memory access does not walk QOM just to learn
+     * whether this is a 64 MiB retail or 128 MiB devkit configuration. */
+    static uint64_t cached_ram_size;
+    if (cached_ram_size != 0) {
+        return cached_ram_size;
+    }
+
     MachineState *ms = MACHINE(qdev_get_machine());
     if (ms == NULL || ms->ram_size == 0) {
         return 64 * 1024 * 1024;
     }
-    return ms->ram_size;
+    cached_ram_size = ms->ram_size;
+    return cached_ram_size;
 }
 
 ssize_t xemu_phys_read(uint64_t phys, void *buf, size_t len)
@@ -126,7 +138,8 @@ ssize_t xemu_phys_read(uint64_t phys, void *buf, size_t len)
     if (len == 0) {
         return 0;
     }
-    if (phys + len > xemu_guest_ram_size()) {
+    const uint64_t ram_size = xemu_guest_ram_size();
+    if (phys >= ram_size || len > ram_size - phys) {
         return -1;
     }
     if (dma_memory_read(&address_space_memory, phys, buf, len,
@@ -143,7 +156,8 @@ ssize_t xemu_phys_write(uint64_t phys, const void *buf, size_t len)
     if (len == 0) {
         return 0;
     }
-    if (phys + len > xemu_guest_ram_size()) {
+    const uint64_t ram_size = xemu_guest_ram_size();
+    if (phys >= ram_size || len > ram_size - phys) {
         return -1;
     }
 

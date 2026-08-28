@@ -222,57 +222,6 @@ typedef struct TextureBinding {
     uint64_t hash;
     unsigned int draw_time;
     uint32_t submit_time;
-
-    /* Texture replacement: image was created at the replacement's size. */
-    bool replaced;
-    uint32_t replacement_width;
-    uint32_t replacement_height;
-
-    /*
-     * Animated replacement (.gif/.webp). anim_frame is the frame index
-     * currently resident in the VkImage, so the per-bind sweep can skip
-     * re-uploading when the displayed frame has not changed.
-     */
-    bool is_animated;
-    int anim_frame;
-
-    /*
-     * Procedural shader replacement (<hash>.shader). The shader is rendered
-     * into `image` through its own render pass each refresh, so the rest of
-     * the pipeline sees an ordinary sampled texture. shader_src_* hold the
-     * optional iChannel0 source (the image replacement for the same hash).
-     */
-    bool has_shader;
-    VkRenderPass shader_render_pass;
-    VkFramebuffer shader_framebuffer;
-    VkPipeline shader_pipeline;
-    VkPipelineLayout shader_pipeline_layout;
-    VkDescriptorSetLayout shader_ds_layout;
-    VkDescriptorPool shader_ds_pool;
-    VkDescriptorSet shader_ds;
-    VkSampler shader_sampler;
-    VkImage shader_src_image;
-    VkImageView shader_src_view;
-    VmaAllocation shader_src_alloc;
-    ShaderModuleInfo *shader_vs;
-    ShaderModuleInfo *shader_fs;
-    uint32_t shader_width;
-    uint32_t shader_height;
-    int shader_frame;
-    int64_t shader_last_us;
-    /*
-     * iChannel0 animation: when the same hash also has a .gif or .webp,
-     * the source image is re-uploaded as frames advance so the shader
-     * distorts live content rather than a frozen first frame.
-     */
-    bool shader_src_animated;
-    int shader_src_frame;
-    uint32_t shader_src_width;
-    uint32_t shader_src_height;
-    /* Hot reload: mtime as last compiled, and time of the last check. */
-    int64_t shader_mtime;
-    int64_t shader_check_us;
-    uint64_t shader_hash;
 } TextureBinding;
 
 typedef struct QueryReport {

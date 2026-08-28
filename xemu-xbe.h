@@ -23,6 +23,7 @@
 #define XEMU_XBE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // http://www.caustik.com/cxbx/download/xbe.htm
 #pragma pack(1)
@@ -107,6 +108,14 @@ extern "C" {
 
 // Get current XBE info
 struct xbe *xemu_get_xbe_info(void);
+
+/*
+ * Lightweight title-ID query. Unlike xemu_get_xbe_info(), this reads only
+ * the handful of header/certificate fields needed to identify the running
+ * title and performs no heap allocation. Intended for high-frequency feature
+ * polling (codes, texture packs, TAS metadata).
+ */
+bool xemu_get_xbe_title_id(uint32_t *title_id);
 
 #ifdef __cplusplus
 }

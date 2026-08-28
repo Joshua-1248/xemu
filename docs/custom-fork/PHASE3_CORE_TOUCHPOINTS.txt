@@ -1,0 +1,24 @@
+Feature Isolation Phase 3 — core renderer touchpoints
+
+OpenGL core:
+  hw/xbox/nv2a/pgraph/gl/renderer.h
+    TextureBinding restored to upstream-shaped fields. No pack state.
+  hw/xbox/nv2a/pgraph/gl/texture.c
+    Narrow texture-pack hooks for lifecycle, dump/replacement, sampler policy,
+    dynamic refresh and cache synchronization.
+
+Vulkan core:
+  hw/xbox/nv2a/pgraph/vk/renderer.h
+    TextureBinding restored to upstream-shaped fields. No pack state.
+  hw/xbox/nv2a/pgraph/vk/texture.c
+    Narrow plan/lifecycle/dump/replacement/dynamic-refresh/cache-sync hooks.
+  hw/xbox/nv2a/pgraph/vk/meson.build
+    Builds feature-owned Vulkan adapter.
+
+Feature-owned implementation:
+  hw/xbox/features/texture-packs.c/.h
+  hw/xbox/features/texture-packs-gl.c/.h
+  hw/xbox/features/texture-packs-vk.c/.h
+
+No custom animation/procedural-shader/replacement fields remain in either
+renderer TextureBinding structure.

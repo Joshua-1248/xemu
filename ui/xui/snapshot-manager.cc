@@ -31,6 +31,8 @@ SnapshotManager::SnapshotManager()
     m_load_failed = false;
     m_open_pending = false;
     m_snapshots_len = 0;
+    m_last_refresh_ms = 0;
+    m_refresh_requested = true;
 }
 
 SnapshotManager::~SnapshotManager()
@@ -42,6 +44,18 @@ SnapshotManager::~SnapshotManager()
 
 void SnapshotManager::Refresh()
 {
+    /* Listing snapshots decodes xemu metadata (including thumbnails). The
+     * Settings/Snapshots page renders at host frame rate, but a snapshot list
+     * does not need to be rebuilt 60+ times a second. Keep it responsive at
+     * 4 Hz and allow mutations to request an immediate refresh next frame. */
+    const uint32_t now = SDL_GetTicks();
+    if (!m_refresh_requested && m_last_refresh_ms != 0 &&
+        now - m_last_refresh_ms < 250) {
+        return;
+    }
+    m_refresh_requested = false;
+    m_last_refresh_ms = now;
+
     Error *err = NULL;
 
     if (!m_load_failed) {

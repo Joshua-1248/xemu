@@ -22,4 +22,9 @@ specific_ss.add([volk, libglslang, vma, vulkan, spirv_reflect,
 		)
 	])
 
+if get_option('xemu_feature_texture_packs')
+	specific_ss.add([volk, libglslang, vma, vulkan, spirv_reflect,
+		files('../../../../../xemu-features/texture-packs/texture-packs-vk.c')])
+endif
+
 endif

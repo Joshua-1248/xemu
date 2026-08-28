@@ -1,0 +1,31 @@
+Xemu Custom Fork Feature Isolation Phase 4 - Static Validation - 2026-08-28
+
+BASELINE:
+  Main(5).zip SHA-256: 2d78d39d42730f53dd6665398372581310ad8696685c4149749373144469eb77
+
+STRUCTURAL / PUBLIC INTERFACE AUDIT:
+FEATURE ISOLATION PHASE 4 AUDIT: PASS
+ - top-level feature ownership present
+ - eight independent Meson options/config flags present
+ - legacy ownership trees absent
+ - FF audio/timing + volume algorithms out of core
+ - renderer sidecar invariant preserved
+ - pack config reads absent from NV2A/MCPX core
+ - shared custom helpers conditionally linked
+ - public headers compile all-OFF, all-ON, and each single-feature mode
+
+MOVED IMPLEMENTATION DIFFERENTIAL CHECK:
+  Audio Packs generic/APU: include-path changes only.
+  Texture Packs generic/GL/VK: include-path changes only.
+  Cheats engine/parser/runtime: relocation/include-path changes only.
+  TAS core/studio: relocation/include-path/comment changes only.
+  Scripting/debugger: relocation/include-path changes only.
+  Fast Forward frontend: relocation/include-path changes only; timing/audio policy extracted to dedicated modules.
+
+MESON CONFIGURE PARSE:
+  Default/all-ON configure reached dependency discovery and stopped at missing host glib-2.0 development dependency.
+  All-OFF configure (all eight -Dxemu_feature_*=false options) reached the same dependency discovery point.
+  Therefore option parsing/configure syntax succeeded in both configurations; full compile/link was not possible in this container.
+
+AUTHORITATIVE REMAINING TEST:
+  User Linux tree: ninja -C build qemu-system-i386

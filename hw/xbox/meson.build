@@ -19,3 +19,7 @@ specific_ss.add(files(
 	))
 subdir('nv2a')
 subdir('mcpx')
+
+if get_option('xemu_feature_tas')
+	specific_ss.add(files('../../xemu-features/tas/core.c'))
+endif

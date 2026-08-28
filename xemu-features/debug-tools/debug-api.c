@@ -1,5 +1,5 @@
 /*
- * xemu CPU debug access - see xemu-dbg.h.
+ * xemu custom CPU debug access - see debug-api.h.
  *
  * Include set mirrors xemu-xbe.c (which compiles in this tree with these
  * exact headers) plus target/i386's cpu.h for CPUX86State.
@@ -21,8 +21,8 @@
 #include "exec/target_page.h"
 #include "exec/watchpoint.h"
 
-#include "xemu-dbg.h"
-#include "xemu-guestmem.h"
+#include "xemu-features/debug-tools/debug-api.h"
+#include "xemu-features/shared/guest-memory.h"
 
 /* Handles the CONFIG_CAPSTONE guard itself and supplies stub constants when
  * capstone is absent, so this include needs no #ifdef around it. */
@@ -119,10 +119,13 @@ int xemu_dbg_disasm(uint32_t addr, int count, XemuDbgInsn *out)
 {
 #ifdef CONFIG_CAPSTONE
     /*
-     * Opened once and kept. cs_open()/cs_close() per call is not cheap, and
-     * the UI's backward-scroll heuristic calls this in a loop.
+     * Keep both the Capstone handle and its reusable instruction object for
+     * the lifetime of xemu. cs_disasm(..., 1, &ptr) allocates/free()s an
+     * instruction for every line; the debugger's backward-scroll heuristic
+     * can decode hundreds of candidates in a single UI action.
      */
     static csh handle;
+    static cs_insn *insn;
     static bool handle_ready;
     int produced = 0;
 
@@ -133,23 +136,21 @@ int xemu_dbg_disasm(uint32_t addr, int count, XemuDbgInsn *out)
         if (cs_open(CS_ARCH_X86, CS_MODE_32, &handle) != CS_ERR_OK) {
             return 0;
         }
+        insn = cs_malloc(handle);
+        if (insn == NULL) {
+            cs_close(&handle);
+            return 0;
+        }
         handle_ready = true;
     }
 
     while (produced < count) {
         uint8_t buf[16];
         ssize_t got;
-        cs_insn *insn = NULL;
-        size_t n;
 
         memset(&out[produced], 0, sizeof(out[produced]));
         out[produced].addr = addr;
 
-        /*
-         * Read a whole instruction's worth. A short read is normal at the end
-         * of a mapped page, so take whatever came back and let capstone
-         * decide whether it is enough.
-         */
         got = xemu_virt_read(addr, buf, sizeof(buf));
         if (got <= 0) {
             out[produced].len = 1;
@@ -161,8 +162,10 @@ int xemu_dbg_disasm(uint32_t addr, int count, XemuDbgInsn *out)
             continue;
         }
 
-        n = cs_disasm(handle, buf, (size_t)got, addr, 1, &insn);
-        if (n == 0) {
+        const uint8_t *code = buf;
+        size_t size = (size_t)got;
+        uint64_t pc = addr;
+        if (!cs_disasm_iter(handle, &code, &size, &pc, insn)) {
             out[produced].len = 1;
             out[produced].bytes[0] = buf[0];
             out[produced].valid = false;
@@ -173,16 +176,15 @@ int xemu_dbg_disasm(uint32_t addr, int count, XemuDbgInsn *out)
             continue;
         }
 
-        out[produced].len = (uint8_t)MIN(insn[0].size, 16);
-        memcpy(out[produced].bytes, insn[0].bytes, out[produced].len);
+        out[produced].len = (uint8_t)MIN(insn->size, 16);
+        memcpy(out[produced].bytes, insn->bytes, out[produced].len);
         snprintf(out[produced].mnemonic, sizeof(out[produced].mnemonic), "%s",
-                 insn[0].mnemonic);
+                 insn->mnemonic);
         snprintf(out[produced].ops, sizeof(out[produced].ops), "%s",
-                 insn[0].op_str);
+                 insn->op_str);
         out[produced].valid = true;
 
-        addr += insn[0].size ? insn[0].size : 1;
-        cs_free(insn, n);
+        addr += insn->size ? insn->size : 1;
         produced++;
     }
 

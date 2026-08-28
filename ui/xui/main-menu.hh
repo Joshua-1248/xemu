@@ -17,6 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 #pragma once
+#include "config-host.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -76,11 +77,13 @@ public:
     void Draw() override;
 };
 
+#ifdef CONFIG_XEMU_FEATURE_CHEATS
 class MainMenuCodesView : public virtual MainMenuTabView
 {
 public:
     void Draw() override;
 };
+#endif
 
 class NetworkInterface
 {
@@ -185,17 +188,21 @@ protected:
                                     m_input_button,
                                     m_display_button,
                                     m_audio_button,
-                                    m_codes_button,
                                     m_network_button,
                                     m_snapshots_button,
                                     m_system_button,
                                     m_about_button;
+#ifdef CONFIG_XEMU_FEATURE_CHEATS
+    MainMenuTabButton               m_codes_button;
+#endif
     std::vector<MainMenuTabView*>   m_views;
     MainMenuGeneralView             m_general_view;
     MainMenuInputView               m_input_view;
     MainMenuDisplayView             m_display_view;
     MainMenuAudioView               m_audio_view;
+#ifdef CONFIG_XEMU_FEATURE_CHEATS
     MainMenuCodesView               m_codes_view;
+#endif
     MainMenuNetworkView             m_network_view;
     MainMenuSnapshotsView           m_snapshots_view;
     MainMenuSystemView              m_system_view;

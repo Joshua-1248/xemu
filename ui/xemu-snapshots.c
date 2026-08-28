@@ -42,6 +42,7 @@ static QEMUSnapshotInfo *xemu_snapshots_metadata = NULL;
 static XemuSnapshotData *xemu_snapshots_extra_data = NULL;
 static int xemu_snapshots_len = 0;
 static bool xemu_snapshots_dirty = true;
+static bool xemu_snapshots_suppress_thumbnail = false;
 
 const char **g_snapshot_shortcut_index_key_map[] = {
     &g_config.general.snapshots.shortcuts.f5,
@@ -217,13 +218,45 @@ done:
     return xemu_snapshots_len;
 }
 
+char **xemu_snapshots_list_names(int *count, Error **err)
+{
+    BlockDriverState *bs;
+    QEMUSnapshotInfo *info = NULL;
+    int snapshots_len;
+
+    if (count) {
+        *count = 0;
+    }
+    bs = bdrv_all_find_vmstate_bs(NULL, false, NULL, err);
+    if (!bs) {
+        return NULL;
+    }
+
+    snapshots_len = bdrv_snapshot_list(bs, &info);
+    if (snapshots_len < 0) {
+        error_setg(err, "Could not list internal snapshots");
+        g_free(info);
+        return NULL;
+    }
+
+    char **names = g_new0(char *, (size_t)snapshots_len + 1);
+    for (int i = 0; i < snapshots_len; ++i) {
+        names[i] = g_strdup(info[i].name);
+    }
+    g_free(info);
+    if (count) {
+        *count = snapshots_len;
+    }
+    return names;
+}
+
 char *xemu_get_currently_loaded_disc_path(void)
 {
     char *file = NULL;
     BlockInfoList *block_list, *info;
 
     block_list = qmp_query_block(NULL);
-    
+
     for (info = block_list; info; info = info->next) {
         if (strcmp("ide0-cd1", info->value->device)) {
             continue;
@@ -238,11 +271,28 @@ char *xemu_get_currently_loaded_disc_path(void)
     return file;
 }
 
+bool xemu_snapshots_load_paused(const char *vm_name, bool *was_running, Error **err)
+{
+    const bool vm_running = runstate_is_running();
+    if (was_running) {
+        *was_running = vm_running;
+    }
+    vm_stop(RUN_STATE_RESTORE_VM);
+
+    const bool loaded = load_snapshot(vm_name, NULL, false, NULL, err);
+    if (!loaded && vm_running && !runstate_is_running()) {
+        /* A failed TAS/greenzone restore must not strand an otherwise-running
+         * VM in the stopped state. Successful callers deliberately retain the
+         * pause until their movie/input cursor has been restored atomically. */
+        vm_start();
+    }
+    return loaded;
+}
+
 void xemu_snapshots_load(const char *vm_name, Error **err)
 {
-    bool vm_running = runstate_is_running();
-    vm_stop(RUN_STATE_RESTORE_VM);
-    if (load_snapshot(vm_name, NULL, false, NULL, err) && vm_running) {
+    bool vm_running = false;
+    if (xemu_snapshots_load_paused(vm_name, &vm_running, err) && vm_running) {
         vm_start();
     }
 }
@@ -250,6 +300,14 @@ void xemu_snapshots_load(const char *vm_name, Error **err)
 void xemu_snapshots_save(const char *vm_name, Error **err)
 {
     save_snapshot(vm_name, true, NULL, false, NULL, err);
+}
+
+void xemu_snapshots_save_no_thumbnail(const char *vm_name, Error **err)
+{
+    const bool previous = xemu_snapshots_suppress_thumbnail;
+    xemu_snapshots_suppress_thumbnail = true;
+    save_snapshot(vm_name, true, NULL, false, NULL, err);
+    xemu_snapshots_suppress_thumbnail = previous;
 }
 
 void xemu_snapshots_delete(const char *vm_name, Error **err)
@@ -274,7 +332,10 @@ void xemu_snapshots_save_extra_data(QEMUFile *f)
     }
 
     size_t thumbnail_size = 0;
-    void *thumbnail_buf = xemu_snapshots_create_framebuffer_thumbnail_png(&thumbnail_size);
+    void *thumbnail_buf = NULL;
+    if (!xemu_snapshots_suppress_thumbnail) {
+        thumbnail_buf = xemu_snapshots_create_framebuffer_thumbnail_png(&thumbnail_size);
+    }
 
     qemu_put_be32(f, XEMU_SNAPSHOT_DATA_MAGIC);
     qemu_put_be32(f, XEMU_SNAPSHOT_DATA_VERSION);

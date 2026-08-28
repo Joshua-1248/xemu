@@ -1,0 +1,8 @@
+Shared guest-memory service
+
+COPY WHEN NEEDED BY: cheats, TAS, scripting, or debug-tools.
+FILES:
+  xemu-features/shared/guest-memory.c
+  xemu-features/shared/guest-memory.h
+BUILD INTEGRATION:
+  root meson.build conditional specific_ss source inclusion.

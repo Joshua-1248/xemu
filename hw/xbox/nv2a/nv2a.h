@@ -30,4 +30,11 @@ unsigned int nv2a_get_surface_scale_factor(void);
 const uint8_t *nv2a_get_dac_palette(void);
 int nv2a_get_screen_off(void);
 
+/*
+ * Raise the emulated NV2A VBLANK interrupt without performing a host-side
+ * framebuffer/display update. Used by fast-forward so guest timing can run
+ * faster without forcing the renderer to produce hundreds of frames/sec.
+ */
+void nv2a_trigger_vblank(void);
+
 #endif

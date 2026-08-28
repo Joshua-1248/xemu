@@ -34,6 +34,7 @@
 #include "actions.hh"
 #include "common.hh"
 #include "xemu-hud.h"
+#include "ui/xemu-monitor.h"
 #include "misc.hh"
 #include "gl-helpers.hh"
 #include "input-manager.hh"
@@ -45,23 +46,27 @@
 #include "main-menu.hh"
 #include "popup-menu.hh"
 #include "notifications.hh"
-#include "monitor.hh"
-#include "debug.hh"
-#include "disassembler.hh"
 #include "welcome.hh"
 #include "menubar.hh"
+#include "monitor.hh"
+#include "debug.hh"
 #include "compat.hh"
-#include "codes.hh"
+#include "xemu-features/cheats/runtime.hh"
+#include "xemu-features/debug-tools/frontend.hh"
+#include "xemu-features/fast-forward/frontend.hh"
+#include "xemu-features/scripting/frontend.hh"
+#include "xemu-features/texture-packs/frontend.hh"
+#include "xemu-features/tas/studio.hh"
 
 extern "C" {
-#include "hw/xbox/nv2a/pgraph/gl/texture-io.h"
+#include "system/cpu-timers.h"
+#include "system/runstate.h"
 }
 #if defined(_WIN32)
 #include "update.hh"
 #endif
 
 bool g_screenshot_pending;
-bool g_texture_reload_pending;
 const char *g_snapshot_pending_load_name;
 
 float g_main_menu_height;
@@ -71,7 +76,6 @@ static float g_last_scale;
 static int g_vsync;
 static GLuint g_tex;
 static bool g_flip_req;
-
 
 static void InitializeStyle()
 {
@@ -226,15 +230,14 @@ void xemu_hud_update(void)
     ImGui::NewFrame();
     ProcessKeyboardShortcuts();
 
-    // Keep per-title texture dump/replacement paths in sync with the
-    // running XBE. Self-skips when the title has not changed.
-    nv2a_texture_io_refresh_paths();
+    // Custom feature services are isolated behind narrow frontend hooks.
+    FeatureTexturePacksFrameSync();
 
     // Apply enabled cheats and patches. Sits beside the texture path refresh
     // because both key off the running XBE's title id and both are cheap
     // no-ops when nothing changed. Must stay on this thread: it reaches
     // dma_memory_write, which needs the BQL the UI thread already holds.
-    g_codes.Tick();
+    FeatureCodesTick();
 
 #if defined(CONFIG_RENDERDOC)
     if (g_capture_renderdoc_frame) {
@@ -250,7 +253,9 @@ void xemu_hud_update(void)
         const uint32_t timeout = 5000;
         const float fade_duration = 1000.0;
         bool menu_wakeup = g_input_mgr.MouseMoved();
-        if (menu_wakeup) {
+        // TAS editing is an active UI workflow. Keep the menu/UI visible while
+        // TAS Studio or Input Display is open even when the mouse is idle.
+        if (menu_wakeup || TasWindowsOpen() || FeatureScriptToolsWindowsOpen()) {
             last_check = now;
         }
         if ((now-last_check) > timeout) {
@@ -276,6 +281,11 @@ void xemu_hud_update(void)
         }
     }
 
+    // TAS tool windows are independent of the auto-hiding main menu bar.
+    // Keep the piano roll/input display alive even when the mouse is idle.
+    ShowTasWindows();
+    FeatureScriptToolsShowWindows();
+
     static uint32_t last_mouse_move = 0;
     if (g_input_mgr.MouseMoved()) {
         last_mouse_move = now;
@@ -285,6 +295,12 @@ void xemu_hud_update(void)
     if (g_config.display.ui.hide_cursor && (now - last_mouse_move) > 3000) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_None);
     }
+
+    bool gameplay_has_focus =
+        !ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) &&
+        !g_scene_mgr.IsDisplayingScene();
+    FeatureFastForwardUpdateHotkey(gameplay_has_focus);
+
 
     if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) &&
         !g_scene_mgr.IsDisplayingScene()) {
@@ -322,46 +338,14 @@ void xemu_hud_update(void)
             }
         }
 
-        // Texture dump / replacement hotkeys
-        if (ImGui::IsKeyPressed(
-                (enum ImGuiKey)g_config.general.texture_replace_toggle_key)) {
-            g_config.general.texture_replace_enabled =
-                !g_config.general.texture_replace_enabled;
-            g_texture_reload_pending = true;
-            xemu_queue_notification(
-                g_config.general.texture_replace_enabled ?
-                    "Texture replacements: ON" :
-                    "Texture replacements: OFF");
-        }
-
-        if (ImGui::IsKeyPressed(
-                (enum ImGuiKey)g_config.general.texture_replace_reload_key)) {
-            g_texture_reload_pending = true;
-            xemu_queue_notification("Reloading texture replacements");
-        }
-
-        if (ImGui::IsKeyPressed(
-                (enum ImGuiKey)g_config.general.texture_dump_toggle_key)) {
-            g_config.general.texture_dump_enabled =
-                !g_config.general.texture_dump_enabled;
-            if (g_config.general.texture_dump_enabled) {
-                /* Rescan so textures deleted from disk are dumped again. */
-                nv2a_texture_io_rebuild_dump_index();
-            }
-            xemu_queue_notification(
-                g_config.general.texture_dump_enabled ?
-                    "Texture dumping: STARTED" :
-                    "Texture dumping: STOPPED");
-        }
+        FeatureTexturePacksProcessHotkeys();
     }
 
     first_boot_window.Draw();
     monitor_window.Draw();
     apu_window.Draw();
     video_window.Draw();
-#if XEMU_ENABLE_DISASSEMBLER
-    disassembler_window.Draw();
-#endif
+    FeatureDebugToolsDrawWindows();
     compatibility_reporter_window.Draw();
 #if defined(_WIN32)
     update_window.Draw();
@@ -389,12 +373,5 @@ void xemu_hud_render()
         g_screenshot_pending = false;
     }
 
-    if (g_texture_reload_pending) {
-        /* Rescan disk first so newly added files are picked up, then drop
-         * cached bindings so they are re-resolved against the new index. */
-        nv2a_texture_io_rebuild_replacement_index();
-        nv2a_texture_io_rebuild_dump_index();
-        nv2a_texture_cache_flush();
-        g_texture_reload_pending = false;
-    }
+    FeatureTexturePacksRenderCommit();
 }

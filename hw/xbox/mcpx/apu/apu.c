@@ -20,6 +20,8 @@
  */
 
 #include "apu_int.h"
+#include "xemu-features/audio-packs/audio-packs.h"
+#include "xemu-features/fast-forward/fast-forward.h"
 
 MCPXAPUState *g_state; // Used via debug handlers
 
@@ -172,16 +174,37 @@ static void throttle(MCPXAPUState *d)
         return;
     }
 
+    const int ff_mode = xemu_fast_forward_mode();
+    const bool fast_forward = ff_mode != 1;
+    const bool unlimited = ff_mode == 0;
+    const int multiplier = ff_mode >= 2 ? ff_mode : 1;
+    const int64_t frame_us = MAX(1, EP_FRAME_US / multiplier);
+
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+
+    /*
+     * Unlimited mode is explicitly host-unbounded. Audio is discarded by
+     * monitor.c while fast-forward is active, so there is no queue to pace.
+     */
+    if (unlimited) {
+        d->next_frame_time_us = 0;
+        return;
+    }
     throttle_update_debug(d, start_us);
     int queued_bytes = -1;
 
-    if (d->monitor.stream) {
+    /*
+     * At normal speed the audio queue is xemu's primary real-time pacing
+     * signal. During fast-forward, audio is deliberately discarded by
+     * monitor.c, so do not let the host audio queue pull us back to 1x.
+     */
+    if (!fast_forward && d->monitor.stream) {
         queued_bytes = SDL_GetAudioStreamQueued(d->monitor.stream);
         if (queued_bytes >= 0) {
             throttle_record_queue(d, queued_bytes);
         }
-        while (!d->pause_requested && queued_bytes >= d->monitor.queued_bytes_high) {
+        while (!d->pause_requested &&
+               queued_bytes >= d->monitor.queued_bytes_high) {
             qemu_cond_timedwait(&d->cond, &d->lock, EP_FRAME_US / 1000);
             if (d->pause_requested) {
                 break;
@@ -190,28 +213,38 @@ static void throttle(MCPXAPUState *d)
         }
     }
 
-    if (queued_bytes < 0 || queued_bytes > d->monitor.queued_bytes_low) {
+    if (fast_forward ||
+        queued_bytes < 0 ||
+        queued_bytes > d->monitor.queued_bytes_low) {
         int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         if (d->next_frame_time_us == 0 ||
             now_us - d->next_frame_time_us > EP_FRAME_US) {
             d->next_frame_time_us = now_us;
         }
+
         while (!d->pause_requested) {
             now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-            int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
-            if (remaining_ms > 0) {
+            int64_t remaining_us = d->next_frame_time_us - now_us;
+            if (remaining_us > 0) {
+                /*
+                 * qemu_cond_timedwait() accepts milliseconds here. Preserve
+                 * short waits by using at least 1 ms rather than truncating
+                 * them to zero.
+                 */
+                int64_t remaining_ms = MAX(1, remaining_us / 1000);
                 qemu_cond_timedwait(&d->cond, &d->lock, remaining_ms);
             } else {
                 break;
             }
         }
-        d->next_frame_time_us += EP_FRAME_US;
+        d->next_frame_time_us += frame_us;
 
-        /* Avoid drift toward watermark */
-        if (queued_bytes >= 0) {
+        /* Avoid drift toward the audio watermark only at normal speed. */
+        if (!fast_forward && queued_bytes >= 0) {
             int mid = (d->monitor.queued_bytes_low +
                        d->monitor.queued_bytes_high) / 2;
-            d->next_frame_time_us += (queued_bytes > mid) - (queued_bytes < mid);
+            d->next_frame_time_us +=
+                (queued_bytes > mid) - (queued_bytes < mid);
         }
     }
 }
@@ -322,6 +355,7 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     memset(d->regs, 0, sizeof(d->regs));
 
     mcpx_apu_vp_reset(d);
+    xemu_audio_packs_reset();
 
     // FIXME: Reset DSP state
     dsp_invalidate_opcache(d->gp.dsp);
@@ -417,6 +451,7 @@ static void mcpx_apu_realize(PCIDevice *dev, Error **errp)
 
     mcpx_apu_vp_init(d);
     mcpx_apu_dsp_init(d);
+    xemu_audio_packs_init();
 
     Error *local_err = NULL;
     mcpx_apu_monitor_init(d, &local_err);
@@ -446,6 +481,7 @@ static void mcpx_apu_exitfn(PCIDevice *dev)
     qemu_thread_join(&d->apu_thread);
     mcpx_apu_vp_finalize(d);
     mcpx_apu_monitor_finalize(d);
+    xemu_audio_packs_finalize();
 }
 
 static bool vp_dsp_dma_read_count_needed(void *opaque)

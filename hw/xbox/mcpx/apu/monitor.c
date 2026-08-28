@@ -18,6 +18,8 @@
  */
 
 #include "apu_int.h"
+#include "xemu-features/fast-forward/audio.h"
+#include "xemu-features/volume-amplifier/volume.h"
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
@@ -28,6 +30,8 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     };
 
     d->monitor.stream = NULL;
+    xemu_fast_forward_audio_reset(NULL);
+    xemu_volume_amplifier_reset(NULL);
 
     if (!SDL_Init(SDL_INIT_AUDIO)) {
         error_setg(errp, "SDL_Init failed: %s", SDL_GetError());
@@ -63,7 +67,10 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     if (d->monitor.stream) {
+        xemu_fast_forward_audio_reset(NULL);
+        xemu_volume_amplifier_reset(NULL);
         SDL_DestroyAudioStream(d->monitor.stream);
+        d->monitor.stream = NULL;
     }
 }
 
@@ -74,10 +81,26 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     }
 
     if (d->monitor.stream) {
-        float vu = pow(fmax(0.0, fmin(g_config.audio.volume_limit, 1.0)), M_E);
-        SDL_SetAudioStreamGain(d->monitor.stream, vu);
-        SDL_PutAudioStreamData(d->monitor.stream, d->monitor.frame_buf,
-                            sizeof(d->monitor.frame_buf));
+        /* Keep the native 0-100% path intact when the optional amplifier is
+         * compiled out. The custom module owns only the extended 0-200%
+         * behavior and its setter cache. */
+        if (!xemu_volume_amplifier_apply(d->monitor.stream,
+                                          g_config.audio.volume_limit)) {
+            double volume =
+                fmax(0.0, fmin(g_config.audio.volume_limit, 1.0));
+            SDL_SetAudioStreamGain(d->monitor.stream, pow(volume, M_E));
+        }
+
+        /* Fast Forward may consume/transform the completed host block. With
+         * the feature omitted, this inline hook is false and normal APU audio
+         * follows the ordinary path below. */
+        if (!xemu_fast_forward_audio_submit(d->monitor.stream,
+                                             d->monitor.frame_buf,
+                                             d->monitor.queued_bytes_high)) {
+            SDL_PutAudioStreamData(d->monitor.stream,
+                                   d->monitor.frame_buf,
+                                   sizeof(d->monitor.frame_buf));
+        }
     }
 
     memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));

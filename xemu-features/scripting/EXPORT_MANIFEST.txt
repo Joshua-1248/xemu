@@ -1,0 +1,17 @@
+Lua / Python Scripting — Phase 4 independent export manifest
+
+COPY DIRECTORY:
+  xemu-features/scripting/
+
+BUILD OPTION:
+  xemu_feature_scripting
+
+CONFIG MACRO:
+  CONFIG_XEMU_FEATURE_SCRIPTING
+
+CORE/FRONTEND INTEGRATION SITES:
+- ui/xui/main.cc — show windows and include open-window state in UI wakeup.
+- ui/xui/menubar.cc — scripting menu hook.
+- ui/xui/meson.build and root meson.build — conditional feature/shared-memory sources.
+
+See README.md for API, dependencies, threading, hot-path and disabled behavior.

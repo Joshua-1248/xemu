@@ -1,0 +1,17 @@
+Cheats / Patches — Phase 4 independent export manifest
+
+COPY DIRECTORY:
+  xemu-features/cheats/
+
+BUILD OPTION:
+  xemu_feature_cheats
+
+CONFIG MACRO:
+  CONFIG_XEMU_FEATURE_CHEATS
+
+CORE/FRONTEND INTEGRATION SITES:
+- ui/xui/main.cc — one FeatureCodesTick() runtime hook.
+- ui/xui/meson.build — conditional frontend/engine source inclusion.
+- root meson.build — includes xemu-features/shared/guest-memory.c only when tooling that needs guest memory is enabled.
+
+See README.md for API, dependencies, threading, hot-path and disabled behavior.

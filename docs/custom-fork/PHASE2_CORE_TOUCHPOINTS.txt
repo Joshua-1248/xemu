@@ -1,0 +1,51 @@
+Custom Fork Feature Isolation Phase 2 — core touchpoints
+Date: 2026-08-28
+
+Feature-owned hardware modules:
+  hw/xbox/features/texture-packs.c
+  hw/xbox/features/texture-packs.h
+  hw/xbox/features/texture-packs-gl.c
+  hw/xbox/features/texture-packs-gl.h
+  hw/xbox/features/audio-packs.c
+  hw/xbox/features/audio-packs.h
+  hw/xbox/features/audio-packs-apu.c
+  hw/xbox/features/audio-packs-apu.h
+
+Texture pack core bridge files:
+  hw/xbox/nv2a/pgraph/gl/texture.c
+    - replacement/dump/shader/animation queries
+    - one renderer_sync cache invalidation hook
+    - backend registration
+  hw/xbox/nv2a/pgraph/vk/texture.c
+    - replacement/dump/shader/animation queries
+    - one renderer_sync cache invalidation hook
+    - backend registration
+
+Texture compatibility-only old paths (not compiled):
+  hw/xbox/nv2a/pgraph/gl/texture-io.c
+  hw/xbox/nv2a/pgraph/gl/texture-io.h
+
+Audio pack core bridge files:
+  hw/xbox/mcpx/apu/apu.c
+    - init/reset/finalize lifecycle
+  hw/xbox/mcpx/apu/vp/vp.c
+    - voice reset
+    - guest CBO event
+    - one source-discovery hook
+    - replacement sample/cursor/finished queries
+    - automatic guest retrigger/seek
+    - replacement rate-scale query
+    - frame-boundary sync
+
+Audio compatibility-only old paths (not compiled):
+  hw/xbox/mcpx/apu/audio-io.c
+  hw/xbox/mcpx/apu/audio-io.h
+
+Core schema invariants:
+  PASS target: no g_config.general.texture_* reads in GL/Vulkan texture.c
+  PASS target: no g_config.audio.dump_enabled/replace_enabled/dump_skip_replaced
+               reads in MCPX vp.c
+
+Next reduction target:
+  Move texture replacement/animation/procedural-shader binding state out of
+  renderer.h TextureBinding structures into feature-owned backend sidecars.

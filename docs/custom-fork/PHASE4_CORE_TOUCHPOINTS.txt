@@ -1,0 +1,35 @@
+Feature Isolation Phase 4 — native Xemu/QEMU integration touchpoints
+
+BUILD/CONFIG
+meson_options.txt
+meson.build
+ui/xui/meson.build
+hw/xbox/meson.build
+hw/xbox/mcpx/apu/meson.build
+hw/xbox/nv2a/pgraph/meson.build
+hw/xbox/nv2a/pgraph/gl/meson.build
+hw/xbox/nv2a/pgraph/vk/meson.build
+
+MCPX/APU
+hw/xbox/mcpx/apu/apu.c
+hw/xbox/mcpx/apu/apu_int.h
+hw/xbox/mcpx/apu/monitor.c
+hw/xbox/mcpx/apu/vp/vp.c
+
+NV2A TEXTURES
+hw/xbox/nv2a/pgraph/gl/texture.c
+hw/xbox/nv2a/pgraph/vk/texture.c
+
+INPUT/TIMING
+hw/xbox/xid.c
+ui/xemu.c
+util/main-loop.c
+
+FRONTEND
+ui/xui/main.cc
+ui/xui/main-menu.cc
+ui/xui/main-menu.hh
+ui/xui/menubar.cc
+ui/xui/popup-menu.cc
+
+Everything else specific to these optional systems is owned by xemu-features/.

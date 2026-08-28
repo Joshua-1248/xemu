@@ -19,6 +19,7 @@
 #include "common.hh"
 #include "scene-manager.hh"
 #include "widgets.hh"
+
 #include "main-menu.hh"
 #include "font-manager.hh"
 #include "input-manager.hh"
@@ -30,13 +31,15 @@
 #include "reporting.hh"
 #include "qapi/error.h"
 #include "actions.hh"
+#include "xemu-features/fast-forward/frontend.hh"
+#include "xemu-features/texture-packs/frontend.hh"
+#include "xemu-features/audio-packs/frontend.hh"
+#include "xemu-features/volume-amplifier/volume.h"
+#include "xemu-features/tas/studio.hh"
 
 #include "../xemu-input.h"
 #include "../xemu-notifications.h"
 #include "../xemu-settings.h"
-extern "C" {
-#include "hw/xbox/nv2a/pgraph/gl/texture-io.h"
-}
 #include "../xemu-monitor.h"
 #include "../xemu-version.h"
 #include "../xemu-net.h"
@@ -82,6 +85,10 @@ void MainMenuGeneralView::Draw()
                [](const char *path) {
                    xemu_settings_set_string(&g_config.general.games_dir, path);
                });
+
+    FeatureFastForwardDrawSettings();
+    FeatureTasDrawGeneralSettings();
+
     // toggle("Throttle DVD/HDD speeds", &g_config.general.throttle_io,
     //        "Limit DVD/HDD throughput to approximate Xbox load times");
 }
@@ -740,51 +747,6 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
     }
 }
 
-// Click-to-capture hotkey binder. Stores raw ImGuiKey values so the value
-// can be compared directly against ImGui::IsKeyPressed() in the main loop.
-static void TextureHotkeyBinder(const char *label, int *key_value)
-{
-    static const char *capturing_label = nullptr;
-    bool capturing = (capturing_label == label);
-
-    const char *key_name = "(unset)";
-    if (!capturing && *key_value > 0) {
-        const char *n = ImGui::GetKeyName((ImGuiKey)*key_value);
-        if (n && n[0]) {
-            key_name = n;
-        }
-    }
-
-    ImGui::PushID(label);
-    ImGui::Text("%s", label);
-    ImGui::SameLine(ImGui::GetWindowWidth() * 0.5f);
-
-    char btn[128];
-    snprintf(btn, sizeof(btn), "%s##bind",
-             capturing ? "Press a key..." : key_name);
-
-    if (ImGui::Button(btn, ImVec2(ImGui::GetWindowWidth() * 0.35f, 0))) {
-        capturing_label = capturing ? nullptr : label;
-        capturing = !capturing;
-    }
-
-    if (capturing) {
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            capturing_label = nullptr;
-        } else {
-            for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END;
-                 k++) {
-                if (ImGui::IsKeyPressed((ImGuiKey)k)) {
-                    *key_value = k;
-                    capturing_label = nullptr;
-                    break;
-                }
-            }
-        }
-    }
-    ImGui::PopID();
-}
-
 void MainMenuDisplayView::Draw()
 {
     SectionTitle("Renderer");
@@ -882,57 +844,33 @@ void MainMenuDisplayView::Draw()
                  "16:9\0",
                  "Select the displayed aspect ratio");
 
-    SectionTitle("Texture Packs");
-    if (Toggle("Dump textures", &g_config.general.texture_dump_enabled,
-               "Write decoded textures to the dump directory as they are used")) {
-        if (g_config.general.texture_dump_enabled) {
-            nv2a_texture_io_rebuild_dump_index();
-        }
-    }
-    Toggle("Use texture replacements",
-           &g_config.general.texture_replace_enabled,
-           "Load replacement textures from the replacements directory");
-    Toggle("Skip already-replaced textures when dumping",
-           &g_config.general.texture_dump_skip_replaced,
-           "Do not dump textures that already have a replacement");
-    Toggle("Dump mipmaps", &g_config.general.texture_dump_mipmaps,
-           "Also dump smaller mip levels, not just the full-size texture");
+    FeatureTexturePacksDrawSettings();
 
-    FilePicker("Texture dump directory", g_config.general.texture_dump_dir,
-               nullptr, 0, true, [](const char *path) {
-                   xemu_settings_set_string(&g_config.general.texture_dump_dir,
-                                            path);
-                   nv2a_texture_io_refresh_paths();
-               });
-    FilePicker("Texture replacement directory",
-               g_config.general.texture_replace_dir, nullptr, 0, true,
-               [](const char *path) {
-                   xemu_settings_set_string(
-                       &g_config.general.texture_replace_dir, path);
-                   nv2a_texture_io_refresh_paths();
-               });
-
-    ImGui::Dummy(ImVec2(0, ImGui::GetStyle().WindowPadding.y));
-    ImGui::TextWrapped(
-        "Leave directories blank to use the default location inside the xemu "
-        "data directory. A per-title subfolder is always added.");
-    ImGui::Dummy(ImVec2(0, ImGui::GetStyle().WindowPadding.y));
-
-    TextureHotkeyBinder("Toggle dumping",
-                        &g_config.general.texture_dump_toggle_key);
-    TextureHotkeyBinder("Toggle replacements",
-                        &g_config.general.texture_replace_toggle_key);
-    TextureHotkeyBinder("Reload replacements",
-                        &g_config.general.texture_replace_reload_key);
 }
 
 void MainMenuAudioView::Draw()
 {
     SectionTitle("Volume");
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Limit output volume (%d%%)",
-             (int)(g_config.audio.volume_limit * 100));
-    Slider("Output volume limit", &g_config.audio.volume_limit, buf);
+
+    const float volume_max = xemu_volume_amplifier_max();
+    char buf[96];
+    if (volume_max > 1.0f) {
+        snprintf(buf, sizeof(buf),
+                 "0%%  —  100%%  —  200%%   (Current: %d%%)",
+                 (int)(g_config.audio.volume_limit * 100.0f + 0.5f));
+    } else {
+        snprintf(buf, sizeof(buf), "Current: %d%%",
+                 (int)(g_config.audio.volume_limit * 100.0f + 0.5f));
+    }
+
+    Slider("Output volume",
+           &g_config.audio.volume_limit,
+           buf,
+           0.0f,
+           volume_max,
+           0.05f);
+
+    FeatureAudioPacksDrawSettings();
 
     SectionTitle("Quality");
     Toggle("Real-time DSP processing", &g_config.audio.use_dsp,
@@ -1391,19 +1329,24 @@ void MainMenuSnapshotsView::Draw()
            "XBE");
 
     if (g_config.general.snapshots.filter_current_game) {
-        struct xbe *xbe = xemu_get_xbe_info();
-        if (xbe && xbe->cert) {
-            if (xbe->cert->m_titleid != m_current_title_id) {
-                char *title_name = g_utf16_to_utf8(xbe->cert->m_title_name, 40,
-                                                   NULL, NULL, NULL);
-                if (title_name) {
-                    m_current_title_name = title_name;
-                    g_free(title_name);
-                } else {
-                    m_current_title_name.clear();
+        uint32_t title_id = 0;
+        if (xemu_get_xbe_title_id(&title_id)) {
+            /* The title name is only needed when the running executable
+             * changes. Avoid reallocating/rereading the complete XBE header
+             * every UI frame just to discover an unchanged title ID. */
+            if (title_id != m_current_title_id) {
+                struct xbe *xbe = xemu_get_xbe_info();
+                if (xbe && xbe->cert) {
+                    char *title_name = g_utf16_to_utf8(
+                        xbe->cert->m_title_name, 40, NULL, NULL, NULL);
+                    if (title_name) {
+                        m_current_title_name = title_name;
+                        g_free(title_name);
+                    } else {
+                        m_current_title_name.clear();
+                    }
+                    m_current_title_id = title_id;
                 }
-
-                m_current_title_id = xbe->cert->m_titleid;
             }
         } else {
             m_current_title_name.clear();
@@ -1436,6 +1379,7 @@ void MainMenuSnapshotsView::Draw()
                       ImVec2(-FLT_MIN, 0))) {
         xemu_snapshots_save(m_search_buf.empty() ? NULL : m_search_buf.c_str(),
                             NULL);
+        g_snapshot_mgr.RequestRefresh();
         ClearSearch();
     }
     if (snapshot_with_create_name_exists) {
@@ -1584,13 +1528,20 @@ void MainMenuSnapshotsView::DrawSnapshotContextMenu(
     ImGui::Separator();
 
     Error *err = NULL;
+    bool snapshots_changed = false;
 
     if (ImGui::MenuItem("Replace")) {
         xemu_snapshots_save(snapshot->name, &err);
+        snapshots_changed = err == NULL;
     }
 
     if (ImGui::MenuItem("Delete")) {
         xemu_snapshots_delete(snapshot->name, &err);
+        snapshots_changed = err == NULL;
+    }
+
+    if (snapshots_changed) {
+        g_snapshot_mgr.RequestRefresh();
     }
 
     if (err) {
@@ -1804,7 +1755,9 @@ MainMenuScene::MainMenuScene()
       m_input_button("Input", ICON_FA_GAMEPAD),
       m_display_button("Display", ICON_FA_TV),
       m_audio_button("Audio", ICON_FA_VOLUME_HIGH),
+#ifdef CONFIG_XEMU_FEATURE_CHEATS
       m_codes_button("Codes", ICON_FA_SLIDERS),
+#endif
       m_network_button("Network", ICON_FA_NETWORK_WIRED),
       m_snapshots_button("Snapshots", ICON_FA_CLOCK_ROTATE_LEFT),
       m_system_button("System", ICON_FA_MICROCHIP),
@@ -1816,7 +1769,9 @@ MainMenuScene::MainMenuScene()
     m_tabs.push_back(&m_input_button);
     m_tabs.push_back(&m_display_button);
     m_tabs.push_back(&m_audio_button);
+#ifdef CONFIG_XEMU_FEATURE_CHEATS
     m_tabs.push_back(&m_codes_button);
+#endif
     m_tabs.push_back(&m_network_button);
     m_tabs.push_back(&m_snapshots_button);
     m_tabs.push_back(&m_system_button);
@@ -1826,7 +1781,9 @@ MainMenuScene::MainMenuScene()
     m_views.push_back(&m_input_view);
     m_views.push_back(&m_display_view);
     m_views.push_back(&m_audio_view);
+#ifdef CONFIG_XEMU_FEATURE_CHEATS
     m_views.push_back(&m_codes_view);
+#endif
     m_views.push_back(&m_network_view);
     m_views.push_back(&m_snapshots_view);
     m_views.push_back(&m_system_view);

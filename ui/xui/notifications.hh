@@ -19,19 +19,22 @@
 #pragma once
 #include <stdint.h>
 #include <deque>
+#include <string>
 
 #include "../xemu-notifications.h"
 
 class NotificationManager
 {
 private:
-    std::deque<const char *> m_notification_queue;
-    std::deque<const char *> m_error_queue;
+    /* Status notifications are newest-wins, so a queue just creates churn. */
+    std::string m_pending_msg;
+    std::deque<std::string> m_error_queue;
 
-    const int kNotificationDuration = 4000;
-    uint32_t m_notification_end_time;
-    const char *m_msg;
-    bool m_active;
+    const int kNotificationDuration = 1500;
+    uint32_t m_notification_end_time = 0;
+    std::string m_msg;
+    bool m_pending = false;
+    bool m_active = false;
 
 public:
     NotificationManager();

@@ -8,7 +8,6 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2024 Matt Borgerson
- * Copyright (c) 2026 Joshua-1248 (texture replacement, animation, shaders)
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -30,10 +29,11 @@
 #include "qemu/fast-hash.h"
 #include "qemu/lru.h"
 #include "renderer.h"
-#include <glib/gstdio.h>
 
-#include "../gl/texture-io.h"
-#include "ui/xemu-settings.h"
+#include "xemu-features/texture-packs/texture-packs.h"
+#include "xemu-features/texture-packs/texture-packs-vk.h"
+
+void pgraph_vk_texture_cache_flush(void);
 
 static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode);
 
@@ -480,1168 +480,6 @@ static bool check_texture_possibly_dirty(NV2AState *d,
 
 // FIXME: Make sure we update sampler when data matches. Should we add filtering
 // options to the textureshape?
-/* Full mip chain for a replacement of the given dimensions. */
-static uint32_t replacement_mip_levels(uint32_t w, uint32_t h)
-{
-    uint32_t levels = 1;
-    uint32_t d = MAX(w, h);
-    while (d > 1) {
-        d >>= 1;
-        levels++;
-    }
-    return levels;
-}
-
-/* Per-level barrier; the shared helper always covers every mip level. */
-static void transition_mip_level(VkCommandBuffer cmd, VkImage image,
-                                 uint32_t level, VkImageLayout old_layout,
-                                 VkImageLayout new_layout,
-                                 VkAccessFlags src_access,
-                                 VkAccessFlags dst_access,
-                                 VkPipelineStageFlags src_stage,
-                                 VkPipelineStageFlags dst_stage,
-                                 uint32_t layer_count)
-{
-    VkImageMemoryBarrier barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .oldLayout = old_layout,
-        .newLayout = new_layout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = image,
-        .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .subresourceRange.baseMipLevel = level,
-        .subresourceRange.levelCount = 1,
-        .subresourceRange.baseArrayLayer = 0,
-        .subresourceRange.layerCount = layer_count,
-        .srcAccessMask = src_access,
-        .dstAccessMask = dst_access,
-    };
-    vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1,
-                         &barrier);
-}
-
-/*
- * Upload a replacement image and generate its mip chain.
- *
- * The VkImage was created at the replacement's dimensions with format
- * R8G8B8A8_UNORM. Replacements can exceed the shared staging buffer, so a
- * dedicated staging buffer is allocated when needed; this only happens for
- * large replacements and is freed immediately afterwards.
- */
-static void upload_replacement_image(PGRAPHState *pg, TextureBinding *binding)
-{
-    PGRAPHVkState *r = pg->vk_renderer_state;
-
-    const bool cubemap = binding->key.state.cubemap;
-    const int num_layers = cubemap ? 6 : 1;
-
-    const int w = (int)binding->replacement_width;
-    const int h = (int)binding->replacement_height;
-    const size_t layer_size = (size_t)w * h * 4;
-    const size_t size = layer_size * num_layers;
-
-    /*
-     * Load every layer up front so a mid-way failure does not leave the
-     * image partially written.
-     */
-    uint8_t *layer_pixels[6] = { NULL };
-    /*
-     * Animated frames are borrowed from texture-io's decoded cache rather
-     * than allocated here, so track which pointers we actually own and must
-     * free afterwards.
-     */
-    bool owns_pixels[6] = { false };
-    bool load_ok = true;
-
-    for (int i = 0; i < num_layers && load_ok; i++) {
-        int lw = 0, lh = 0;
-        const char *variant =
-            cubemap ? nv2a_texture_io_cubemap_face_name(i) : NULL;
-
-        if (binding->is_animated) {
-            /*
-             * Decoded frames are already in memory; take the one due now
-             * instead of reloading (and re-decoding frame 0) from disk.
-             */
-            const uint8_t *frame_pixels =
-                nv2a_texture_io_animated_frame_pixels(
-                    binding->hash, variant, binding->anim_frame, &lw, &lh);
-            layer_pixels[i] = (uint8_t *)frame_pixels;
-            owns_pixels[i] = false;
-        } else {
-            layer_pixels[i] = nv2a_texture_io_load_replacement_rgba_variant(
-                binding->hash, variant, &lw, &lh);
-            owns_pixels[i] = layer_pixels[i] != NULL;
-        }
-
-        if (layer_pixels[i] == NULL || lw != w || lh != h) {
-            /* Missing, undecodable, or changed on disk since sizing. */
-            load_ok = false;
-        }
-    }
-
-    if (!load_ok) {
-        for (int i = 0; i < num_layers; i++) {
-            if (layer_pixels[i] && owns_pixels[i]) {
-                nv2a_texture_io_free_pixels(layer_pixels[i]);
-            }
-        }
-        return;
-    }
-
-    VkBuffer src_buffer = r->storage_buffers[BUFFER_STAGING_SRC].buffer;
-    VmaAllocation src_alloc =
-        r->storage_buffers[BUFFER_STAGING_SRC].allocation;
-
-    VkBuffer temp_buffer = VK_NULL_HANDLE;
-    VmaAllocation temp_alloc = VK_NULL_HANDLE;
-    bool using_temp = size > r->storage_buffers[BUFFER_STAGING_SRC].buffer_size;
-
-    if (using_temp) {
-        VkBufferCreateInfo buffer_create_info = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = size,
-            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        };
-        VmaAllocationCreateInfo alloc_create_info = {
-            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-            .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                     VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-        };
-
-        if (vmaCreateBuffer(r->allocator, &buffer_create_info,
-                            &alloc_create_info, &temp_buffer, &temp_alloc,
-                            NULL) != VK_SUCCESS) {
-            fprintf(stderr,
-                    "nv2a: texture-io: could not allocate %zu byte staging "
-                    "buffer for replacement %016" PRIx64 "\n",
-                    size, binding->hash);
-            for (int i = 0; i < num_layers; i++) {
-                if (owns_pixels[i]) {
-                    nv2a_texture_io_free_pixels(layer_pixels[i]);
-                }
-            }
-            return;
-        }
-
-        src_buffer = temp_buffer;
-        src_alloc = temp_alloc;
-    }
-
-    uint8_t *mapped_memory_ptr;
-    VK_CHECK(vmaMapMemory(r->allocator, src_alloc, (void *)&mapped_memory_ptr));
-    for (int i = 0; i < num_layers; i++) {
-        memcpy(mapped_memory_ptr + (size_t)i * layer_size, layer_pixels[i],
-               layer_size);
-    }
-    vmaFlushAllocation(r->allocator, src_alloc, 0, VK_WHOLE_SIZE);
-    vmaUnmapMemory(r->allocator, src_alloc);
-
-    for (int i = 0; i < num_layers; i++) {
-        if (owns_pixels[i]) {
-            nv2a_texture_io_free_pixels(layer_pixels[i]);
-        }
-    }
-
-    const uint32_t mip_levels = replacement_mip_levels(w, h);
-
-    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
-    pgraph_vk_begin_debug_marker(r, cmd, RGBA_GREEN, __func__);
-
-    VkBufferMemoryBarrier host_barrier = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = src_buffer,
-        .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1,
-                         &host_barrier, 0, NULL);
-
-    /* Level 0: copy from staging. */
-    transition_mip_level(cmd, binding->image, 0, binding->current_layout,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         num_layers);
-
-    VkBufferImageCopy regions[6];
-    for (int i = 0; i < num_layers; i++) {
-        regions[i] = (VkBufferImageCopy){
-            .bufferOffset = (VkDeviceSize)i * layer_size,
-            .bufferRowLength = 0,
-            .bufferImageHeight = 0,
-            .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .imageSubresource.mipLevel = 0,
-            .imageSubresource.baseArrayLayer = i,
-            .imageSubresource.layerCount = 1,
-            .imageOffset = (VkOffset3D){ 0, 0, 0 },
-            .imageExtent = (VkExtent3D){ w, h, 1 },
-        };
-    }
-    vkCmdCopyBufferToImage(cmd, src_buffer, binding->image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, num_layers,
-                           regions);
-
-    /* Successively blit each level down by half. */
-    int32_t mip_w = w, mip_h = h;
-
-    for (uint32_t level = 1; level < mip_levels; level++) {
-        int32_t next_w = mip_w > 1 ? mip_w / 2 : 1;
-        int32_t next_h = mip_h > 1 ? mip_h / 2 : 1;
-
-        /* Source level: DST -> SRC */
-        transition_mip_level(cmd, binding->image, level - 1,
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                             VK_ACCESS_TRANSFER_WRITE_BIT,
-                             VK_ACCESS_TRANSFER_READ_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         num_layers);
-
-        /* Destination level: UNDEFINED -> DST */
-        transition_mip_level(cmd, binding->image, level,
-                             VK_IMAGE_LAYOUT_UNDEFINED,
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                             VK_ACCESS_TRANSFER_WRITE_BIT,
-                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         num_layers);
-
-        VkImageBlit blit = {
-            .srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .srcSubresource.mipLevel = level - 1,
-            .srcSubresource.baseArrayLayer = 0,
-            .srcSubresource.layerCount = num_layers,
-            .srcOffsets[0] = (VkOffset3D){ 0, 0, 0 },
-            .srcOffsets[1] = (VkOffset3D){ mip_w, mip_h, 1 },
-            .dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .dstSubresource.mipLevel = level,
-            .dstSubresource.baseArrayLayer = 0,
-            .dstSubresource.layerCount = num_layers,
-            .dstOffsets[0] = (VkOffset3D){ 0, 0, 0 },
-            .dstOffsets[1] = (VkOffset3D){ next_w, next_h, 1 },
-        };
-
-        vkCmdBlitImage(cmd, binding->image,
-                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, binding->image,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                       VK_FILTER_LINEAR);
-
-        /* Source level is finished: SRC -> shader read */
-        transition_mip_level(cmd, binding->image, level - 1,
-                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                             VK_ACCESS_TRANSFER_READ_BIT,
-                             VK_ACCESS_SHADER_READ_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                         num_layers);
-
-        mip_w = next_w;
-        mip_h = next_h;
-    }
-
-    /* Final level is still TRANSFER_DST. */
-    transition_mip_level(cmd, binding->image, mip_levels - 1,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_ACCESS_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                         num_layers);
-
-    binding->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_4);
-    pgraph_vk_end_debug_marker(r, cmd);
-    pgraph_vk_end_single_time_commands(pg, cmd);
-
-    if (using_temp) {
-        vmaDestroyBuffer(r->allocator, temp_buffer, temp_alloc);
-    }
-}
-
-/*
- * ---------------------------------------------------------------------
- * Procedural shader replacements (<hash>.shader) -- Vulkan
- * ---------------------------------------------------------------------
- *
- * Same file format and uniform set as the GL backend. The shader is drawn
- * into the texture's own VkImage through a dedicated single-attachment
- * render pass whose finalLayout is SHADER_READ_ONLY_OPTIMAL, so the render
- * pass itself performs the layout transition and no explicit barriers are
- * needed around the draw.
- */
-
-#define TEXTURE_SHADER_MAX_SIZE 4096
-#define TEXTURE_SHADER_INTERVAL_US 16000 /* ~60Hz */
-
-typedef struct TextureShaderPushConstants {
-    float iTime;
-    float iResolution[2];
-    int32_t iFrame;
-    int32_t iHasChannel0;
-} TextureShaderPushConstants;
-
-static const char *vk_texture_shader_vs_src =
-    "#version 450 core\n"
-    "layout(location = 0) out vec2 uv;\n"
-    "void main() {\n"
-    "    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
-    "    uv = p;\n"
-    "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
-    "}\n";
-
-/*
- * The push-constant block is aliased to plain names with #define so a single
- * .shader file works unmodified on both backends, where GL exposes these as
- * ordinary uniforms.
- */
-static const char *vk_texture_shader_fs_prologue =
-    "#version 450 core\n"
-    "layout(location = 0) in vec2 uv;\n"
-    "layout(location = 0) out vec4 fragColor;\n"
-    "layout(set = 0, binding = 0) uniform sampler2D iChannel0;\n"
-    "layout(push_constant) uniform PC {\n"
-    "    float iTime;\n"
-    "    vec2 iResolution;\n"
-    "    int iFrame;\n"
-    "    int iHasChannel0;\n"
-    "} pc;\n"
-    "#define iTime pc.iTime\n"
-    "#define iResolution pc.iResolution\n"
-    "#define iFrame pc.iFrame\n"
-    "#define iHasChannel0 (pc.iHasChannel0 != 0)\n"
-    "#line 1\n";
-
-static void destroy_texture_shader(PGRAPHVkState *r, TextureBinding *binding)
-{
-    if (binding->shader_framebuffer) {
-        vkDestroyFramebuffer(r->device, binding->shader_framebuffer, NULL);
-    }
-    if (binding->shader_pipeline) {
-        vkDestroyPipeline(r->device, binding->shader_pipeline, NULL);
-    }
-    if (binding->shader_pipeline_layout) {
-        vkDestroyPipelineLayout(r->device, binding->shader_pipeline_layout,
-                                NULL);
-    }
-    if (binding->shader_render_pass) {
-        vkDestroyRenderPass(r->device, binding->shader_render_pass, NULL);
-    }
-    if (binding->shader_ds_pool) {
-        vkDestroyDescriptorPool(r->device, binding->shader_ds_pool, NULL);
-    }
-    if (binding->shader_ds_layout) {
-        vkDestroyDescriptorSetLayout(r->device, binding->shader_ds_layout,
-                                     NULL);
-    }
-    if (binding->shader_sampler) {
-        vkDestroySampler(r->device, binding->shader_sampler, NULL);
-    }
-    if (binding->shader_src_view) {
-        vkDestroyImageView(r->device, binding->shader_src_view, NULL);
-    }
-    if (binding->shader_src_image) {
-        vmaDestroyImage(r->allocator, binding->shader_src_image,
-                        binding->shader_src_alloc);
-    }
-    if (binding->shader_vs) {
-        pgraph_vk_destroy_shader_module(r, binding->shader_vs);
-    }
-    if (binding->shader_fs) {
-        pgraph_vk_destroy_shader_module(r, binding->shader_fs);
-    }
-
-    binding->has_shader = false;
-    binding->shader_framebuffer = VK_NULL_HANDLE;
-    binding->shader_pipeline = VK_NULL_HANDLE;
-    binding->shader_pipeline_layout = VK_NULL_HANDLE;
-    binding->shader_render_pass = VK_NULL_HANDLE;
-    binding->shader_ds_pool = VK_NULL_HANDLE;
-    binding->shader_ds_layout = VK_NULL_HANDLE;
-    binding->shader_sampler = VK_NULL_HANDLE;
-    binding->shader_src_view = VK_NULL_HANDLE;
-    binding->shader_src_image = VK_NULL_HANDLE;
-    binding->shader_vs = NULL;
-    binding->shader_fs = NULL;
-}
-
-/*
- * Create and populate the iChannel0 source image.
- *
- * A 1x1 transparent image is created when the hash has no image replacement,
- * so the descriptor set always has something valid bound; shaders gate on
- * iHasChannel0 rather than on the descriptor being absent.
- */
-static bool create_shader_source_image(PGRAPHState *pg,
-                                       TextureBinding *binding,
-                                       uint64_t hash, bool *out_has_source)
-{
-    PGRAPHVkState *r = pg->vk_renderer_state;
-
-    int sw = 0, sh = 0;
-    uint8_t *pixels = NULL;
-    const uint8_t *src = NULL;
-    const uint8_t transparent[4] = { 0, 0, 0, 0 };
-
-    bool animated = nv2a_texture_io_replacement_is_animated(hash, NULL);
-
-    if (animated) {
-        /*
-         * Borrowed from the decoded frame cache; not freed here. Also the
-         * only path that works for WebP, which stbi_load cannot read.
-         */
-        src = nv2a_texture_io_animated_frame_pixels(hash, NULL, 0, &sw, &sh);
-    } else {
-        pixels = nv2a_texture_io_load_replacement_rgba(hash, &sw, &sh);
-        src = pixels;
-    }
-
-    binding->shader_src_animated = animated;
-    binding->shader_src_frame = 0;
-
-    if (src == NULL || sw <= 0 || sh <= 0) {
-        sw = 1;
-        sh = 1;
-        src = transparent;
-        binding->shader_src_animated = false;
-        *out_has_source = false;
-    } else {
-        *out_has_source = true;
-    }
-
-    binding->shader_src_width = (uint32_t)sw;
-    binding->shader_src_height = (uint32_t)sh;
-
-    const size_t size = (size_t)sw * sh * 4;
-
-    VkImageCreateInfo ici = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .extent = { (uint32_t)sw, (uint32_t)sh, 1 },
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                 VK_IMAGE_USAGE_SAMPLED_BIT,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-    };
-    VmaAllocationCreateInfo aci = {
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-    };
-
-    if (vmaCreateImage(r->allocator, &ici, &aci, &binding->shader_src_image,
-                       &binding->shader_src_alloc, NULL) != VK_SUCCESS) {
-        if (pixels) {
-            nv2a_texture_io_free_pixels(pixels);
-        }
-        return false;
-    }
-
-    /* Staging upload. Source images are small; the shared buffer suffices. */
-    VkBuffer buf = VK_NULL_HANDLE;
-    VmaAllocation buf_alloc = VK_NULL_HANDLE;
-    VkBufferCreateInfo bci = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-    };
-    VmaAllocationCreateInfo bac = {
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-    };
-
-    if (vmaCreateBuffer(r->allocator, &bci, &bac, &buf, &buf_alloc, NULL) !=
-        VK_SUCCESS) {
-        if (pixels) {
-            nv2a_texture_io_free_pixels(pixels);
-        }
-        return false;
-    }
-
-    uint8_t *mapped = NULL;
-    VK_CHECK(vmaMapMemory(r->allocator, buf_alloc, (void *)&mapped));
-    memcpy(mapped, src, size);
-    vmaFlushAllocation(r->allocator, buf_alloc, 0, VK_WHOLE_SIZE);
-    vmaUnmapMemory(r->allocator, buf_alloc);
-
-    if (pixels) {
-        nv2a_texture_io_free_pixels(pixels);
-    }
-
-    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
-
-    transition_mip_level(cmd, binding->shader_src_image, 0,
-                         VK_IMAGE_LAYOUT_UNDEFINED,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
-
-    VkBufferImageCopy region = {
-        .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .imageSubresource.mipLevel = 0,
-        .imageSubresource.baseArrayLayer = 0,
-        .imageSubresource.layerCount = 1,
-        .imageExtent = { (uint32_t)sw, (uint32_t)sh, 1 },
-    };
-    vkCmdCopyBufferToImage(cmd, buf, binding->shader_src_image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    transition_mip_level(cmd, binding->shader_src_image, 0,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_ACCESS_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 1);
-
-    pgraph_vk_end_single_time_commands(pg, cmd);
-    vmaDestroyBuffer(r->allocator, buf, buf_alloc);
-
-    VkImageViewCreateInfo ivci = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = binding->shader_src_image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .subresourceRange.levelCount = 1,
-        .subresourceRange.layerCount = 1,
-    };
-
-    return vkCreateImageView(r->device, &ivci, NULL,
-                             &binding->shader_src_view) == VK_SUCCESS;
-}
-
-/*
- * Build everything needed to render a binding's shader. Called once, after
- * the image and view exist. Any failure tears down cleanly and leaves
- * has_shader false, so a broken shader degrades to a normal texture rather
- * than breaking the frame.
- */
-static void setup_texture_shader(PGRAPHState *pg, TextureBinding *binding,
-                                 uint64_t hash, uint32_t width,
-                                 uint32_t height, VkFormat format)
-{
-    PGRAPHVkState *r = pg->vk_renderer_state;
-
-    const char *path = nv2a_texture_io_get_shader_path(hash, NULL);
-    if (path == NULL) {
-        return;
-    }
-
-    g_autofree char *body = NULL;
-    gsize body_len = 0;
-    if (!g_file_get_contents(path, &body, &body_len, NULL)) {
-        fprintf(stderr, "nv2a: texture-io: could not read shader %s\n", path);
-        return;
-    }
-
-    g_autofree char *fs_src =
-        g_strconcat(vk_texture_shader_fs_prologue, body, NULL);
-
-    binding->shader_width = CLAMP(width, 1, TEXTURE_SHADER_MAX_SIZE);
-    binding->shader_height = CLAMP(height, 1, TEXTURE_SHADER_MAX_SIZE);
-    binding->shader_frame = 0;
-    binding->shader_last_us = INT64_MIN;
-
-    binding->shader_vs = pgraph_vk_create_shader_module_from_glsl(
-        r, VK_SHADER_STAGE_VERTEX_BIT, vk_texture_shader_vs_src);
-    binding->shader_fs = pgraph_vk_create_shader_module_from_glsl(
-        r, VK_SHADER_STAGE_FRAGMENT_BIT, fs_src);
-
-    if (binding->shader_vs == NULL || binding->shader_fs == NULL ||
-        binding->shader_vs->module == VK_NULL_HANDLE ||
-        binding->shader_fs->module == VK_NULL_HANDLE) {
-        fprintf(stderr, "nv2a: texture-io: shader %s failed to compile\n",
-                path);
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    bool has_source = false;
-    if (!create_shader_source_image(pg, binding, hash, &has_source)) {
-        fprintf(stderr,
-                "nv2a: texture-io: could not create shader source image "
-                "for %s\n", path);
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    VkSamplerCreateInfo sci = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .maxLod = 0.0f,
-    };
-    if (vkCreateSampler(r->device, &sci, NULL, &binding->shader_sampler) !=
-        VK_SUCCESS) {
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    VkDescriptorSetLayoutBinding dslb = {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-    };
-    VkDescriptorSetLayoutCreateInfo dslci = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings = &dslb,
-    };
-    if (vkCreateDescriptorSetLayout(r->device, &dslci, NULL,
-                                    &binding->shader_ds_layout) !=
-        VK_SUCCESS) {
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    VkDescriptorPoolSize pool_size = {
-        .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1,
-    };
-    VkDescriptorPoolCreateInfo dpci = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1,
-        .poolSizeCount = 1,
-        .pPoolSizes = &pool_size,
-    };
-    if (vkCreateDescriptorPool(r->device, &dpci, NULL,
-                               &binding->shader_ds_pool) != VK_SUCCESS) {
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    VkDescriptorSetAllocateInfo dsai = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = binding->shader_ds_pool,
-        .descriptorSetCount = 1,
-        .pSetLayouts = &binding->shader_ds_layout,
-    };
-    if (vkAllocateDescriptorSets(r->device, &dsai, &binding->shader_ds) !=
-        VK_SUCCESS) {
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    VkDescriptorImageInfo dii = {
-        .sampler = binding->shader_sampler,
-        .imageView = binding->shader_src_view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    };
-    VkWriteDescriptorSet write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = binding->shader_ds,
-        .dstBinding = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .pImageInfo = &dii,
-    };
-    vkUpdateDescriptorSets(r->device, 1, &write, 0, NULL);
-
-    VkPushConstantRange pcr = {
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset = 0,
-        .size = sizeof(TextureShaderPushConstants),
-    };
-    VkPipelineLayoutCreateInfo plci = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1,
-        .pSetLayouts = &binding->shader_ds_layout,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &pcr,
-    };
-    if (vkCreatePipelineLayout(r->device, &plci, NULL,
-                               &binding->shader_pipeline_layout) !=
-        VK_SUCCESS) {
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    /*
-     * finalLayout SHADER_READ_ONLY_OPTIMAL means the render pass performs
-     * the transition itself, so no explicit barrier is needed after the draw.
-     */
-    VkAttachmentDescription color_attachment = {
-        .format = format,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    };
-    VkAttachmentReference color_ref = {
-        .attachment = 0,
-        .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-    };
-    VkSubpassDescription subpass = {
-        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &color_ref,
-    };
-    VkSubpassDependency dependency = {
-        .srcSubpass = VK_SUBPASS_EXTERNAL,
-        .dstSubpass = 0,
-        .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-    };
-    VkRenderPassCreateInfo rpci = {
-        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments = &color_attachment,
-        .subpassCount = 1,
-        .pSubpasses = &subpass,
-        .dependencyCount = 1,
-        .pDependencies = &dependency,
-    };
-    if (vkCreateRenderPass(r->device, &rpci, NULL,
-                           &binding->shader_render_pass) != VK_SUCCESS) {
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    VkFramebufferCreateInfo fbci = {
-        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-        .renderPass = binding->shader_render_pass,
-        .attachmentCount = 1,
-        .pAttachments = &binding->image_view,
-        .width = binding->shader_width,
-        .height = binding->shader_height,
-        .layers = 1,
-    };
-    if (vkCreateFramebuffer(r->device, &fbci, NULL,
-                            &binding->shader_framebuffer) != VK_SUCCESS) {
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = binding->shader_vs->module,
-            .pName = "main",
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = binding->shader_fs->module,
-            .pName = "main",
-        },
-    };
-
-    /* No vertex buffers: the vertex shader builds a triangle from its index. */
-    VkPipelineVertexInputStateCreateInfo vertex_input = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    };
-    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-    };
-    VkViewport viewport = {
-        .width = (float)binding->shader_width,
-        .height = (float)binding->shader_height,
-        .maxDepth = 1.0f,
-    };
-    VkRect2D scissor = {
-        .extent = { binding->shader_width, binding->shader_height },
-    };
-    VkPipelineViewportStateCreateInfo viewport_state = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .viewportCount = 1,
-        .pViewports = &viewport,
-        .scissorCount = 1,
-        .pScissors = &scissor,
-    };
-    VkPipelineRasterizationStateCreateInfo rasterizer = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode = VK_CULL_MODE_NONE,
-        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth = 1.0f,
-    };
-    VkPipelineMultisampleStateCreateInfo multisampling = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-        .minSampleShading = 1.0f,
-    };
-    VkPipelineColorBlendAttachmentState blend_attachment = {
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-    VkPipelineColorBlendStateCreateInfo color_blending = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments = &blend_attachment,
-    };
-    VkGraphicsPipelineCreateInfo gpci = {
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .stageCount = 2,
-        .pStages = stages,
-        .pVertexInputState = &vertex_input,
-        .pInputAssemblyState = &input_assembly,
-        .pViewportState = &viewport_state,
-        .pRasterizationState = &rasterizer,
-        .pMultisampleState = &multisampling,
-        .pColorBlendState = &color_blending,
-        .layout = binding->shader_pipeline_layout,
-        .renderPass = binding->shader_render_pass,
-        .subpass = 0,
-    };
-
-    if (vkCreateGraphicsPipelines(r->device, VK_NULL_HANDLE, 1, &gpci, NULL,
-                                  &binding->shader_pipeline) != VK_SUCCESS) {
-        fprintf(stderr, "nv2a: texture-io: shader pipeline failed for %s\n",
-                path);
-        destroy_texture_shader(r, binding);
-        return;
-    }
-
-    binding->has_shader = true;
-    binding->shader_hash = hash;
-
-    GStatBuf st;
-    binding->shader_mtime = (g_stat(path, &st) == 0) ? (int64_t)st.st_mtime : 0;
-    binding->shader_check_us = INT64_MIN;
-
-    fprintf(stderr, "nv2a: texture-io: loaded shader %s (%ux%u%s)\n", path,
-            binding->shader_width, binding->shader_height,
-            has_source ? ", with iChannel0" : ", procedural");
-}
-
-/*
- * Re-upload iChannel0 when its animation frame advances, so a .shader paired
- * with a .gif/.webp distorts live frames. Only runs on an actual frame
- * change, so the cost is the animation's rate, not the draw rate.
- */
-static void refresh_shader_source(PGRAPHState *pg, TextureBinding *binding,
-                                  uint64_t hash, int64_t now_us)
-{
-    if (!binding->shader_src_animated ||
-        binding->shader_src_image == VK_NULL_HANDLE) {
-        return;
-    }
-
-    int frame = nv2a_texture_io_animated_frame_index(hash, NULL, now_us);
-    if (frame < 0 || frame == binding->shader_src_frame) {
-        return;
-    }
-
-    int sw = 0, sh = 0;
-    const uint8_t *pixels =
-        nv2a_texture_io_animated_frame_pixels(hash, NULL, frame, &sw, &sh);
-
-    if (pixels == NULL || (uint32_t)sw != binding->shader_src_width ||
-        (uint32_t)sh != binding->shader_src_height) {
-        return;
-    }
-
-    PGRAPHVkState *r = pg->vk_renderer_state;
-    const size_t size = (size_t)sw * sh * 4;
-
-    VkBuffer buf = VK_NULL_HANDLE;
-    VmaAllocation buf_alloc = VK_NULL_HANDLE;
-    VkBufferCreateInfo bci = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-    };
-    VmaAllocationCreateInfo bac = {
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-    };
-
-    if (vmaCreateBuffer(r->allocator, &bci, &bac, &buf, &buf_alloc, NULL) !=
-        VK_SUCCESS) {
-        return;
-    }
-
-    uint8_t *mapped = NULL;
-    VK_CHECK(vmaMapMemory(r->allocator, buf_alloc, (void *)&mapped));
-    memcpy(mapped, pixels, size);
-    vmaFlushAllocation(r->allocator, buf_alloc, 0, VK_WHOLE_SIZE);
-    vmaUnmapMemory(r->allocator, buf_alloc);
-
-    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
-
-    transition_mip_level(cmd, binding->shader_src_image, 0,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         VK_ACCESS_SHADER_READ_BIT,
-                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
-
-    VkBufferImageCopy region = {
-        .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .imageSubresource.mipLevel = 0,
-        .imageSubresource.baseArrayLayer = 0,
-        .imageSubresource.layerCount = 1,
-        .imageExtent = { (uint32_t)sw, (uint32_t)sh, 1 },
-    };
-    vkCmdCopyBufferToImage(cmd, buf, binding->shader_src_image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    transition_mip_level(cmd, binding->shader_src_image, 0,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_ACCESS_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 1);
-
-    pgraph_vk_end_single_time_commands(pg, cmd);
-    vmaDestroyBuffer(r->allocator, buf, buf_alloc);
-
-    binding->shader_src_frame = frame;
-}
-
-/*
- * Recompile and rebuild the pipeline when the .shader file changes on disk.
- *
- * Only the shader modules and pipeline are rebuilt; the render pass,
- * framebuffer, descriptors, sampler, and source image all stay valid since
- * none of them depend on the shader body. If compilation or pipeline
- * creation fails, everything new is discarded and the previous pipeline
- * keeps running, so a syntax error mid-edit does not blank the texture.
- *
- * vkDeviceWaitIdle before destroying the old pipeline: it may still be
- * referenced by command buffers in flight, and destroying a pipeline in use
- * is undefined behaviour. Reloads are rare (only on file save), so the stall
- * is not a concern.
- */
-static void reload_texture_shader_if_changed(PGRAPHState *pg,
-                                             TextureBinding *binding,
-                                             int64_t now_us)
-{
-    if (!binding->has_shader) {
-        return;
-    }
-
-    if (binding->shader_check_us != INT64_MIN &&
-        now_us >= binding->shader_check_us &&
-        (now_us - binding->shader_check_us) < 250000) {
-        return;
-    }
-    binding->shader_check_us = now_us;
-
-    const char *path =
-        nv2a_texture_io_get_shader_path(binding->shader_hash, NULL);
-    if (path == NULL) {
-        return;
-    }
-
-    GStatBuf st;
-    if (g_stat(path, &st) != 0) {
-        return;
-    }
-
-    int64_t mtime = (int64_t)st.st_mtime;
-    if (mtime == binding->shader_mtime) {
-        return;
-    }
-    binding->shader_mtime = mtime;
-
-    PGRAPHVkState *r = pg->vk_renderer_state;
-
-    g_autofree char *body = NULL;
-    gsize body_len = 0;
-    if (!g_file_get_contents(path, &body, &body_len, NULL)) {
-        return;
-    }
-
-    g_autofree char *fs_src =
-        g_strconcat(vk_texture_shader_fs_prologue, body, NULL);
-
-    ShaderModuleInfo *new_fs = pgraph_vk_create_shader_module_from_glsl(
-        r, VK_SHADER_STAGE_FRAGMENT_BIT, fs_src);
-
-    if (new_fs == NULL || new_fs->module == VK_NULL_HANDLE) {
-        fprintf(stderr,
-                "nv2a: texture-io: shader %s failed to compile; keeping "
-                "previous version\n", path);
-        if (new_fs) {
-            pgraph_vk_destroy_shader_module(r, new_fs);
-        }
-        return;
-    }
-
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = binding->shader_vs->module,
-            .pName = "main",
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = new_fs->module,
-            .pName = "main",
-        },
-    };
-
-    VkPipelineVertexInputStateCreateInfo vertex_input = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    };
-    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-    };
-    VkViewport viewport = {
-        .width = (float)binding->shader_width,
-        .height = (float)binding->shader_height,
-        .maxDepth = 1.0f,
-    };
-    VkRect2D scissor = {
-        .extent = { binding->shader_width, binding->shader_height },
-    };
-    VkPipelineViewportStateCreateInfo viewport_state = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .viewportCount = 1,
-        .pViewports = &viewport,
-        .scissorCount = 1,
-        .pScissors = &scissor,
-    };
-    VkPipelineRasterizationStateCreateInfo rasterizer = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode = VK_CULL_MODE_NONE,
-        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth = 1.0f,
-    };
-    VkPipelineMultisampleStateCreateInfo multisampling = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-        .minSampleShading = 1.0f,
-    };
-    VkPipelineColorBlendAttachmentState blend_attachment = {
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-    VkPipelineColorBlendStateCreateInfo color_blending = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments = &blend_attachment,
-    };
-    VkGraphicsPipelineCreateInfo gpci = {
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .stageCount = 2,
-        .pStages = stages,
-        .pVertexInputState = &vertex_input,
-        .pInputAssemblyState = &input_assembly,
-        .pViewportState = &viewport_state,
-        .pRasterizationState = &rasterizer,
-        .pMultisampleState = &multisampling,
-        .pColorBlendState = &color_blending,
-        .layout = binding->shader_pipeline_layout,
-        .renderPass = binding->shader_render_pass,
-        .subpass = 0,
-    };
-
-    VkPipeline new_pipeline = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(r->device, VK_NULL_HANDLE, 1, &gpci, NULL,
-                                  &new_pipeline) != VK_SUCCESS) {
-        fprintf(stderr,
-                "nv2a: texture-io: pipeline rebuild failed for %s; keeping "
-                "previous version\n", path);
-        pgraph_vk_destroy_shader_module(r, new_fs);
-        return;
-    }
-
-    /* New pipeline is good; retire the old one once the GPU is done with it. */
-    vkDeviceWaitIdle(r->device);
-    vkDestroyPipeline(r->device, binding->shader_pipeline, NULL);
-    pgraph_vk_destroy_shader_module(r, binding->shader_fs);
-
-    binding->shader_pipeline = new_pipeline;
-    binding->shader_fs = new_fs;
-    binding->shader_last_us = INT64_MIN;
-
-    fprintf(stderr, "nv2a: texture-io: reloaded shader %s\n", path);
-}
-
-/* Draw one frame of a binding's shader. Throttled to ~60Hz. */
-static void render_texture_shader(PGRAPHState *pg, TextureBinding *binding,
-                                  int64_t now_us)
-{
-    if (!binding->has_shader) {
-        return;
-    }
-
-    if (binding->shader_last_us != INT64_MIN &&
-        now_us >= binding->shader_last_us &&
-        (now_us - binding->shader_last_us) < TEXTURE_SHADER_INTERVAL_US) {
-        return;
-    }
-    binding->shader_last_us = now_us;
-
-    /* Live iChannel0 before the shader samples it. */
-    refresh_shader_source(pg, binding, binding->hash, now_us);
-
-    PGRAPHVkState *r = pg->vk_renderer_state;
-    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
-    pgraph_vk_begin_debug_marker(r, cmd, RGBA_GREEN, __func__);
-
-    VkRenderPassBeginInfo rpbi = {
-        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = binding->shader_render_pass,
-        .framebuffer = binding->shader_framebuffer,
-        .renderArea.extent = { binding->shader_width, binding->shader_height },
-    };
-    vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      binding->shader_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            binding->shader_pipeline_layout, 0, 1,
-                            &binding->shader_ds, 0, NULL);
-
-    TextureShaderPushConstants pc = {
-        .iTime = (float)(now_us / 1000) / 1000.0f,
-        .iResolution = { (float)binding->shader_width,
-                         (float)binding->shader_height },
-        .iFrame = binding->shader_frame,
-        .iHasChannel0 = binding->shader_src_view != VK_NULL_HANDLE,
-    };
-    vkCmdPushConstants(cmd, binding->shader_pipeline_layout,
-                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRenderPass(cmd);
-
-    pgraph_vk_end_debug_marker(r, cmd);
-    pgraph_vk_end_single_time_commands(pg, cmd);
-
-    /* The render pass left the image ready to sample. */
-    binding->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    binding->shader_frame++;
-}
-
 static void upload_texture_image(PGRAPHState *pg, int texture_idx,
                                  TextureBinding *binding)
 {
@@ -1651,61 +489,27 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
 
     nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
 
-    if (binding->replaced) {
-        upload_replacement_image(pg, binding);
+    if (xemu_texture_packs_vk_upload_if_replaced(pg, binding)) {
         return;
     }
 
     g_autofree TextureLayout *layout = get_texture_layout(pg, texture_idx);
     const int num_layers = state->cubemap ? 6 : 1;
 
-    /*
-     * Texture dump: level 0 of layer 0 only. decoded_size/(w*h) gives the
-     * decoded bytes per pixel without needing to interpret the Vulkan
-     * format; anything that is not 32bpp is skipped rather than written
-     * out incorrectly.
-     */
-    if (g_config.general.texture_dump_enabled && binding->hash != 0 &&
-        !binding->replaced) {
-        const int dump_levels =
-            g_config.general.texture_dump_mipmaps ? state->levels : 1;
-
-        for (int li = 0; li < num_layers; li++) {
-            for (int lv = 0; lv < dump_levels && lv < state->levels; lv++) {
-                TextureLevel *tl = &layout->layers[li].levels[lv];
-
-                if (!tl->width || !tl->height || !tl->decoded_data) {
-                    continue;
-                }
-
-                /*
-                 * decoded_size/(w*h) gives decoded bytes per pixel without
-                 * interpreting the Vulkan format; anything not 32bpp is
-                 * skipped rather than written out incorrectly.
-                 */
-                size_t px = (size_t)tl->width * tl->height;
-                if (!px || (tl->decoded_size / px) != 4) {
-                    continue;
-                }
-
-                char variant[32];
-                const char *face = state->cubemap ?
-                    nv2a_texture_io_cubemap_face_name(li) : NULL;
-
-                if (face && lv > 0) {
-                    snprintf(variant, sizeof(variant), "%s_mip%d", face, lv);
-                } else if (face) {
-                    snprintf(variant, sizeof(variant), "%s", face);
-                } else if (lv > 0) {
-                    snprintf(variant, sizeof(variant), "mip%d", lv);
-                } else {
-                    variant[0] = '\0';
-                }
-
-                nv2a_texture_io_dump_variant(
-                    binding->hash, variant[0] ? variant : NULL, tl->width,
-                    tl->height, tl->decoded_data);
+    const int dump_levels = xemu_texture_packs_vk_dump_level_count(state->levels);
+    for (int li = 0; li < num_layers; li++) {
+        for (int lv = 0; lv < dump_levels && lv < state->levels; lv++) {
+            TextureLevel *tl = &layout->layers[li].levels[lv];
+            if (!tl->width || !tl->height || !tl->decoded_data) {
+                continue;
             }
+            size_t px = (size_t)tl->width * tl->height;
+            if (!px || (tl->decoded_size / px) != 4) {
+                continue;
+            }
+            xemu_texture_packs_vk_maybe_dump_guest32(
+                binding->hash, state->cubemap, li, lv, tl->width, tl->height,
+                state->color_format, tl->decoded_data);
         }
     }
 
@@ -2426,90 +1230,10 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     snode->possibly_dirty = false;
     snode->hash = content_hash;
 
-    /*
-     * Texture replacement.
-     *
-     * The image must be created at the replacement's dimensions, so the
-     * lookup has to happen before vmaCreateImage. Cubemaps and volume
-     * textures are not supported (each face/slice would need its own file),
-     * nor are surface-sourced textures, which have no meaningful data hash.
-     */
-    snode->replaced = false;
-    snode->replacement_width = 0;
-    snode->replacement_height = 0;
-    snode->is_animated = false;
-    snode->anim_frame = 0;
-    snode->has_shader = false;
-    snode->shader_render_pass = VK_NULL_HANDLE;
-    snode->shader_framebuffer = VK_NULL_HANDLE;
-    snode->shader_pipeline = VK_NULL_HANDLE;
-    snode->shader_pipeline_layout = VK_NULL_HANDLE;
-    snode->shader_ds_layout = VK_NULL_HANDLE;
-    snode->shader_ds_pool = VK_NULL_HANDLE;
-    snode->shader_sampler = VK_NULL_HANDLE;
-    snode->shader_src_image = VK_NULL_HANDLE;
-    snode->shader_src_view = VK_NULL_HANDLE;
-    snode->shader_vs = NULL;
-    snode->shader_fs = NULL;
-    snode->shader_frame = 0;
-    snode->shader_last_us = INT64_MIN;
-    snode->shader_src_animated = false;
-    snode->shader_src_frame = 0;
-    snode->shader_src_width = 0;
-    snode->shader_src_height = 0;
-    snode->shader_mtime = 0;
-    snode->shader_check_us = INT64_MIN;
-    snode->shader_hash = 0;
-
-    if (g_config.general.texture_replace_enabled && content_hash != 0 &&
-        !surface_to_texture && state.dimensionality == 2) {
-        int rw = 0, rh = 0;
-
-        if (state.cubemap) {
-            /* All six faces must exist and match in size, or none is used. */
-            if (nv2a_texture_io_has_all_cubemap_faces(content_hash, &rw,
-                                                      &rh)) {
-                snode->replaced = true;
-                snode->replacement_width = rw;
-                snode->replacement_height = rh;
-            }
-        } else if (nv2a_texture_io_get_replacement_size(content_hash, &rw,
-                                                        &rh)) {
-            snode->replaced = true;
-            snode->replacement_width = rw;
-            snode->replacement_height = rh;
-        }
-
-        /*
-         * A shader attachment makes this a replaced texture even with no
-         * image file: it renders its own content. Sizing follows the image
-         * replacement when one exists (that becomes iChannel0), otherwise
-         * the guest texture's own size.
-         */
-        if (!state.cubemap &&
-            nv2a_texture_io_get_shader_path(content_hash, NULL) != NULL) {
-            snode->has_shader = true;
-            if (!snode->replaced) {
-                snode->replaced = true;
-                snode->replacement_width = state.width;
-                snode->replacement_height = state.height;
-            }
-        }
-
-        /*
-         * Animated replacements are only supported for plain 2D textures;
-         * a cubemap would need per-face animation timing.
-         */
-        if (snode->replaced && !state.cubemap) {
-            snode->is_animated =
-                nv2a_texture_io_replacement_is_animated(content_hash, NULL);
-            snode->anim_frame = nv2a_texture_io_animated_frame_index(
-                content_hash, NULL, nv2a_texture_io_anim_now_us());
-            if (snode->anim_frame < 0) {
-                snode->anim_frame = 0;
-            }
-        }
-    }
+    XemuTexturePacksVKPlan pack_plan;
+    xemu_texture_packs_vk_plan(&pack_plan, content_hash,
+                               state.dimensionality, state.cubemap,
+                               state.width, state.height, surface_to_texture);
 
     /*
      * Replacements are decoded to RGBA8 with identity swizzle, overriding
@@ -2518,7 +1242,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     VkFormat img_format = kelvin_color_format_vk_map[state.color_format].vk_format;
     VkComponentMapping img_components =
         kelvin_color_format_vk_map[state.color_format].component_map;
-    if (snode->replaced) {
+    if (pack_plan.replaced) {
         img_format = VK_FORMAT_R8G8B8A8_UNORM;
         img_components = (VkComponentMapping){
             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -2536,29 +1260,24 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     VkImageCreateInfo image_create_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = dimensionality_to_vk_image_type[state.dimensionality],
-        .extent.width = snode->replaced ? snode->replacement_width :
-                                          state.width,
-        .extent.height = snode->replaced ? snode->replacement_height :
-                                           state.height,
-        .extent.depth = snode->replaced ? 1 : state.depth,
+        .extent.width = pack_plan.replaced ? pack_plan.width : state.width,
+        .extent.height = pack_plan.replaced ? pack_plan.height : state.height,
+        .extent.depth = pack_plan.replaced ? 1 : state.depth,
         /*
          * Shader targets keep a single level: the render pass writes level 0
          * and there is no cheap in-pass way to regenerate a chain.
          */
-        .mipLevels = snode->has_shader ? 1 :
-                     (snode->replaced ?
-                         replacement_mip_levels(snode->replacement_width,
-                                                snode->replacement_height) :
-                         (f_basic.linear ? 1 : state.levels)),
+        .mipLevels = pack_plan.replaced ? pack_plan.mip_levels :
+                     (f_basic.linear ? 1 : state.levels),
         .arrayLayers = state.cubemap ? 6 : 1,
         .format = img_format,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                  VK_IMAGE_USAGE_SAMPLED_BIT |
-                 (snode->replaced ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0) |
+                 (pack_plan.replaced ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0) |
                  /* Shader targets are rendered into, not just copied to. */
-                 (snode->has_shader ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
+                 (pack_plan.has_shader ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .flags = (state.cubemap ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
@@ -2708,7 +1427,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
          * be applied -- sampling above level 0 would be out of range.
          */
         .minLod = 0.0,
-        .maxLod = snode->has_shader ? 0.0 :
+        .maxLod = pack_plan.has_shader ? 0.0 :
                   (mipmap_en ? MIN(state.max_mipmap_level, state.levels - 1) :
                                0.0),
         .mipLodBias = lod_bias,
@@ -2722,22 +1441,11 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
 
     r->texture_bindings[texture_idx] = snode;
 
-    if (snode->has_shader) {
-        /*
-         * The shader owns this image's contents, so the normal upload is
-         * skipped entirely; any image replacement becomes iChannel0 inside
-         * setup rather than being written here.
-         */
-        setup_texture_shader(pg, snode, snode->hash, snode->replacement_width,
-                             snode->replacement_height, img_format);
+    bool shader_active = xemu_texture_packs_vk_binding_created(
+        pg, snode, &pack_plan, img_format);
 
-        if (snode->has_shader) {
-            render_texture_shader(pg, snode, nv2a_texture_io_anim_now_us());
-        } else {
-            /* Setup failed; fall back to a normal texture. */
-            upload_texture_image(pg, texture_idx, snode);
-            snode->draw_time = 0;
-        }
+    if (shader_active) {
+        /* The feature rendered the initial procedural frame. */
     } else if (surface_to_texture) {
         copy_surface_to_texture(pg, surface, snode);
     } else {
@@ -2777,83 +1485,16 @@ static void update_timestamps(PGRAPHVkState *r)
  * actual frame change -- roughly 10 times a second for a typical GIF rather
  * than once per draw.
  */
-/*
- * PERFORMANCE: bind_textures() is called once per DRAW CALL, not once per
- * frame, and lru_add_free() puts free nodes on the global list too -- so an
- * unguarded walk here costs a full 1024-node linked-list traversal on every
- * draw, whether or not any replacement texture exists. In a draw-heavy title
- * that is millions of cache-hostile pointer chases per frame, paid even with
- * texture replacement switched off. It looks like a game/renderer regression
- * rather than a feature cost, so it is gated twice: nothing can be animated
- * or shader-backed unless replacements are enabled, and the walk itself runs
- * at a fixed 250 Hz rather than per draw -- far above the ~10-30 fps of the
- * source media.
- */
-#define TEXTURE_ANIM_REFRESH_INTERVAL_US 4000
-
-static void refresh_animated_textures(PGRAPHState *pg)
-{
-    PGRAPHVkState *r = pg->vk_renderer_state;
-
-    if (r->texture_cache_entries == NULL) {
-        return;
-    }
-
-    if (!g_config.general.texture_replace_enabled) {
-        return;
-    }
-
-    static int64_t last_refresh_us;
-    int64_t now_us = nv2a_texture_io_anim_now_us();
-
-    if (now_us >= last_refresh_us &&
-        now_us - last_refresh_us < TEXTURE_ANIM_REFRESH_INTERVAL_US) {
-        return;
-    }
-    last_refresh_us = now_us;
-
-    LruNode *node;
-
-    QTAILQ_FOREACH(node, &r->texture_cache.global, next_global) {
-        TextureBinding *binding = container_of(node, TextureBinding, node);
-
-        if (binding->image == VK_NULL_HANDLE) {
-            continue;
-        }
-
-        if (binding->has_shader) {
-            reload_texture_shader_if_changed(pg, binding, now_us);
-            render_texture_shader(pg, binding, now_us);
-            continue;
-        }
-
-        if (!binding->replaced || !binding->is_animated) {
-            continue;
-        }
-
-        int frame = nv2a_texture_io_animated_frame_index(binding->hash, NULL,
-                                                         now_us);
-        if (frame < 0 || frame == binding->anim_frame) {
-            continue;
-        }
-
-        binding->anim_frame = frame;
-        upload_replacement_image(pg, binding);
-    }
-}
-
 void pgraph_vk_bind_textures(NV2AState *d)
 {
-    if (nv2a_texture_io_consume_flush_request()) {
-        pgraph_vk_texture_cache_flush();
-    }
+    xemu_texture_packs_renderer_sync(pgraph_vk_texture_cache_flush);
 
     NV2A_VK_DGROUP_BEGIN("%s", __func__);
 
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
 
-    refresh_animated_textures(pg);
+    xemu_texture_packs_vk_refresh_dynamic(pg);
 
     // FIXME: Check for modifications on bind fastpath (CPU hook)
     // FIXME: Mark textures that are sourced from surfaces so we can track them
@@ -2895,13 +1536,8 @@ static void texture_cache_entry_init(Lru *lru, LruNode *node, const void *state)
 
 static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode)
 {
-    /*
-     * Shader resources reference image_view, so tear them down before the
-     * view and image below.
-     */
-    if (snode->has_shader || snode->shader_render_pass) {
-        destroy_texture_shader(r, snode);
-    }
+    /* Feature sidecar resources may reference image_view; release them first. */
+    xemu_texture_packs_vk_binding_destroy(r, snode);
 
     vkDestroySampler(r->device, snode->sampler, NULL);
     snode->sampler = VK_NULL_HANDLE;
@@ -2955,13 +1591,8 @@ static void texture_cache_init(PGRAPHVkState *r)
 {
     const size_t texture_cache_size = 1024;
     lru_init(&r->texture_cache);
-    /*
-     * Zeroed: the animated-texture sweep walks the LRU global list, which
-     * includes not-yet-used free nodes, so their replaced/is_animated/image
-     * fields must be false/NULL rather than uninitialised garbage.
-     */
     r->texture_cache_entries =
-        g_malloc0_n(texture_cache_size, sizeof(TextureBinding));
+        g_malloc_n(texture_cache_size, sizeof(TextureBinding));
     assert(r->texture_cache_entries != NULL);
     for (int i = 0; i < texture_cache_size; i++) {
         lru_add_free(&r->texture_cache, &r->texture_cache_entries[i].node);
@@ -2971,7 +1602,7 @@ static void texture_cache_init(PGRAPHVkState *r)
     r->texture_cache.pre_node_evict = texture_cache_entry_pre_evict;
     r->texture_cache.post_node_evict = texture_cache_entry_post_evict;
 
-    nv2a_texture_io_set_backend(NV2A_TEXTURE_BACKEND_VK);
+    xemu_texture_packs_set_backend(XEMU_TEXTURE_PACKS_BACKEND_VK);
 }
 
 static void texture_cache_finalize(PGRAPHVkState *r)
@@ -3035,7 +1666,7 @@ void pgraph_vk_finalize_textures(PGRAPHState *pg)
 void pgraph_vk_texture_cache_flush(void)
 {
     if (g_nv2a == NULL ||
-        nv2a_texture_io_get_backend() != NV2A_TEXTURE_BACKEND_VK) {
+        xemu_texture_packs_get_backend() != XEMU_TEXTURE_PACKS_BACKEND_VK) {
         return;
     }
 

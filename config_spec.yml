@@ -45,6 +45,24 @@ general:
     type: integer
     default: 599 # ImGuiKey_Period ( . )
 
+  # Fast-forward controls.
+  # 0 = Unlimited; 2..5 = fixed multiplier.
+  fast_forward_multiplier:
+    type: integer
+    default: 3
+  fast_forward_toggle_mode:
+    type: bool
+    default: false
+  # Keep fast-forward audio near its original pitch by granular
+  # time-compression instead of frequency-ratio resampling.
+  fast_forward_preserve_pitch:
+    type: bool
+    default: false
+  # Raw ImGuiKey value. Tab = 512.
+  fast_forward_hotkey:
+    type: integer
+    default: 512
+
 input:
   bindings:
     port1_driver: string
@@ -334,6 +352,21 @@ display:
     default: true
 
 audio:
+  # Source-level APU audio dumping/replacement. Static hardware voices are
+  # supported first; streaming SSL voices remain on the original path until
+  # the streaming reconstruction phase is implemented.
+  dump_enabled:
+    type: bool
+    default: false
+  dump_skip_replaced:
+    type: bool
+    default: true
+  replace_enabled:
+    type: bool
+    default: false
+  # Empty = <xemu data dir>/audio/<TITLEID>/{dumps,replacements}
+  dump_dir: string
+  replace_dir: string
   vp:
     num_workers:
       type: integer

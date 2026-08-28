@@ -8,22 +8,11 @@
 //
 #pragma once
 
-/*
- * Master switch for the disassembler window.
- *
- * Set to 1 to build and show it. While 0 the window is not drawn and the menu
- * item is hidden, so it costs nothing at runtime - but every source file stays
- * in the tree and keeps compiling, so it cannot rot.
- */
-#ifndef XEMU_ENABLE_DISASSEMBLER
-#define XEMU_ENABLE_DISASSEMBLER 1
-#endif
-
 #include <cstdint>
 #include <string>
 #include <vector>
 
-#include "../xemu-dbg.h"
+#include "xemu-features/debug-tools/debug-api.h"
 
 class DisassemblerWindow
 {
@@ -96,6 +85,16 @@ private:
     int      m_mem_bytes_per_row = 16;
     uint32_t m_mem_sel = 0;
     bool     m_mem_have_sel = false;
+
+    /* 24-row memory-view snapshot. Guest reads are refreshed only on the
+     * configured Live polling tick or when the view moves; repainting ImGui
+     * itself never touches guest memory. */
+    uint8_t  m_mem_cache[24][32] {};
+    int      m_mem_cache_got[24] {};
+    uint32_t m_mem_cache_addr = 0;
+    int      m_mem_cache_per = 0;
+    bool     m_mem_cache_virtual = true;
+    bool     m_mem_cache_valid = false;
 
     // Debugger state
     char     m_sym_path[512] = "";

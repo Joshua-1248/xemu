@@ -1,0 +1,20 @@
+Fast Forward — Phase 4 independent export manifest
+
+COPY DIRECTORY:
+  xemu-features/fast-forward/
+
+BUILD OPTION:
+  xemu_feature_fast_forward
+
+CONFIG MACRO:
+  CONFIG_XEMU_FEATURE_FAST_FORWARD
+
+CORE/FRONTEND INTEGRATION SITES:
+- ui/xemu.c — four timing/presentation-policy calls.
+- util/main-loop.c — main-loop unblock query (weak false fallback only while the feature is built, for standalone QEMU utility binaries).
+- hw/xbox/mcpx/apu/monitor.c — one completed-block audio transform/reset boundary.
+- hw/xbox/mcpx/apu/apu.c — APU pacing query.
+- ui/xui/main.cc / ui/xui/main-menu.cc — hotkey and settings hooks.
+- ui/xui/meson.build and hw/xbox/mcpx/apu/meson.build — conditional source inclusion.
+
+See README.md for API, dependencies, threading, hot-path and disabled behavior.

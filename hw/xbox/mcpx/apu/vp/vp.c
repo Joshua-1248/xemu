@@ -21,6 +21,8 @@
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
 #include "adpcm.h"
+#include "xemu-features/audio-packs/audio-packs.h"
+#include "xemu-features/audio-packs/audio-packs-apu.h"
 
 static const struct {
     hwaddr top, current, next;
@@ -129,6 +131,7 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
         notifier += d->vp.ssl[v].ssl_index;
     }
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
+    xemu_audio_packs_voice_reset(v);
 }
 
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
@@ -216,6 +219,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         // FIXME: Should set CBO here?
         voice_set_mask(d, selected_handle, NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
+        xemu_audio_packs_voice_reset(selected_handle);
         d->vp.ssl[selected_handle].ssl_seg = 0; // FIXME: verify this
         d->vp.ssl[selected_handle].ssl_index = 0; // FIXME: verify this
 
@@ -403,10 +407,17 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_set_mask(d, d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_CUR_PSH_SAMPLE,
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO, argument);
         break;
-    case NV1BA0_PIO_SET_VOICE_BUF_CBO:
-        voice_set_mask(d, d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_PAR_OFFSET,
+    case NV1BA0_PIO_SET_VOICE_BUF_CBO: {
+        unsigned int voice = d->regs[NV_PAPU_FECV];
+        /* This method is the guest-visible SetCurrentPosition/CBO update.
+         * Record it separately from audio-io's own mirrored CBO writes so a
+         * replacement audio can distinguish real guest seeks/retriggers from
+         * audio-io's own mirrored CBO updates. */
+        xemu_audio_packs_note_guest_cbo_write(voice, argument);
+        voice_set_mask(d, voice, NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
         break;
+    }
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
         voice_set_mask(d, d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_PAR_NEXT,
                        NV_PAVS_VOICE_PAR_NEXT_EBO, argument);
@@ -676,6 +687,7 @@ static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
     return prd_address + addr % TARGET_PAGE_SIZE;
 }
 
+
 static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
                            uint32_t reg_a, uint32_t rr_reg, uint32_t rr_mask,
                            uint32_t lvl_reg, uint32_t lvl_mask,
@@ -912,6 +924,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
     if (paused) {
         return -1;
+    }
+
+    if (!stream && xemu_audio_packs_voice_has_replacement(v)) {
+        int count = xemu_audio_packs_voice_get_samples(v, samples,
+                                                     num_samples_requested);
+        uint32_t replacement_cbo = xemu_audio_packs_voice_guest_cbo(v);
+        voice_set_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                       NV_PAVS_VOICE_PAR_OFFSET_CBO, replacement_cbo);
+        bool finished = xemu_audio_packs_voice_finished(v);
+        if (finished) {
+            voice_off(d, v);
+        }
+        return count > 0 ? count : -1;
     }
 
     if (stream) {
@@ -1306,6 +1331,28 @@ static void voice_process(MCPXAPUState *d,
         return;
     }
 
+    xemu_audio_packs_apu_prepare_voice_if_needed(d, v);
+
+    /*
+     * Titles may seek or retrigger an already-playing static DirectSound voice
+     * with SET_VOICE_BUF_CBO/SetCurrentPosition instead of another VOICE_ON.
+     * audio-io follows that guest event automatically on the owning worker,
+     * before replacement playback can overwrite the mirrored guest CBO.
+     */
+    if (xemu_audio_packs_voice_has_replacement(v)) {
+        uint32_t live_cbo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                                           NV_PAVS_VOICE_PAR_OFFSET_CBO);
+        if (xemu_audio_packs_voice_apply_guest_retrigger(v, live_cbo)) {
+            /* libsamplerate can retain source history across callbacks.  A
+             * true retrigger must start from the new attack, not from buffered
+             * samples belonging to the previous shot.  Preserve SVF/HRTF
+             * histories; only the sample-rate converter is reset here. */
+            if (d->vp.filters[v].resampler) {
+                src_reset(d->vp.filters[v].resampler);
+            }
+        }
+    }
+
     float ef_value = voice_step_envelope(
         d, v, NV_PAVS_VOICE_CFG_ENV1, NV_PAVS_VOICE_CFG_ENVF,
         NV_PAVS_VOICE_CFG_MISC, NV_PAVS_VOICE_CFG_MISC_EF_RELEASERATE,
@@ -1318,6 +1365,7 @@ static void voice_process(MCPXAPUState *d,
     int8_t ps = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_ENV0,
                                NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
     float rate = 1.0 / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
+    rate *= xemu_audio_packs_voice_rate_scale(v);
     dbg->rate = rate;
 
     float ea_value = voice_step_envelope(
@@ -1808,6 +1856,9 @@ static void voice_work_finalize(MCPXAPUState *d)
 
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    /* Audio-I/O cache invalidation must happen while VP workers are idle. */
+    xemu_audio_packs_frame_sync();
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     /* Process all voices, mixing each into the affected MIXBINs */
