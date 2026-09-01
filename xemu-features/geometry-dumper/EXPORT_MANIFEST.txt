@@ -1,0 +1,7 @@
+xemu-features/geometry-dumper/geometry-dumper.h
+xemu-features/geometry-dumper/geometry-dumper.c
+xemu-features/geometry-dumper/frontend.cc
+xemu-features/geometry-dumper/README.md
+xemu-features/geometry-dumper/EXPORT_MANIFEST.txt
+xemu-features/texture-packs/texture-packs.c
+xemu-features/debug-tools/frontend.cc

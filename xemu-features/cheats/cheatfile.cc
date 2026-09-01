@@ -61,6 +61,39 @@ static bool StartsWith(const std::string &s, const char *p)
     return s.size() >= n && s.compare(0, n, p) == 0;
 }
 
+static bool EqualsI(const std::string &a, const std::string &b)
+{
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower((unsigned char)a[i]) !=
+            std::tolower((unsigned char)b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ParseHex32Span(const std::string &line, size_t start, size_t len,
+                           uint32_t *out)
+{
+    if (!out || len < 1 || len > 8 || start > line.size() ||
+        len > line.size() - start) {
+        return false;
+    }
+    uint32_t value = 0;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)line[start + i];
+        unsigned digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else return false;
+        value = (value << 4) | digit;
+    }
+    *out = value;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Line-level matchers
 // ---------------------------------------------------------------------------
@@ -98,9 +131,8 @@ static bool MatchCode(const std::string &line, uint32_t *a, uint32_t *b)
     if (l2 < 1 || l2 > 8) return false;
     while (i < n && (line[i] == ' ' || line[i] == '\t')) i++;
     if (i != n) return false;
-    *a = (uint32_t)strtoul(line.substr(s1, l1).c_str(), nullptr, 16);
-    *b = (uint32_t)strtoul(line.substr(s2, l2).c_str(), nullptr, 16);
-    return true;
+    return ParseHex32Span(line, s1, l1, a) &&
+           ParseHex32Span(line, s2, l2, b);
 }
 
 // _KV: ^([A-Za-z][A-Za-z0-9_ -]*?)[ \t]*=(.*)$
@@ -172,7 +204,7 @@ static NodeList *EnsureGroup(NodeList *root,
     for (const auto &comp : parts) {
         Node *found = nullptr;
         for (auto &n : *parent) {
-            if (n->is_group && Lower(n->name) == Lower(comp)) {
+            if (n->is_group && EqualsI(n->name, comp)) {
                 found = n.get();
                 break;
             }
@@ -603,9 +635,9 @@ std::string RenderCheatText(const std::string &title,
     // title id -- and those have neither to write.
     std::string have_serial, have_titleid;
     SplitStem(stem, &have_serial, &have_titleid);
-    if (!serial.empty() && Lower(serial) != Lower(have_serial))
+    if (!serial.empty() && !EqualsI(serial, have_serial))
         out += "serial=" + serial + "\n";
-    if (!titleid.empty() && Lower(titleid) != Lower(have_titleid))
+    if (!titleid.empty() && !EqualsI(titleid, have_titleid))
         out += "titleid=" + titleid + "\n";
     out += "\n";
 

@@ -1,0 +1,12 @@
+xemu-features/freecam/freecam.h
+xemu-features/freecam/freecam.c
+xemu-features/freecam/frontend.hh
+xemu-features/freecam/frontend.cc
+xemu-features/freecam/README.md
+xemu-features/freecam/EXPORT_MANIFEST.txt
+
+Feature-owned integration companions:
+- xemu-features/texture-packs/texture-packs.c — includes freecam.c beside the existing geometry wrapper core.
+- xemu-features/geometry-dumper/geometry-dumper.c — wrapper calls freecam begin/end hooks around backend draws.
+- xemu-features/debug-tools/frontend.cc — compiles/draws the standalone freecam window but no longer exposes a Debug-menu entry.
+- xemu-features/scripting/frontend.cc — exposes the Free Camera menu item through the existing feature-owned Misc menu aggregator.

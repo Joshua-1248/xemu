@@ -15,6 +15,7 @@
 //
 
 #include "studio.hh"
+#include "xemu-features/shared/detachable-windows.hh"
 
 #include "ui/xui/common.hh"
 #include "ui/xui/misc.hh"
@@ -73,6 +74,15 @@ extern float g_main_menu_height;
 
 namespace {
 using TasXidReport = std::array<uint8_t, XEMU_TAS_XID_REPORT_SIZE>;
+using TasPollCounts = std::array<uint32_t, XEMU_TAS_MAX_PORTS>;
+static constexpr uint32_t kTasUnknownPollCount = UINT32_MAX;
+
+static TasPollCounts TasUnknownPollCounts()
+{
+    TasPollCounts p{};
+    p.fill(kTasUnknownPollCount);
+    return p;
+}
 
 struct TasFrame {
     std::array<TasXidReport, XEMU_TAS_MAX_PORTS> xid{};
@@ -84,6 +94,7 @@ struct TasStateMeta {
     bool valid = false;
     uint64_t frame = 0;
     uint32_t branch_id = 0;
+    XemuTasTransactionId transaction{};
 };
 
 struct TasChapter {
@@ -118,6 +129,7 @@ struct TasEditSnapshot {
     size_t total_frames = 0;
     std::vector<TasFrame> frames;
     std::vector<uint8_t> lag;
+    std::vector<TasPollCounts> polls;
     std::vector<TasChapter> chapters;
     std::vector<TasMarker> markers;
     int selected_frame = 0;
@@ -163,12 +175,18 @@ struct TasBranch {
     std::string name;
     std::vector<TasFrame> frames;
     std::vector<uint8_t> lag;
+    std::vector<TasPollCounts> polls;
 };
 
 struct TasRewindCheckpoint {
     bool valid = false;
     uint64_t frame = 0;
     uint32_t branch_id = 0;
+    uint64_t state_hash = 0;
+    bool last_frame_lagged = false;
+    uint64_t lag_count = 0;
+    uint64_t lag_streak = 0;
+    XemuTasTransactionId transaction{};
     std::string snapshot_name;
 };
 
@@ -185,15 +203,47 @@ static bool g_tas_rewind_panel_open = false;
 static int g_tas_port = 0;
 static int g_tas_selected_frame = 0;
 static std::vector<TasFrame> g_tas_frames(1);
+static std::vector<TasPollCounts> g_tas_poll_counts(1, TasUnknownPollCounts());
 static TasFrame g_tas_clipboard;
 static bool g_tas_clipboard_valid = false;
 static bool g_tas_follow_frame = true;
+/* Double-clicking a piano-roll frame can either behave like a precise
+ * greenzone seek (stop on the requested frame) or like a scrub-to-here
+ * operation that resumes normal movie playback after the target is reached. */
+static bool g_tas_double_click_continue = false;
+static bool g_tas_seek_continue_pending = false;
+static uint64_t g_tas_seek_continue_target = 0;
+/* Every greenzone seek is verified after the VM reaches its requested pause.
+ * This catches stale transport work or a broken frame boundary immediately
+ * instead of letting the piano roll silently claim the wrong destination. */
+static bool g_tas_seek_completion_pending = false;
+static bool g_tas_step_completion_pending = false;
+static uint64_t g_tas_step_completion_target = 0;
+/* Strict Sync never allows the live VM to continue on a state produced by
+ * movie input that has just been edited in its past. Re-simulate that state
+ * from the last still-valid checkpoint on the next maintenance tick. */
+static bool g_tas_strict_resim_pending = false;
+static uint64_t g_tas_strict_resim_target = 0;
+static bool g_tas_strict_resim_continue = false;
 static std::string g_tas_movie_path;
 static bool g_tas_goto_dialog_requested = false;
 static int g_tas_goto_frame_value = 0;
 static std::vector<uint8_t> g_tas_lag_flags(1, 0);
 static bool g_tas_read_only = true;
 static bool g_tas_power_on_recording = true;
+static bool g_tas_power_on_reset_pending = false;
+static bool g_tas_power_on_reset_start_vm = true;
+static uint64_t g_tas_power_on_reset_sequence_before = 0;
+static std::chrono::steady_clock::time_point g_tas_power_on_reset_deadline{};
+/* Current-state movies need the exact VM state that existed before movie frame
+ * 0. The native snapshot lives in Xemu's snapshot store; the .xmt records the
+ * snapshot name + RAM fingerprint so Play From Beginning can restore the same
+ * starting machine state instead of replaying frame 0 from whatever state the
+ * Xbox happens to be in later. */
+static std::string g_tas_movie_start_snapshot;
+static uint64_t g_tas_movie_start_state_hash = 0;
+static uint64_t g_tas_movie_start_legacy_ram_hash = 0;
+static XemuTasTransactionId g_tas_movie_start_transaction{};
 static bool g_tas_apply_movie_settings = true;
 static uint64_t g_tas_rerecord_count = 0;
 static uint64_t g_tas_record_synced = 0;
@@ -221,14 +271,23 @@ static bool g_tas_branches_open = false;
 static bool g_tas_chapters_open = false;
 static bool g_tas_automation_open = false;
 static bool g_tas_macro_open = false;
-static bool g_tas_rewind_enabled = false;
+static bool g_tas_rewind_enabled = true;
 static int g_tas_rewind_interval = 120;
 static int g_tas_rewind_distance = 60;
 static int g_tas_rewind_slot = 0;
 static uint64_t g_tas_rewind_next_frame = 0;
-static std::chrono::steady_clock::time_point g_tas_rewind_next_host_checkpoint{};
 static std::array<TasRewindCheckpoint, 64> g_tas_rewind_points{};
+/* In deterministic mode checkpoints are never taken from an arbitrary point
+ * inside a running frame. We schedule a one-frame advance, let the VBLANK TAS
+ * hook pause the VM at the next canonical boundary, save there, then resume. */
+static bool g_tas_strict_checkpoint_pending = false;
+static bool g_tas_strict_checkpoint_resume = false;
+/* User frame-advance in Strict Sync is already an exact VBLANK pause. Cache
+ * that destination immediately so frame-by-frame TAS work gets exact rewind
+ * anchors instead of replaying from a much older periodic checkpoint. */
+static bool g_tas_strict_step_checkpoint_pending = false;
 static std::string g_tas_undo_snapshot_name;
+static XemuTasTransactionId g_tas_undo_transaction{};
 static std::deque<std::string> g_tas_snapshot_delete_queue;
 static std::unordered_set<std::string> g_tas_snapshot_delete_queued;
 
@@ -237,6 +296,7 @@ static int g_tas_selection_anchor = 0;
 static int g_tas_selection_end = 0;
 static std::vector<TasFrame> g_tas_clipboard_frames;
 static std::vector<uint8_t> g_tas_clipboard_lag;
+static std::vector<TasPollCounts> g_tas_clipboard_polls;
 static std::deque<TasEditSnapshot> g_tas_undo_stack;
 static std::deque<TasEditSnapshot> g_tas_redo_stack;
 static uint64_t g_tas_movie_revision = 0;
@@ -275,6 +335,14 @@ static uint64_t g_tas_verify_actual = 0;
 static std::string g_tas_verify_status = "Not verified";
 static std::string g_tas_verify_start_snapshot;
 static uint32_t g_tas_verify_branch = 0;
+static uint64_t g_tas_verify_revision = UINT64_MAX;
+static XemuTasTransactionId g_tas_verify_start_transaction{};
+static int g_tas_verify_baseline_interval = 120;
+static int g_tas_verify_runs_total = 1;
+static int g_tas_verify_runs_remaining = 0;
+static int g_tas_verify_run_index = 0;
+static bool g_tas_verify_exhaustive = false;
+static uint64_t g_tas_verify_poll_sync_from = 0;
 
 /* Greenzone / cached timeline. Uses native xemu internal snapshots and movie
  * replay, so the .xmt itself stays small. */
@@ -342,15 +410,104 @@ static int g_tas_macro_press_frames = 1;
 static int g_tas_macro_gap_frames = 1;
 static int g_tas_macro_repeats = 4;
 
+enum class TasRuntimeMode : uint8_t {
+    Idle = 0,
+    Playback = 1,
+    Recording = 2,
+    Overdub = 3,
+};
+
+struct TasStateBundleRuntime {
+    bool valid = false;
+    XemuTasTransactionId transaction{};
+    uint64_t boundary = 0;
+    uint64_t state_hash = 0;
+    bool last_frame_lagged = false;
+    uint64_t lag_count = 0;
+    uint64_t lag_streak = 0;
+    TasRuntimeMode mode = TasRuntimeMode::Idle;
+    bool vm_was_running = false;
+    int selected_frame = 0;
+    int selection_anchor = 0;
+    int selection_end = 0;
+    bool follow = false;
+    bool read_only = true;
+    uint32_t branch_id = 0;
+    uint64_t movie_revision = 0;
+    uint64_t overdub_start = 0;
+    uint64_t overdub_synced = 0;
+    uint32_t overdub_port = 0;
+    uint32_t overdub_field_mask = 0;
+    std::string owner_movie_path;
+};
+
+static TasStateBundleRuntime g_tas_loaded_state_bundle;
+static bool g_tas_silent_bundle_load = false;
+
+/* Manual piano-roll mutations must not race an active movie runtime.  The
+ * first edit freezes and drains Record/Overdub, keeps the original runtime
+ * intent, and defers reconstruction until the UI edit gesture is complete.
+ * This also makes analog drags atomic instead of restarting the VM after the
+ * first changed pixel while the mouse is still down. */
+struct TasTimelineMutationTxn {
+    bool active = false;
+    bool edited = false;
+    bool reconstructing = false;
+    TasRuntimeMode mode = TasRuntimeMode::Idle;
+    bool vm_was_running = false;
+    uint64_t boundary = 0;
+    uint64_t first_frame = UINT64_MAX;
+    uint32_t overdub_port = 0;
+    uint32_t overdub_field_mask = 0;
+};
+static TasTimelineMutationTxn g_tas_timeline_mutation;
+
+struct TasBranchSwitchTxn {
+    bool active = false;
+    bool reconstructing = false;
+    std::string guard_snapshot;
+    std::string guard_bundle_path;
+    TasStateBundleRuntime old_runtime;
+    uint64_t target_boundary = 0;
+};
+static TasBranchSwitchTxn g_tas_branch_switch;
+
+struct TasPendingOverdubStart {
+    bool active = false;
+    uint64_t boundary = 0;
+    uint8_t port = 0;
+    uint16_t digital_mask = 0;
+    uint8_t analog_mask = 0;
+    uint8_t stick_mask = 0;
+};
+static TasPendingOverdubStart g_tas_pending_overdub_start;
+
 static void TasAutosaveRecovery(bool force);
 
 static void TasPushMovieToCore();
-static bool TasSaveMovieToPathInternal(const char *path, bool set_current_path, bool notify);
+static bool TasSaveMovieToPathInternal(const char *path, bool set_current_path,
+                                       bool notify,
+                                       const TasStateBundleRuntime *state_bundle = nullptr);
 static bool TasLoadMovieFromPath(const char *path);
 static void TasStartPlayback(uint64_t frame);
+static void TasPlayMovieFromBeginning();
 static void TasInvalidateGreenzoneFrom(uint64_t frame);
+static bool TasSaveRewindCheckpointAtBoundary(uint64_t frame);
 static bool TasSeekFrame(uint64_t target);
+static bool TasSeekFrameEx(uint64_t target, bool continue_after_target);
+static void TasSeekContinueTick();
+static void TasCancelPendingTransportAdvance();
 static void TasStopOverdub();
+static bool TasFinishPendingOverdubStart();
+static void TasSyncRecordingFromCore();
+static void TasPowerOnResetTick();
+static void TasPrepareTimelineMutation(uint64_t first_frame);
+static void TasNoteTimelineMutation(uint64_t first_frame);
+static void TasTimelineMutationTick();
+static void TasAbortTimelineMutation(const char *reason);
+static bool TasSwitchToBranchIndex(size_t index);
+static void TasFinishBranchSwitch();
+static void TasRollbackBranchSwitch(const char *reason);
 
 static std::pair<int,int> TasSelectionBounds()
 {
@@ -378,6 +535,7 @@ static TasEditSnapshot TasCaptureEditSnapshot(const char *description)
     snap.total_frames = g_tas_frames.size();
     snap.frames = g_tas_frames;
     snap.lag = g_tas_lag_flags;
+    snap.polls = g_tas_poll_counts;
     snap.chapters = g_tas_chapters;
     snap.markers = g_tas_markers;
     snap.selected_frame = g_tas_selected_frame;
@@ -400,7 +558,12 @@ static TasEditSnapshot TasCaptureEditSnapshotRange(const char *description, int 
     if (g_tas_lag_flags.size() < g_tas_frames.size()) {
         g_tas_lag_flags.resize(g_tas_frames.size(), 0);
     }
+    if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+    }
     snap.lag.assign(g_tas_lag_flags.begin() + first, g_tas_lag_flags.begin() + last + 1);
+    snap.polls.assign(g_tas_poll_counts.begin() + first,
+                      g_tas_poll_counts.begin() + last + 1);
     snap.selected_frame = g_tas_selected_frame;
     snap.selection_anchor = g_tas_selection_anchor;
     snap.selection_end = g_tas_selection_end;
@@ -427,6 +590,7 @@ static size_t TasEditSnapshotApproxBytes(const TasEditSnapshot &snap)
     size_t bytes = sizeof(snap);
     bytes += snap.frames.size() * sizeof(TasFrame);
     bytes += snap.lag.size();
+    bytes += snap.polls.size() * sizeof(TasPollCounts);
     bytes += snap.chapters.size() * sizeof(TasChapter);
     bytes += snap.markers.size() * sizeof(TasMarker);
     for (const TasChapter &c : snap.chapters) bytes += c.name.size();
@@ -461,8 +625,15 @@ static void TasPushUndo(const char *description)
     g_tas_redo_stack.clear();
 }
 
+static void TasPushTimelineUndo(const char *description, uint64_t first_frame)
+{
+    TasPrepareTimelineMutation(first_frame);
+    TasPushUndo(description);
+}
+
 static void TasPushUndoRange(const char *description, int first, int last)
 {
+    TasPrepareTimelineMutation((uint64_t)std::max(0, first));
     g_tas_undo_stack.push_back(TasCaptureEditSnapshotRange(description, first, last));
     TasTrimEditStack(g_tas_undo_stack);
     g_tas_redo_stack.clear();
@@ -484,15 +655,24 @@ static bool TasRestoreEditSnapshot(const TasEditSnapshot &snap)
             g_tas_lag_flags.resize(g_tas_frames.size(), 0);
         }
         std::copy(snap.lag.begin(), snap.lag.end(), g_tas_lag_flags.begin() + first);
+        if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+            g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+        }
+        std::copy(snap.polls.begin(), snap.polls.end(),
+                  g_tas_poll_counts.begin() + first);
         invalidate_from = (uint64_t)first;
     } else {
         g_tas_frames = snap.frames;
         g_tas_lag_flags = snap.lag;
+        g_tas_poll_counts = snap.polls;
         g_tas_chapters = snap.chapters;
         g_tas_markers = snap.markers;
         if (g_tas_frames.empty()) g_tas_frames.resize(1);
         if (g_tas_lag_flags.size() < g_tas_frames.size()) {
             g_tas_lag_flags.resize(g_tas_frames.size(), 0);
+        }
+        if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+            g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
         }
         invalidate_from = (uint64_t)std::max(0, std::min(snap.selection_anchor,
                                                          snap.selection_end));
@@ -506,12 +686,16 @@ static bool TasRestoreEditSnapshot(const TasEditSnapshot &snap)
     g_tas_core_pushed_revision = UINT64_MAX;
     g_tas_visible_frame_cache_dirty = true;
     TasInvalidateGreenzoneFrom(invalidate_from);
+    TasNoteTimelineMutation(invalidate_from);
     return true;
 }
 
 static void TasUndoEdit()
 {
     if (g_tas_undo_stack.empty()) return;
+    const TasEditSnapshot &pending = g_tas_undo_stack.back();
+    const uint64_t first = pending.partial ? (uint64_t)std::max(0, pending.range_start) : 0;
+    TasPrepareTimelineMutation(first);
     TasEditSnapshot snap = std::move(g_tas_undo_stack.back());
     g_tas_undo_stack.pop_back();
     TasEditSnapshot current = TasCaptureEditSnapshotLike(snap, "Redo");
@@ -527,6 +711,9 @@ static void TasUndoEdit()
 static void TasRedoEdit()
 {
     if (g_tas_redo_stack.empty()) return;
+    const TasEditSnapshot &pending = g_tas_redo_stack.back();
+    const uint64_t first = pending.partial ? (uint64_t)std::max(0, pending.range_start) : 0;
+    TasPrepareTimelineMutation(first);
     TasEditSnapshot snap = std::move(g_tas_redo_stack.back());
     g_tas_redo_stack.pop_back();
     TasEditSnapshot current = TasCaptureEditSnapshotLike(snap, "Undo");
@@ -541,11 +728,63 @@ static void TasRedoEdit()
 
 static void TasMarkMovieEdited(uint64_t first_frame)
 {
+    TasNoteTimelineMutation(first_frame);
     g_tas_movie_dirty = true;
     ++g_tas_movie_revision;
     g_tas_core_pushed_revision = UINT64_MAX;
     g_tas_visible_frame_cache_dirty = true;
     TasInvalidateGreenzoneFrom(first_frame);
+    if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+    }
+    for (uint64_t i = first_frame; i < g_tas_poll_counts.size(); ++i) {
+        g_tas_poll_counts[(size_t)i] = TasUnknownPollCounts();
+    }
+
+    /* A verifier hash at/after an edited input frame describes the old movie,
+     * not the new branch. Keeping it would turn an intentional edit into a
+     * misleading "desync" later. Preserve only the still-valid prefix. */
+    g_tas_verify_baseline.erase(
+        std::remove_if(g_tas_verify_baseline.begin(), g_tas_verify_baseline.end(),
+                       [first_frame](const TasHashRecord &h) {
+                           return h.frame >= first_frame;
+                       }),
+        g_tas_verify_baseline.end());
+    if (g_tas_verify_mode != TasVerifyMode::Idle) {
+        g_tas_verify_mode = TasVerifyMode::Idle;
+        g_tas_verify_status = "Verifier baseline invalidated by movie edit";
+    }
+    g_tas_verify_revision = UINT64_MAX;
+
+    const uint64_t live_frame = xemu_tas_playback()
+        ? xemu_tas_playback_frame() : xemu_tas_frame();
+    if (!g_tas_timeline_mutation.active && xemu_tas_deterministic_mode() &&
+        !xemu_tas_recording() && first_frame < live_frame) {
+        /* The VM has already executed input that no longer exists in the
+         * edited movie. Freeze immediately; on the next maintenance tick seek
+         * from a surviving pre-edit checkpoint through the new input history. */
+        g_tas_strict_resim_target = std::min<uint64_t>(
+            live_frame, g_tas_frames.size());
+        g_tas_strict_resim_continue =
+            xemu_tas_playback() && runstate_is_running();
+        g_tas_strict_resim_pending = true;
+        TasCancelPendingTransportAdvance();
+        xemu_tas_stop_playback();
+        if (runstate_is_running()) {
+            vm_stop(RUN_STATE_PAUSED);
+        }
+    } else if (xemu_tas_playback() && first_frame >= live_frame) {
+        /* Future-only edits do not invalidate the current VM state. Publish
+         * them to the active core copy without rewinding the playback cursor. */
+        if (xemu_tas_update_playback_movie_ex(
+                g_tas_frames.data(), g_tas_lag_flags.data(),
+                reinterpret_cast<const uint32_t *>(g_tas_poll_counts.data()),
+                g_tas_poll_counts.size() * XEMU_TAS_MAX_PORTS,
+                g_tas_frames.size())) {
+            g_tas_core_pushed_revision = g_tas_movie_revision;
+            g_tas_core_pushed_frame_count = g_tas_frames.size();
+        }
+    }
 }
 
 static uint64_t TasFnv1a64(const void *data, size_t size, uint64_t h = 1469598103934665603ULL)
@@ -558,32 +797,89 @@ static uint64_t TasFnv1a64(const void *data, size_t size, uint64_t h = 146959810
     return h;
 }
 
-static uint64_t TasComputeStateHash()
+static bool TasComputeRamHash(uint64_t *out_hash)
 {
-    /* Hash guest RAM in chunks plus the canonical movie frame input. This is
-     * deliberately an explicit verifier checkpoint, not a per-frame hot-path
-     * hash. */
+    if (!out_hash) return false;
     const uint64_t ram_size = xemu_guest_ram_size();
+    if (!ram_size) return false;
     static std::vector<uint8_t> buf(1 << 20);
     uint64_t h = 1469598103934665603ULL;
+    uint64_t hashed = 0;
     for (uint64_t off = 0; off < ram_size; off += buf.size()) {
         size_t n = (size_t)std::min<uint64_t>(buf.size(), ram_size - off);
         ssize_t got = xemu_phys_read((uint32_t)off, buf.data(), n);
-        if (got <= 0) break;
-        /* XXH3 uses the host's optimized SIMD implementation. Combine one
-         * 64-bit hash per chunk instead of byte-walking all 128 MiB of Xbox RAM
-         * in C++ for every verifier checkpoint. */
+        if (got != (ssize_t)n) return false;
         const uint64_t chunk_hash = fast_hash(buf.data(), (size_t)got);
         h = TasFnv1a64(&chunk_hash, sizeof(chunk_hash), h);
+        hashed += (uint64_t)got;
     }
+    if (hashed != ram_size) return false;
+    *out_hash = h;
+    return true;
+}
+
+/* QEMU's standalone non-RAM serializer is stronger than RAM-only hashing,
+ * but some device configurations cannot be serialized through that helper even
+ * though ordinary native Xemu snapshots work. Detect support once per process.
+ * A first-probe failure deliberately falls back to RAM + TAS boundary state so
+ * recording itself is never disabled by an optional verifier layer. If the
+ * serializer succeeds once, later failures remain hard errors rather than
+ * silently weakening an established proof mode. */
+static int g_tas_nonram_fingerprint_capability = -1; /* -1 unknown, 0 fallback, 1 full */
+
+static bool TasComputeStateHash(uint64_t *out_hash)
+{
+    if (!out_hash) return false;
+    /* Full strict fingerprint: guest RAM plus QEMU's canonical serialized
+     * non-RAM VM/device state (CPU, clocks/timers, NV2A/APU/IDE/USB, etc.) and
+     * the TAS movie/input/lag state associated with this machine boundary. */
+    uint64_t h = 0;
+    if (!TasComputeRamHash(&h)) return false;
+
+    if (g_tas_nonram_fingerprint_capability != 0) {
+        uint64_t full_h = h;
+        if (xemu_tas_machine_state_hash(h, &full_h)) {
+            h = full_h;
+            g_tas_nonram_fingerprint_capability = 1;
+        } else if (g_tas_nonram_fingerprint_capability < 0) {
+            /* First probe failed on this device configuration. Keep the
+             * transaction-bound native snapshot authoritative and use a
+             * stable, explicitly tagged RAM+TAS fallback fingerprint. */
+            g_tas_nonram_fingerprint_capability = 0;
+        } else {
+            /* Full VMState hashing was already proven available earlier in
+             * this session. Losing it later is a real strict-sync failure. */
+            return false;
+        }
+    }
+    if (g_tas_nonram_fingerprint_capability == 0) {
+        static const uint64_t fallback_tag =
+            UINT64_C(0x58454d5554415346); /* XEMUTASF */
+        h = TasFnv1a64(&fallback_tag, sizeof(fallback_tag), h);
+    }
+
     uint64_t frame = xemu_tas_frame();
     h = TasFnv1a64(&frame, sizeof(frame), h);
-    if (frame < g_tas_frames.size()) {
-        h = TasFnv1a64(&g_tas_frames[(size_t)frame], sizeof(TasFrame), h);
-        uint8_t lag = frame < g_tas_lag_flags.size() ? g_tas_lag_flags[(size_t)frame] : 0;
+    /* Boundary N means rows [0,N) have executed and row N is still future.
+     * Fingerprint the just-consumed row, never an unexecuted future input. */
+    if (frame > 0 && frame - 1 < g_tas_frames.size()) {
+        const size_t executed = (size_t)(frame - 1);
+        h = TasFnv1a64(&g_tas_frames[executed], sizeof(TasFrame), h);
+        uint8_t lag = executed < g_tas_lag_flags.size() ? g_tas_lag_flags[executed] : 0;
         h = TasFnv1a64(&lag, 1, h);
+        if (executed < g_tas_poll_counts.size()) {
+            h = TasFnv1a64(&g_tas_poll_counts[executed],
+                           sizeof(TasPollCounts), h);
+        }
     }
-    return h;
+    const uint8_t last_lag = xemu_tas_last_frame_lagged() ? 1 : 0;
+    const uint64_t lag_count = xemu_tas_lag_count();
+    const uint64_t lag_streak = xemu_tas_lag_streak();
+    h = TasFnv1a64(&last_lag, sizeof(last_lag), h);
+    h = TasFnv1a64(&lag_count, sizeof(lag_count), h);
+    h = TasFnv1a64(&lag_streak, sizeof(lag_streak), h);
+    *out_hash = h;
+    return true;
 }
 
 static bool TasReadMemoryValue(uint32_t address, int size, uint64_t *value)
@@ -700,11 +996,19 @@ static void TasApplySelectedFrame()
 
 static void DrawTasInputDisplay()
 {
-    if (!g_tas_input_display_open) return;
-    if (!ImGui::Begin("TAS Input Display", &g_tas_input_display_open)) {
+    static constexpr const char *kDetachId = "tas.input-display";
+    xemu_feature_detach::Register(kDetachId, "TAS Input Display",
+                                  &g_tas_input_display_open, DrawTasInputDisplay);
+    if (!g_tas_input_display_open || !xemu_feature_detach::ShouldDraw(kDetachId)) return;
+    if (xemu_feature_detach::IsDetachedPass(kDetachId)) {
+        xemu_feature_detach::PrepareWindow(kDetachId);
+    }
+    if (!ImGui::Begin("TAS Input Display", &g_tas_input_display_open,
+                      xemu_feature_detach::WindowFlags(kDetachId, 0))) {
         ImGui::End();
         return;
     }
+    xemu_feature_detach::ObserveCurrentWindow(kDetachId);
     ImGui::Text("TAS frame: %llu", (unsigned long long)xemu_tas_frame());
     for (int port = 0; port < XEMU_TAS_MAX_PORTS; ++port) {
         uint8_t r[20]{};
@@ -852,6 +1156,124 @@ static void TasInvalidateSnapshotCache()
     g_tas_state_slot_cache_valid = false;
 }
 
+static bool TasCaptureMovieStartSnapshot()
+{
+    /* Caller keeps the VM paused until movie-frame-0 recording is armed. */
+    if (runstate_is_running()) {
+        xemu_queue_error_message("Internal TAS error: movie-start snapshot requested while VM is running");
+        return false;
+    }
+
+    uint32_t title_id = 0;
+    TasGetCurrentTitleId(&title_id);
+    const uint64_t stamp = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    char name[96];
+    snprintf(name, sizeof(name), "%08X_TAS_START_%016llX", title_id,
+             (unsigned long long)stamp);
+
+    XemuTasTransactionId transaction{};
+    xemu_tas_transaction_mint(&transaction);
+
+    Error *err = NULL;
+    xemu_tas_transaction_snapshot_begin();
+    xemu_snapshots_save_no_thumbnail(name, &err);
+    xemu_tas_transaction_snapshot_end();
+    if (err) {
+        xemu_queue_error_message(error_get_pretty(err));
+        error_free(err);
+        return false;
+    }
+
+    TasSnapshotCacheInsert(name);
+    g_tas_movie_start_snapshot = name;
+    g_tas_movie_start_transaction = transaction;
+    if (!TasComputeRamHash(&g_tas_movie_start_legacy_ram_hash) ||
+        !TasComputeStateHash(&g_tas_movie_start_state_hash)) {
+        xemu_queue_error_message(
+            "Could not fingerprint canonical TAS movie-start state even with the safe fallback; snapshot was not accepted");
+        if (g_tas_snapshot_delete_queued.emplace(name).second) {
+            g_tas_snapshot_delete_queue.push_back(name);
+        }
+        g_tas_movie_start_snapshot.clear();
+        g_tas_movie_start_transaction = {};
+        g_tas_movie_start_legacy_ram_hash = 0;
+        g_tas_movie_start_state_hash = 0;
+        return false;
+    }
+    return true;
+}
+
+static bool TasRestoreMovieStartSnapshot()
+{
+    if (g_tas_movie_start_snapshot.empty()) {
+        xemu_queue_error_message(
+            "This TAS has no canonical movie-start state. Re-record it from the desired starting point so playback can be deterministic.");
+        return false;
+    }
+    if (!TasSnapshotExists(g_tas_movie_start_snapshot.c_str())) {
+        xemu_queue_error_message(
+            "The TAS movie-start snapshot is not available in this Xemu snapshot store; playback cannot be reproduced exactly.");
+        return false;
+    }
+
+    xemu_tas_prepare_runtime();
+    Error *err = NULL;
+    bool was_running = false;
+    const bool loaded = xemu_snapshots_load_paused(g_tas_movie_start_snapshot.c_str(),
+                                                    &was_running, &err);
+    (void)was_running;
+    if (err || !loaded) {
+        if (err) {
+            xemu_queue_error_message(error_get_pretty(err));
+            error_free(err);
+        } else {
+            xemu_queue_error_message("Could not restore TAS movie-start snapshot");
+        }
+        return false;
+    }
+
+    /* Native snapshots do not own TAStudio's feature counters. Canonical
+     * movie-start state is always boundary 0 with fresh lag bookkeeping. */
+    if (!xemu_tas_enabled()) xemu_tas_set_enabled(true);
+    xemu_tas_set_frame(0);
+    xemu_tas_reset_lag_counters();
+
+    if ((g_tas_movie_start_transaction.hi || g_tas_movie_start_transaction.lo) &&
+        !xemu_tas_transaction_matches(&g_tas_movie_start_transaction)) {
+        xemu_queue_error_message(
+            "TAS movie-start snapshot transaction ID does not match the movie metadata; playback remains paused");
+        return false;
+    }
+
+    if (g_tas_movie_start_state_hash) {
+        uint64_t actual = 0;
+        if (!TasComputeStateHash(&actual)) {
+            xemu_queue_error_message(
+                "Could not compute TAS movie-start machine fingerprint; restore rejected");
+            return false;
+        }
+        if (actual != g_tas_movie_start_state_hash) {
+            xemu_queue_error_message(
+                "TAS movie-start snapshot failed Strict Sync machine-state validation; playback remains paused");
+            return false;
+        }
+    } else if (g_tas_movie_start_legacy_ram_hash) {
+        uint64_t actual = 0;
+        if (!TasComputeRamHash(&actual)) {
+            xemu_queue_error_message(
+                "Could not compute legacy TAS movie-start RAM fingerprint; restore rejected");
+            return false;
+        }
+        if (actual != g_tas_movie_start_legacy_ram_hash) {
+            xemu_queue_error_message(
+                "Legacy TAS movie-start snapshot failed RAM validation; playback remains paused");
+            return false;
+        }
+    }
+    return true;
+}
+
 static std::string TasDefaultMovieDirectory()
 {
     std::filesystem::path dir = xemu_settings_get_base_path();
@@ -977,15 +1399,16 @@ static void TasStoreCurrentBranch(uint64_t fork_frame, const char *reason)
     archived.name = reason ? reason : "Preserved branch";
     archived.frames = std::move(g_tas_frames);
     archived.lag = std::move(g_tas_lag_flags);
+    archived.polls = std::move(g_tas_poll_counts);
     g_tas_branches.push_back(std::move(archived));
 }
 
-static void TasArchiveCurrentBranch(uint64_t fork_frame, const char *reason)
+static void TasArchiveCurrentBranch(uint64_t fork_boundary, const char *reason)
 {
     TasBranch archived;
     archived.id = g_tas_current_branch;
     archived.parent = g_tas_current_parent;
-    archived.fork_frame = fork_frame;
+    archived.fork_frame = fork_boundary;
     archived.name = reason ? reason : "Preserved future";
 
     /* Transfer ownership of the full old branch instead of copying it, then
@@ -993,13 +1416,22 @@ static void TasArchiveCurrentBranch(uint64_t fork_frame, const char *reason)
      * potentially huge full-movie duplicate into O(prefix) work. */
     archived.frames = std::move(g_tas_frames);
     archived.lag = std::move(g_tas_lag_flags);
-    const size_t keep = std::min<size_t>((size_t)fork_frame + 1, archived.frames.size());
+    archived.polls = std::move(g_tas_poll_counts);
+    /* fork_boundary is a machine boundary: inputs [0, boundary) have already
+     * executed and row boundary is the first input owned by the new branch. */
+    const size_t keep = std::min<size_t>((size_t)fork_boundary,
+                                         archived.frames.size());
     g_tas_frames.assign(archived.frames.begin(), archived.frames.begin() + keep);
     g_tas_lag_flags.assign(archived.lag.begin(), archived.lag.begin() +
                           std::min(keep, archived.lag.size()));
+    g_tas_poll_counts.assign(archived.polls.begin(), archived.polls.begin() +
+                             std::min(keep, archived.polls.size()));
     if (g_tas_frames.empty()) g_tas_frames.resize(1);
     if (g_tas_lag_flags.size() < g_tas_frames.size()) {
         g_tas_lag_flags.resize(g_tas_frames.size(), 0);
+    }
+    if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
     }
     g_tas_branches.push_back(std::move(archived));
 
@@ -1008,38 +1440,280 @@ static void TasArchiveCurrentBranch(uint64_t fork_frame, const char *reason)
     g_tas_visible_frame_cache_dirty = true;
 }
 
-static void TasResumeMovieAtFrame(uint64_t frame, bool resume_vm)
+static void TasResumeMovieAtFrame(uint64_t boundary, bool resume_vm)
 {
+    TasCancelPendingTransportAdvance();
     if (!xemu_tas_enabled()) xemu_tas_set_enabled(true);
     if (g_tas_frames.empty()) {
         g_tas_frames.resize(1);
         g_tas_lag_flags.resize(1, 0);
+        g_tas_poll_counts.resize(1, TasUnknownPollCounts());
     }
-    frame = std::min<uint64_t>(frame, g_tas_frames.size() - 1);
+    boundary = std::min<uint64_t>(boundary, g_tas_frames.size());
 
-    if (!g_tas_read_only && frame + 1 < g_tas_frames.size()) {
-        TasArchiveCurrentBranch(frame, "Preserved future before rerecord");
-        g_tas_frames.resize((size_t)frame + 1);
-        g_tas_lag_flags.resize((size_t)frame + 1);
+    if (!g_tas_read_only && boundary < g_tas_frames.size()) {
+        TasArchiveCurrentBranch(boundary, "Preserved future before rerecord");
+        /* TasArchiveCurrentBranch keeps exactly [0,boundary). Keep a single
+         * placeholder only for an otherwise empty editor; it is replaced by
+         * the first newly recorded frame. */
+        if (boundary == 0) {
+            g_tas_frames.assign(1, TasFrame{});
+            g_tas_lag_flags.assign(1, 0);
+            g_tas_poll_counts.assign(1, TasUnknownPollCounts());
+            g_tas_record_replace_placeholder = true;
+        }
         ++g_tas_rerecord_count;
     }
 
-    g_tas_selected_frame = (int)std::min<uint64_t>(frame, INT_MAX);
-    xemu_tas_set_frame(frame);
+    const uint64_t selected = g_tas_frames.empty() ? 0 :
+        std::min<uint64_t>(boundary, g_tas_frames.size() - 1);
+    g_tas_selected_frame = (int)std::min<uint64_t>(selected, INT_MAX);
+    xemu_tas_set_frame(boundary);
 
     if (g_tas_read_only) {
-        xemu_tas_set_playback_movie(g_tas_frames.data(), g_tas_lag_flags.data(),
-                                    g_tas_frames.size());
-        xemu_tas_start_playback(frame);
+        xemu_tas_set_playback_movie_ex(g_tas_frames.data(), g_tas_lag_flags.data(),
+                                       reinterpret_cast<const uint32_t *>(g_tas_poll_counts.data()),
+                                       g_tas_poll_counts.size() * XEMU_TAS_MAX_PORTS,
+                                       g_tas_frames.size());
+        if (boundary < g_tas_frames.size()) {
+            xemu_tas_start_playback(boundary);
+        } else {
+            xemu_tas_stop_playback();
+        }
     } else {
         xemu_tas_clear_recording();
         g_tas_record_synced = 0;
-        g_tas_record_replace_placeholder = false;
+        if (boundary != 0) g_tas_record_replace_placeholder = false;
         xemu_tas_start_recording(true);
     }
     if (resume_vm && !runstate_is_running()) {
         vm_start();
     }
+}
+
+static std::string TasStateBundlePath(const char *snapshot_name)
+{
+    std::filesystem::path dir(TasDefaultMovieDirectory());
+    dir /= ".tas_states";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::filesystem::path p = dir / (std::string(snapshot_name ? snapshot_name : "state") + ".xmt");
+    return p.string();
+}
+
+static uint32_t TasOverdubFieldMask()
+{
+    uint32_t mask = 0;
+    for (unsigned i = 0; i < g_tas_overdub_fields.size(); ++i) {
+        if (g_tas_overdub_fields[i]) mask |= 1u << i;
+    }
+    return mask;
+}
+
+static TasStateBundleRuntime TasCaptureRuntimeBundle(
+    const XemuTasTransactionId &transaction, bool vm_was_running)
+{
+    TasStateBundleRuntime bundle;
+    bundle.valid = true;
+    bundle.transaction = transaction;
+    bundle.boundary = xemu_tas_frame();
+    bundle.vm_was_running = vm_was_running;
+    bundle.selected_frame = g_tas_selected_frame;
+    bundle.selection_anchor = g_tas_selection_anchor;
+    bundle.selection_end = g_tas_selection_end;
+    bundle.follow = g_tas_follow_frame;
+    bundle.read_only = g_tas_read_only;
+    bundle.branch_id = g_tas_current_branch;
+    bundle.movie_revision = g_tas_movie_revision;
+    bundle.overdub_start = g_tas_overdub_start_frame;
+    bundle.overdub_synced = g_tas_overdub_synced;
+    bundle.overdub_port = (uint32_t)std::clamp(g_tas_port, 0, XEMU_TAS_MAX_PORTS - 1);
+    bundle.overdub_field_mask = TasOverdubFieldMask();
+    bundle.owner_movie_path = g_tas_movie_path;
+    bundle.last_frame_lagged = xemu_tas_last_frame_lagged();
+    bundle.lag_count = xemu_tas_lag_count();
+    bundle.lag_streak = xemu_tas_lag_streak();
+
+    if (g_tas_overdub_ui_active || xemu_tas_overdub()) {
+        bundle.mode = TasRuntimeMode::Overdub;
+    } else if (xemu_tas_recording()) {
+        bundle.mode = TasRuntimeMode::Recording;
+    } else if (xemu_tas_playback()) {
+        bundle.mode = TasRuntimeMode::Playback;
+    } else {
+        bundle.mode = TasRuntimeMode::Idle;
+    }
+    if (!TasComputeStateHash(&bundle.state_hash)) {
+        bundle.valid = false;
+    }
+    return bundle;
+}
+
+static bool TasSavePairedSnapshot(const char *snapshot_name,
+                                  const std::string &bundle_path,
+                                  TasStateBundleRuntime *saved_bundle)
+{
+    if (runstate_is_running()) {
+        xemu_queue_error_message("Internal TAS error: paired snapshot requested while VM is running");
+        return false;
+    }
+
+    /* Flush every completed recording/overdub frame into the movie half while
+     * the VM is frozen, but do not dismantle the active runtime mode. */
+    TasSyncRecordingFromCore();
+
+    XemuTasTransactionId transaction{};
+    xemu_tas_transaction_mint(&transaction);
+    TasStateBundleRuntime bundle = TasCaptureRuntimeBundle(transaction, false);
+    if (!bundle.valid) {
+        xemu_queue_error_message("Could not fingerprint TAS paired state; snapshot was not saved");
+        return false;
+    }
+
+    if (!TasSaveMovieToPathInternal(bundle_path.c_str(), false, false, &bundle)) {
+        xemu_queue_error_message("Could not save the TAS movie/runtime half of the paired state");
+        return false;
+    }
+
+    Error *err = NULL;
+    xemu_tas_transaction_snapshot_begin();
+    xemu_snapshots_save_no_thumbnail(snapshot_name, &err);
+    xemu_tas_transaction_snapshot_end();
+    if (err) {
+        xemu_queue_error_message(error_get_pretty(err));
+        error_free(err);
+        std::error_code ec;
+        std::filesystem::remove(bundle_path, ec);
+        return false;
+    }
+    TasSnapshotCacheInsert(snapshot_name);
+    if (saved_bundle) *saved_bundle = std::move(bundle);
+    return true;
+}
+
+static bool TasRestoreRuntimeBundle(const TasStateBundleRuntime &bundle)
+{
+    if (!bundle.valid || bundle.boundary > g_tas_frames.size() ||
+        bundle.branch_id != g_tas_current_branch ||
+        bundle.movie_revision != g_tas_movie_revision) {
+        return false;
+    }
+
+    xemu_tas_stop_overdub();
+    xemu_tas_stop_recording();
+    xemu_tas_stop_playback();
+    xemu_tas_set_frame(bundle.boundary);
+    xemu_tas_set_lag_state(bundle.last_frame_lagged, bundle.lag_count,
+                           bundle.lag_streak);
+
+    if (bundle.state_hash) {
+        uint64_t actual = 0;
+        if (!TasComputeStateHash(&actual) || actual != bundle.state_hash) {
+            return false;
+        }
+    }
+
+    const int last = std::max(0, (int)g_tas_frames.size() - 1);
+    g_tas_selected_frame = std::clamp(bundle.selected_frame, 0, last);
+    g_tas_selection_anchor = std::clamp(bundle.selection_anchor, 0, last);
+    g_tas_selection_end = std::clamp(bundle.selection_end, 0, last);
+    g_tas_follow_frame = bundle.follow;
+    g_tas_read_only = bundle.read_only;
+    g_tas_port = std::clamp((int)bundle.overdub_port, 0, XEMU_TAS_MAX_PORTS - 1);
+    g_tas_overdub_start_frame = bundle.overdub_start;
+    g_tas_overdub_synced = bundle.overdub_synced;
+    for (unsigned i = 0; i < g_tas_overdub_fields.size(); ++i) {
+        g_tas_overdub_fields[i] = (bundle.overdub_field_mask & (1u << i)) != 0;
+    }
+    if (!bundle.owner_movie_path.empty()) g_tas_movie_path = bundle.owner_movie_path;
+
+    TasPushMovieToCore();
+    g_tas_record_synced = 0;
+    g_tas_record_replace_placeholder = false;
+    g_tas_overdub_ui_active = false;
+    g_tas_power_on_reset_pending = false;
+    g_tas_power_on_reset_deadline = {};
+    xemu_tas_cancel_post_reset_pause();
+
+    switch (bundle.mode) {
+    case TasRuntimeMode::Idle:
+        break;
+    case TasRuntimeMode::Playback:
+        if (bundle.boundary < g_tas_frames.size() &&
+            !xemu_tas_start_playback(bundle.boundary)) {
+            return false;
+        }
+        break;
+    case TasRuntimeMode::Recording:
+        if (bundle.boundary == 0 && g_tas_frames.size() == 1) {
+            g_tas_record_replace_placeholder = true;
+        } else if (bundle.boundary != g_tas_frames.size()) {
+            /* A recording transaction cannot own unexecuted future rows. */
+            return false;
+        }
+        xemu_tas_start_recording(true);
+        break;
+    case TasRuntimeMode::Overdub: {
+        if (bundle.boundary >= g_tas_frames.size()) return false;
+        uint16_t digital_mask = 0;
+        uint8_t analog_mask = 0, stick_mask = 0;
+        for (int i = 0; i < 8; ++i) if (g_tas_overdub_fields[i]) digital_mask |= (uint16_t)(1u << i);
+        for (int i = 0; i < 8; ++i) if (g_tas_overdub_fields[8 + i]) analog_mask |= (uint8_t)(1u << i);
+        for (int i = 0; i < 4; ++i) if (g_tas_overdub_fields[16 + i]) stick_mask |= (uint8_t)(1u << i);
+        g_tas_overdub_start_frame = bundle.boundary;
+        g_tas_overdub_synced = 0;
+        g_tas_overdub_ui_active = xemu_tas_start_overdub(
+            bundle.boundary, (uint8_t)g_tas_port, digital_mask,
+            analog_mask, stick_mask);
+        if (!g_tas_overdub_ui_active) return false;
+        break;
+    }
+    }
+
+    if (bundle.vm_was_running && !runstate_is_running()) vm_start();
+    return true;
+}
+
+static bool TasLoadPairedSnapshot(const char *snapshot_name,
+                                  const std::string &bundle_path)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(bundle_path, ec)) {
+        xemu_queue_error_message("TAS paired movie/runtime bundle is missing");
+        return false;
+    }
+
+    xemu_tas_prepare_runtime();
+    Error *err = NULL;
+    bool ignored_running = false;
+    const bool loaded = xemu_snapshots_load_paused(snapshot_name, &ignored_running, &err);
+    if (err || !loaded) {
+        if (err) {
+            xemu_queue_error_message(error_get_pretty(err));
+            error_free(err);
+        } else {
+            xemu_queue_error_message("TAS native snapshot load failed");
+        }
+        return false;
+    }
+
+    g_tas_silent_bundle_load = true;
+    const bool movie_loaded = TasLoadMovieFromPath(bundle_path.c_str());
+    g_tas_silent_bundle_load = false;
+    if (!movie_loaded || !g_tas_loaded_state_bundle.valid) {
+        xemu_queue_error_message("TAS paired movie/runtime bundle is invalid");
+        return false;
+    }
+    const TasStateBundleRuntime bundle = g_tas_loaded_state_bundle;
+    if (!xemu_tas_transaction_matches(&bundle.transaction)) {
+        xemu_queue_error_message("TAS snapshot/movie transaction ID mismatch; pair rejected");
+        return false;
+    }
+    if (!TasRestoreRuntimeBundle(bundle)) {
+        xemu_queue_error_message("TAS paired state failed runtime/state-hash validation");
+        return false;
+    }
+    return true;
 }
 
 static void TasSaveSelectedState()
@@ -1050,11 +1724,27 @@ static void TasSaveSelectedState()
         return;
     }
 
-    Error *err = NULL;
-    xemu_snapshots_save(state_name, &err);
-    if (err) {
-        xemu_queue_error_message(error_get_pretty(err));
-        error_free(err);
+    const bool was_running = runstate_is_running();
+    if (was_running) vm_stop(RUN_STATE_PAUSED);
+
+    TasStateBundleRuntime bundle;
+    const std::string bundle_path = TasStateBundlePath(state_name);
+    if (!TasSavePairedSnapshot(state_name, bundle_path, &bundle)) {
+        if (was_running && !runstate_is_running()) vm_start();
+        return;
+    }
+    bundle.vm_was_running = was_running;
+    /* Rewrite only the small movie sidecar so its runtime header records the
+     * pre-save runstate. Native VM state is unchanged while paused. The pair
+     * is not committed unless this second half succeeds. */
+    if (!TasSaveMovieToPathInternal(bundle_path.c_str(), false, false, &bundle)) {
+        std::error_code ec;
+        std::filesystem::remove(bundle_path, ec);
+        if (g_tas_snapshot_delete_queued.emplace(state_name).second) {
+            g_tas_snapshot_delete_queue.push_back(state_name);
+        }
+        if (was_running && !runstate_is_running()) vm_start();
+        xemu_queue_error_message("Could not finalize TAS state movie/runtime bundle; state was discarded");
         return;
     }
 
@@ -1065,9 +1755,12 @@ static void TasSaveSelectedState()
         g_tas_state_slot_cache[(size_t)g_tas_state_slot] = true;
     }
     g_tas_state_meta[g_tas_state_slot].valid = true;
-    g_tas_state_meta[g_tas_state_slot].frame = xemu_tas_frame();
+    g_tas_state_meta[g_tas_state_slot].frame = bundle.boundary;
     g_tas_state_meta[g_tas_state_slot].branch_id = g_tas_current_branch;
+    g_tas_state_meta[g_tas_state_slot].transaction = bundle.transaction;
     TasAutosaveRecovery(true);
+
+    if (was_running && !runstate_is_running()) vm_start();
 
     char msg[160];
     snprintf(msg, sizeof(msg), "Saved TAS state %02d (%s) at frame %llu",
@@ -1078,6 +1771,7 @@ static void TasSaveSelectedState()
 
 static void TasLoadSelectedState()
 {
+    TasCancelPendingTransportAdvance();
     char state_name[64];
     if (!TasBuildStateName(state_name, sizeof(state_name))) {
         xemu_queue_error_message("TAS state: no running XBE/title ID is available yet");
@@ -1091,58 +1785,56 @@ static void TasLoadSelectedState()
         return;
     }
 
-    TasAutosaveRecovery(true);
-
     uint32_t title_id = 0;
     TasGetCurrentTitleId(&title_id);
     char undo_name[64];
     snprintf(undo_name, sizeof(undo_name), "%08X_TAS_UNDO_LOAD", title_id);
-    Error *undo_err = NULL;
-    xemu_snapshots_save_no_thumbnail(undo_name, &undo_err);
-    if (!undo_err) {
-        TasSnapshotCacheInsert(undo_name);
-        g_tas_undo_snapshot_name = undo_name;
-    } else {
-        error_free(undo_err);
-    }
+    const bool was_running = runstate_is_running();
+    if (was_running) vm_stop(RUN_STATE_PAUSED);
+    TasSyncRecordingFromCore();
+    TasAutosaveRecovery(true);
 
-    Error *err = NULL;
-    bool was_running = false;
-    const bool loaded = xemu_snapshots_load_paused(state_name, &was_running, &err);
-    if (err || !loaded) {
-        if (err) {
-            xemu_queue_error_message(error_get_pretty(err));
-            error_free(err);
-        } else {
-            xemu_queue_error_message("TAS state load failed");
-        }
+    /* Undo Load is itself a complete pair. If loading the target fails after
+     * touching either half, immediately roll back through this pair. */
+    const std::string undo_bundle_path = TasStateBundlePath(undo_name);
+    TasStateBundleRuntime undo_bundle;
+    if (!TasSavePairedSnapshot(undo_name, undo_bundle_path, &undo_bundle)) {
+        if (was_running && !runstate_is_running()) vm_start();
+        xemu_queue_error_message("Could not create transactional Undo Load guard");
         return;
     }
+    undo_bundle.vm_was_running = was_running;
+    if (!TasSaveMovieToPathInternal(undo_bundle_path.c_str(), false, false,
+                                    &undo_bundle)) {
+        std::error_code ec;
+        std::filesystem::remove(undo_bundle_path, ec);
+        if (g_tas_snapshot_delete_queued.emplace(undo_name).second) {
+            g_tas_snapshot_delete_queue.push_back(undo_name);
+        }
+        if (was_running && !runstate_is_running()) vm_start();
+        xemu_queue_error_message("Could not finalize transactional Undo Load guard");
+        return;
+    }
+    g_tas_undo_snapshot_name = undo_name;
+    g_tas_undo_transaction = undo_bundle.transaction;
 
-    /* The VM is deliberately still stopped here. Install the movie cursor and
-     * input mode before any restored guest instruction can execute. This makes
-     * Resume Recording From Savestate deterministic instead of racing VM resume. */
-    if (g_tas_state_meta[g_tas_state_slot].valid) {
-        TasResumeMovieAtFrame(g_tas_state_meta[g_tas_state_slot].frame, false);
-    } else {
-        xemu_queue_notification("Loaded TAS state; movie frame metadata was not available");
+    if (!TasLoadPairedSnapshot(state_name, TasStateBundlePath(state_name))) {
+        TasLoadPairedSnapshot(undo_name, undo_bundle_path);
+        return;
     }
-    if (was_running && !runstate_is_running()) {
-        vm_start();
-    }
+    xemu_queue_notification("Loaded transactional TAS state");
 }
 
 static void TasUndoStateLoad()
 {
+    TasCancelPendingTransportAdvance();
     if (g_tas_undo_snapshot_name.empty() || !TasSnapshotExists(g_tas_undo_snapshot_name.c_str())) {
         xemu_queue_error_message("No TAS savestate load to undo");
         return;
     }
-    Error *err = NULL;
-    xemu_snapshots_load(g_tas_undo_snapshot_name.c_str(), &err);
-    if (err) {
-        xemu_queue_error_message(error_get_pretty(err));
-        error_free(err);
+    const std::string bundle_path = TasStateBundlePath(g_tas_undo_snapshot_name.c_str());
+    if (!TasLoadPairedSnapshot(g_tas_undo_snapshot_name.c_str(), bundle_path)) {
+        xemu_queue_error_message("Could not restore transactional Undo Load pair");
         return;
     }
     xemu_queue_notification("Undid last TAS savestate load");
@@ -1190,6 +1882,23 @@ static void TasGetStateSlotStatus(std::array<bool, 100> &occupied)
     occupied = g_tas_state_slot_cache;
 }
 
+static void TasClearRewindCheckpoints()
+{
+    /* Rewind states are only valid for the exact movie/runtime session that
+     * produced them. Drop the in-memory index immediately when that baseline
+     * changes and retire the native snapshots lazily while the VM is paused. */
+    for (auto &cp : g_tas_rewind_points) {
+        if (cp.valid && !cp.snapshot_name.empty() &&
+            g_tas_snapshot_delete_queued.emplace(cp.snapshot_name).second) {
+            g_tas_snapshot_delete_queue.push_back(cp.snapshot_name);
+        }
+        cp = {};
+    }
+    g_tas_rewind_slot = 0;
+    g_tas_rewind_next_frame = 0;
+    TasCancelPendingTransportAdvance();
+}
+
 static void TasResetMovieMetadata()
 {
     g_tas_lag_flags.assign(1, 0);
@@ -1203,10 +1912,7 @@ static void TasResetMovieMetadata()
     g_tas_record_synced = 0;
     g_tas_last_autosave_record_count = 0;
     g_tas_next_autosave_host = {};
-    g_tas_rewind_points = {};
-    g_tas_rewind_slot = 0;
-    g_tas_rewind_next_frame = 0;
-    g_tas_rewind_next_host_checkpoint = {};
+    TasClearRewindCheckpoints();
     g_tas_markers.clear();
     g_tas_properties = {};
     g_tas_loaded_environment = {};
@@ -1216,6 +1922,23 @@ static void TasResetMovieMetadata()
     g_tas_verify_failed = false;
     g_tas_verify_start_snapshot.clear();
     g_tas_verify_branch = 0;
+    g_tas_movie_start_snapshot.clear();
+    g_tas_movie_start_state_hash = 0;
+    g_tas_movie_start_legacy_ram_hash = 0;
+    g_tas_movie_start_transaction = {};
+    g_tas_poll_counts.assign(1, TasUnknownPollCounts());
+    g_tas_verify_revision = UINT64_MAX;
+    g_tas_verify_start_transaction = {};
+    g_tas_verify_baseline_interval = std::max(1, g_tas_verify_interval);
+    g_tas_verify_runs_total = 1;
+    g_tas_verify_runs_remaining = 0;
+    g_tas_verify_run_index = 0;
+    g_tas_verify_exhaustive = false;
+    g_tas_verify_poll_sync_from = 0;
+    g_tas_timeline_mutation = {};
+    g_tas_branch_switch = {};
+    g_tas_loaded_state_bundle = {};
+    g_tas_undo_transaction = {};
     g_tas_movie_revision = 0;
     g_tas_movie_dirty = false;
     g_tas_core_pushed_revision = UINT64_MAX;
@@ -1228,7 +1951,15 @@ static void TasResetMovieMetadata()
     g_tas_selection_end = 0;
     g_tas_clipboard_frames.clear();
     g_tas_clipboard_lag.clear();
+    g_tas_clipboard_polls.clear();
     g_tas_overdub_ui_active = false;
+    g_tas_power_on_reset_pending = false;
+    xemu_tas_cancel_post_reset_pause();
+    g_tas_power_on_reset_deadline = {};
+    g_tas_pending_overdub_start = {};
+    g_tas_strict_resim_pending = false;
+    g_tas_strict_resim_target = 0;
+    g_tas_strict_resim_continue = false;
     g_tas_compare_frames.clear();
     g_tas_compare_lag.clear();
 }
@@ -1244,7 +1975,8 @@ static void TasNewMovie()
     g_tas_movie_path.clear();
     g_tas_follow_frame = true;
     xemu_tas_clear_all_xid_reports();
-    xemu_queue_notification("Created new TAS movie (power-on recording is the default)");
+    xemu_tas_set_deterministic_mode(true);
+    xemu_queue_notification("Created new TAS movie (Strict Sync enabled; power-on recording is the default)");
 }
 
 static bool TasWriteU8(FILE *f, uint8_t v)
@@ -1378,7 +2110,40 @@ static bool TasReadFrames(FILE *f, std::vector<TasFrame> *frames,
     return true;
 }
 
-static bool TasSaveMovieToPathInternal(const char *path, bool set_current_path, bool notify)
+static bool TasWritePollCounts(FILE *f, const std::vector<TasPollCounts> &polls,
+                               size_t frame_count)
+{
+    if (!TasWriteU64(f, frame_count)) return false;
+    const TasPollCounts unknown = TasUnknownPollCounts();
+    for (size_t i = 0; i < frame_count; ++i) {
+        const TasPollCounts &p = i < polls.size() ? polls[i] : unknown;
+        for (uint32_t count : p) {
+            if (!TasWriteU32(f, count)) return false;
+        }
+    }
+    return true;
+}
+
+static bool TasReadPollCounts(FILE *f, std::vector<TasPollCounts> *polls,
+                              size_t expected_frames)
+{
+    uint64_t count = 0;
+    if (!TasReadU64(f, &count) || count != expected_frames ||
+        count > 10000000ULL) {
+        return false;
+    }
+    polls->assign((size_t)count, TasUnknownPollCounts());
+    for (size_t i = 0; i < (size_t)count; ++i) {
+        for (uint32_t &value : (*polls)[i]) {
+            if (!TasReadU32(f, &value)) return false;
+        }
+    }
+    return true;
+}
+
+static bool TasSaveMovieToPathInternal(const char *path, bool set_current_path,
+                                       bool notify,
+                                       const TasStateBundleRuntime *state_bundle)
 {
     if (!path || !*path) return false;
     std::string final_path = TasEnsureXmtExtension(path);
@@ -1479,6 +2244,77 @@ static bool TasSaveMovieToPathInternal(const char *path, bool set_current_path, 
         if (!ok) break;
         ok = TasWriteU64(f, h.frame) && TasWriteU64(f, h.hash);
     }
+    /* Optional current-state start reference. Older XMT2 readers ignore bytes
+     * after the verifier list, so the existing XEX3 version remains valid. */
+    if (ok) {
+        ok = fwrite("TSST", 1, 4, f) == 4 &&
+             TasWriteString(f, g_tas_movie_start_snapshot) &&
+             TasWriteU64(f, g_tas_movie_start_legacy_ram_hash);
+    }
+    /* Determinism-v2 canonical start ownership + strong state fingerprint. */
+    if (ok) {
+        ok = fwrite("TST2", 1, 4, f) == 4 && TasWriteU32(f, 1) &&
+             TasWriteU64(f, g_tas_movie_start_transaction.hi) &&
+             TasWriteU64(f, g_tas_movie_start_transaction.lo) &&
+             TasWriteU64(f, g_tas_movie_start_state_hash);
+    }
+    /* Exact per-frame XID poll traces. Unknown entries are UINT32_MAX and are
+     * intentionally not treated as proof until a recording/verifier pass
+     * repopulates them. Branch traces travel with their branch ownership. */
+    if (ok) {
+        ok = fwrite("TPOL", 1, 4, f) == 4 && TasWriteU32(f, 1) &&
+             TasWritePollCounts(f, g_tas_poll_counts, g_tas_frames.size()) &&
+             TasWriteU32(f, (uint32_t)g_tas_branches.size());
+    }
+    for (const TasBranch &b : g_tas_branches) {
+        if (!ok) break;
+        ok = TasWriteU32(f, b.id) &&
+             TasWritePollCounts(f, b.polls, b.frames.size());
+    }
+    /* Slot transaction identities bind each native snapshot to the movie
+     * bundle that created it without changing the legacy fixed slot table. */
+    if (ok) {
+        ok = fwrite("TSM2", 1, 4, f) == 4 && TasWriteU32(f, 1);
+    }
+    for (const TasStateMeta &meta : g_tas_state_meta) {
+        if (!ok) break;
+        ok = TasWriteU64(f, meta.transaction.hi) &&
+             TasWriteU64(f, meta.transaction.lo);
+    }
+    if (ok) {
+        ok = fwrite("TVR2", 1, 4, f) == 4 && TasWriteU32(f, 2) &&
+             TasWriteU64(f, g_tas_verify_revision) &&
+             TasWriteU32(f, (uint32_t)std::max(1, g_tas_verify_interval)) &&
+             TasWriteU32(f, g_tas_verify_branch) &&
+             TasWriteU64(f, g_tas_verify_start_frame) &&
+             TasWriteU64(f, g_tas_verify_start_transaction.hi) &&
+             TasWriteU64(f, g_tas_verify_start_transaction.lo) &&
+             TasWriteString(f, g_tas_verify_start_snapshot);
+    }
+    if (ok && state_bundle && state_bundle->valid) {
+        ok = fwrite("TBND", 1, 4, f) == 4 && TasWriteU32(f, 2) &&
+             TasWriteU64(f, state_bundle->transaction.hi) &&
+             TasWriteU64(f, state_bundle->transaction.lo) &&
+             TasWriteU64(f, state_bundle->boundary) &&
+             TasWriteU64(f, state_bundle->state_hash) &&
+             TasWriteU8(f, state_bundle->last_frame_lagged ? 1 : 0) &&
+             TasWriteU64(f, state_bundle->lag_count) &&
+             TasWriteU64(f, state_bundle->lag_streak) &&
+             TasWriteU8(f, (uint8_t)state_bundle->mode) &&
+             TasWriteU8(f, state_bundle->vm_was_running ? 1 : 0) &&
+             TasWriteU32(f, (uint32_t)std::max(0, state_bundle->selected_frame)) &&
+             TasWriteU32(f, (uint32_t)std::max(0, state_bundle->selection_anchor)) &&
+             TasWriteU32(f, (uint32_t)std::max(0, state_bundle->selection_end)) &&
+             TasWriteU8(f, state_bundle->follow ? 1 : 0) &&
+             TasWriteU8(f, state_bundle->read_only ? 1 : 0) &&
+             TasWriteU32(f, state_bundle->branch_id) &&
+             TasWriteU64(f, state_bundle->movie_revision) &&
+             TasWriteU64(f, state_bundle->overdub_start) &&
+             TasWriteU64(f, state_bundle->overdub_synced) &&
+             TasWriteU32(f, state_bundle->overdub_port) &&
+             TasWriteU32(f, state_bundle->overdub_field_mask) &&
+             TasWriteString(f, state_bundle->owner_movie_path);
+    }
 
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -1550,6 +2386,7 @@ static bool TasLoadXmt1(FILE *f, uint32_t title_id, uint32_t flags,
     }
     g_tas_frames = std::move(loaded);
     g_tas_lag_flags.assign(g_tas_frames.size(), 0);
+    g_tas_poll_counts.assign(g_tas_frames.size(), TasUnknownPollCounts());
     g_tas_rerecord_count = 0;
     g_tas_state_meta = {};
     g_tas_chapters.clear();
@@ -1560,7 +2397,14 @@ static bool TasLoadXmt1(FILE *f, uint32_t title_id, uint32_t flags,
     g_tas_markers.clear();
     g_tas_properties = {};
     g_tas_verify_baseline.clear();
+    g_tas_verify_revision = UINT64_MAX;
+    g_tas_verify_start_transaction = {};
     g_tas_movie_revision = 0;
+    g_tas_movie_start_snapshot.clear();
+    g_tas_movie_start_legacy_ram_hash = 0;
+    g_tas_movie_start_state_hash = 0;
+    g_tas_movie_start_transaction = {};
+    g_tas_loaded_state_bundle = {};
     g_tas_loaded_environment = {};
     xemu_tas_set_deterministic_mode((flags & 1u) != 0);
     return true;
@@ -1644,7 +2488,18 @@ static bool TasLoadMovieFromPath(const char *path)
         g_tas_markers.clear();
         g_tas_properties = {};
         g_tas_verify_baseline.clear();
+        g_tas_verify_revision = UINT64_MAX;
+        g_tas_verify_start_transaction = {};
         g_tas_movie_revision = 0;
+        g_tas_movie_start_snapshot.clear();
+        g_tas_movie_start_legacy_ram_hash = 0;
+        g_tas_movie_start_state_hash = 0;
+        g_tas_movie_start_transaction = {};
+        g_tas_loaded_state_bundle = {};
+        g_tas_poll_counts.assign(g_tas_frames.size(), TasUnknownPollCounts());
+        for (TasBranch &b : g_tas_branches) {
+            b.polls.assign(b.frames.size(), TasUnknownPollCounts());
+        }
         if (ok) {
             char ext_magic[4];
             size_t ext_read = fread(ext_magic, 1, sizeof(ext_magic), f);
@@ -1669,6 +2524,121 @@ static bool TasLoadMovieFromPath(const char *path)
                     TasHashRecord h;
                     ok = TasReadU64(f, &h.frame) && TasReadU64(f, &h.hash);
                     if (ok) g_tas_verify_baseline.push_back(h);
+                }
+                while (ok) {
+                    char trailer[4];
+                    const size_t trailer_read = fread(trailer, 1, sizeof(trailer), f);
+                    if (trailer_read == 0) {
+                        clearerr(f);
+                        break;
+                    }
+                    if (trailer_read != sizeof(trailer)) {
+                        ok = false;
+                        break;
+                    }
+
+                    if (!memcmp(trailer, "TSST", 4)) {
+                        ok = TasReadString(f, &g_tas_movie_start_snapshot, 4096) &&
+                             TasReadU64(f, &g_tas_movie_start_legacy_ram_hash);
+                    } else if (!memcmp(trailer, "TST2", 4)) {
+                        uint32_t v = 0;
+                        ok = TasReadU32(f, &v) && v == 1 &&
+                             TasReadU64(f, &g_tas_movie_start_transaction.hi) &&
+                             TasReadU64(f, &g_tas_movie_start_transaction.lo) &&
+                             TasReadU64(f, &g_tas_movie_start_state_hash);
+                    } else if (!memcmp(trailer, "TPOL", 4)) {
+                        uint32_t v = 0, poll_branch_count = 0;
+                        ok = TasReadU32(f, &v) && v == 1 &&
+                             TasReadPollCounts(f, &g_tas_poll_counts,
+                                               g_tas_frames.size()) &&
+                             TasReadU32(f, &poll_branch_count) &&
+                             poll_branch_count <= 1000;
+                        for (uint32_t i = 0; ok && i < poll_branch_count; ++i) {
+                            uint32_t id = 0;
+                            ok = TasReadU32(f, &id);
+                            auto it = std::find_if(g_tas_branches.begin(),
+                                                   g_tas_branches.end(),
+                                                   [id](const TasBranch &b) {
+                                                       return b.id == id;
+                                                   });
+                            if (!ok || it == g_tas_branches.end()) {
+                                ok = false;
+                                break;
+                            }
+                            ok = TasReadPollCounts(f, &it->polls,
+                                                   it->frames.size());
+                        }
+                    } else if (!memcmp(trailer, "TSM2", 4)) {
+                        uint32_t v = 0;
+                        ok = TasReadU32(f, &v) && v == 1;
+                        for (TasStateMeta &meta : g_tas_state_meta) {
+                            if (!ok) break;
+                            ok = TasReadU64(f, &meta.transaction.hi) &&
+                                 TasReadU64(f, &meta.transaction.lo);
+                        }
+                    } else if (!memcmp(trailer, "TVR2", 4)) {
+                        uint32_t v = 0, interval = 0;
+                        ok = TasReadU32(f, &v) && (v == 1 || v == 2) &&
+                             TasReadU64(f, &g_tas_verify_revision) &&
+                             TasReadU32(f, &interval) &&
+                             TasReadU32(f, &g_tas_verify_branch) &&
+                             TasReadU64(f, &g_tas_verify_start_frame) &&
+                             TasReadU64(f, &g_tas_verify_start_transaction.hi) &&
+                             TasReadU64(f, &g_tas_verify_start_transaction.lo);
+                        if (ok && v >= 2) {
+                            ok = TasReadString(f, &g_tas_verify_start_snapshot, 4096);
+                        }
+                        if (ok) g_tas_verify_interval = std::max(1, (int)interval);
+                    } else if (!memcmp(trailer, "TBND", 4)) {
+                        uint32_t v = 0, selected = 0, anchor = 0, end = 0;
+                        uint32_t branch = 0, overdub_port = 0, field_mask = 0;
+                        uint8_t mode = 0, was_running = 0, follow = 0, read_only = 0;
+                        uint8_t last_lag = 0;
+                        TasStateBundleRuntime bundle;
+                        ok = TasReadU32(f, &v) && (v == 1 || v == 2) &&
+                             TasReadU64(f, &bundle.transaction.hi) &&
+                             TasReadU64(f, &bundle.transaction.lo) &&
+                             TasReadU64(f, &bundle.boundary) &&
+                             TasReadU64(f, &bundle.state_hash);
+                        if (ok && v >= 2) {
+                            ok = TasReadU8(f, &last_lag) &&
+                                 TasReadU64(f, &bundle.lag_count) &&
+                                 TasReadU64(f, &bundle.lag_streak);
+                            bundle.last_frame_lagged = last_lag != 0;
+                        }
+                        if (ok) {
+                            ok = TasReadU8(f, &mode) && mode <= (uint8_t)TasRuntimeMode::Overdub &&
+                             TasReadU8(f, &was_running) &&
+                             TasReadU32(f, &selected) && TasReadU32(f, &anchor) &&
+                             TasReadU32(f, &end) && TasReadU8(f, &follow) &&
+                             TasReadU8(f, &read_only) && TasReadU32(f, &branch) &&
+                             TasReadU64(f, &bundle.movie_revision) &&
+                             TasReadU64(f, &bundle.overdub_start) &&
+                             TasReadU64(f, &bundle.overdub_synced) &&
+                             TasReadU32(f, &overdub_port) &&
+                             TasReadU32(f, &field_mask) &&
+                             TasReadString(f, &bundle.owner_movie_path, 1 << 20);
+                        }
+                        if (ok) {
+                            bundle.valid = true;
+                            bundle.mode = (TasRuntimeMode)mode;
+                            bundle.vm_was_running = was_running != 0;
+                            bundle.selected_frame = (int)std::min<uint32_t>(selected, INT_MAX);
+                            bundle.selection_anchor = (int)std::min<uint32_t>(anchor, INT_MAX);
+                            bundle.selection_end = (int)std::min<uint32_t>(end, INT_MAX);
+                            bundle.follow = follow != 0;
+                            bundle.read_only = read_only != 0;
+                            bundle.branch_id = branch;
+                            bundle.overdub_port = overdub_port;
+                            bundle.overdub_field_mask = field_mask;
+                            g_tas_loaded_state_bundle = std::move(bundle);
+                        }
+                    } else {
+                        /* Forward-compatible unknown tail: older code did not
+                         * have section lengths, so stop rather than guessing. */
+                        clearerr(f);
+                        break;
+                    }
                 }
             } else if (ext_read != 0) {
                 /* Unknown trailing data is ignored to preserve forward compatibility. */
@@ -1695,7 +2665,7 @@ static bool TasLoadMovieFromPath(const char *path)
         g_tas_loaded_environment.fast_forward = ff;
         g_tas_loaded_environment.deterministic = (flags & 1u) != 0;
 
-        if (ok && g_tas_apply_movie_settings) {
+        if (ok && g_tas_apply_movie_settings && !g_tas_silent_bundle_load) {
             g_config.display.renderer = (int)renderer;
             nv2a_set_surface_scale_factor(std::clamp((int)surface_scale, 1, 10));
             g_config.display.ui.fit = (int)fit;
@@ -1708,16 +2678,17 @@ static bool TasLoadMovieFromPath(const char *path)
         }
         xemu_tas_set_deterministic_mode((flags & 1u) != 0);
 
-        if (ok && saved_commit != (xemu_commit ? xemu_commit : "")) {
+        if (ok && !g_tas_silent_bundle_load &&
+            saved_commit != (xemu_commit ? xemu_commit : "")) {
             xemu_queue_notification(".xmt was created by a different Xemu commit; deterministic verification is recommended");
         }
-        if (ok && !disc_path.empty()) {
+        if (ok && !g_tas_silent_bundle_load && !disc_path.empty()) {
             char *current_disc = xemu_get_currently_loaded_disc_path();
             bool mismatch = !current_disc || disc_path != current_disc;
             if (current_disc) g_free(current_disc);
             if (mismatch) xemu_queue_notification(".xmt disc path differs from the currently loaded disc");
         }
-        if (ok) {
+        if (ok && !g_tas_silent_bundle_load) {
             std::string cur_boot = TasFileMD5(g_config.sys.files.bootrom_path);
             std::string cur_flash = TasFileMD5(g_config.sys.files.flashrom_path);
             std::string cur_eeprom = TasFileMD5(g_config.sys.files.eeprom_path);
@@ -1750,7 +2721,7 @@ static bool TasLoadMovieFromPath(const char *path)
     g_tas_selected_frame = 0;
     g_tas_selection_anchor = 0;
     g_tas_selection_end = 0;
-    g_tas_movie_path = path;
+    if (!g_tas_silent_bundle_load) g_tas_movie_path = path;
     g_tas_follow_frame = true;
     g_tas_movie_dirty = false;
     g_tas_core_pushed_revision = UINT64_MAX;
@@ -1762,7 +2733,8 @@ static bool TasLoadMovieFromPath(const char *path)
     g_tas_record_synced = 0;
     xemu_tas_stop_recording();
     xemu_tas_stop_playback();
-    xemu_queue_notification("Loaded TAS movie");
+    TasClearRewindCheckpoints();
+    if (!g_tas_silent_bundle_load) xemu_queue_notification("Loaded TAS movie");
     return true;
 }
 
@@ -1820,8 +2792,14 @@ static void TasPushMovieToCore()
     /* TasFrame is exactly four packed 20-byte reports, so avoid allocating and
      * repacking the whole movie before the core makes its immutable playback
      * copy. Re-copy only after a movie edit/reload. */
-    if (xemu_tas_set_playback_movie(g_tas_frames.data(), g_tas_lag_flags.data(),
-                                    g_tas_frames.size())) {
+    if (g_tas_poll_counts.size() != g_tas_frames.size()) {
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+    }
+    if (xemu_tas_set_playback_movie_ex(
+            g_tas_frames.data(), g_tas_lag_flags.data(),
+            reinterpret_cast<const uint32_t *>(g_tas_poll_counts.data()),
+            g_tas_poll_counts.size() * XEMU_TAS_MAX_PORTS,
+            g_tas_frames.size())) {
         g_tas_core_pushed_revision = g_tas_movie_revision;
         g_tas_core_pushed_frame_count = g_tas_frames.size();
     }
@@ -1829,18 +2807,102 @@ static void TasPushMovieToCore()
 
 static void TasStartPlayback(uint64_t frame)
 {
+    TasCancelPendingTransportAdvance();
     if (!xemu_tas_enabled()) xemu_tas_set_enabled(true);
-    TasPushMovieToCore();
+    if (g_tas_frames.empty()) return;
     frame = std::min<uint64_t>(frame, g_tas_frames.size() - 1);
-    xemu_tas_set_frame(frame);
-    if (xemu_tas_start_playback(frame)) {
-        if (!runstate_is_running()) vm_start();
-        xemu_queue_notification("TAS movie playback started");
+
+    /* Playing from an arbitrary selected frame is always an exact seek. Never
+     * relabel whatever live VM state happens to exist as that movie frame; that
+     * was a direct source of rerecord desync even with Det unchecked. */
+    if (!TasSeekFrameEx(frame, true)) {
+        xemu_queue_error_message(
+            "Play From Selected needs a valid checkpoint at/before that frame; use Play Beginning first to establish the movie baseline");
     }
 }
 
-static void TasStartRecording(bool power_on)
+static void TasStopPlaybackFromUi()
 {
+    /* Playback and the global TAS frame counter are deliberately independent:
+     * stopping movie input must not stop normal emulation.  The piano roll,
+     * however, should stay on the frame where playback was stopped instead of
+     * immediately following the still-advancing global TAS counter. */
+    const bool was_playing = xemu_tas_playback();
+    const uint64_t stopped_frame = was_playing
+        ? xemu_tas_playback_frame()
+        : xemu_tas_frame();
+
+    xemu_tas_stop_playback();
+    TasCancelPendingTransportAdvance();
+
+    if (was_playing && !g_tas_frames.empty()) {
+        const int frame = (int)std::min<uint64_t>(
+            std::min<uint64_t>(stopped_frame, g_tas_frames.size() - 1),
+            INT_MAX);
+        g_tas_selected_frame = frame;
+        g_tas_selection_anchor = frame;
+        g_tas_selection_end = frame;
+    }
+
+    /* A manual Stop Playback is an explicit request to stop following the
+     * live timeline. The user can re-enable Follow whenever desired. */
+    g_tas_follow_frame = false;
+}
+
+static void TasPlayMovieFromBeginning()
+{
+    g_tas_seek_continue_pending = false;
+    if (g_tas_frames.empty()) {
+        xemu_queue_error_message("TAS movie has no frames to play");
+        return;
+    }
+    if (xemu_tas_recording() || g_tas_overdub_ui_active || xemu_tas_overdub()) {
+        xemu_queue_error_message("Stop TAS recording/overdub before restarting movie playback");
+        return;
+    }
+
+    /* Restart from the same machine state that originally preceded frame 0.
+     * Current-state movies restore their captured baseline before installing
+     * movie input, rather than using whatever state the Xbox is in now. */
+    xemu_tas_stop_playback();
+    if (!xemu_tas_enabled()) xemu_tas_set_enabled(true);
+    TasClearRewindCheckpoints();
+
+    if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+    /* Both power-on and current-state movies replay from the exact canonical
+     * frame-0 snapshot captured when the movie was created. Reissuing Reset
+     * here would reintroduce mutable HDD/RTC/external-state differences. */
+    if (!TasRestoreMovieStartSnapshot()) {
+        return;
+    }
+
+    g_tas_selected_frame = 0;
+    g_tas_selection_anchor = 0;
+    g_tas_selection_end = 0;
+    xemu_tas_clear_all_xid_reports();
+    xemu_tas_set_frame(0);
+    xemu_tas_reset_lag_counters();
+
+    TasPushMovieToCore();
+    if (xemu_tas_start_playback(0)) {
+        if (g_tas_rewind_enabled || g_tas_greenzone_enabled) {
+            TasSaveRewindCheckpointAtBoundary(0);
+        }
+        if (!runstate_is_running()) vm_start();
+        xemu_queue_notification(g_tas_power_on_recording
+            ? "TAS movie restarted from beginning (power-on/reset)"
+            : "TAS movie restarted from captured current state");
+    } else {
+        xemu_queue_error_message("Could not start TAS movie from the beginning");
+    }
+}
+
+static void TasStartRecording(bool power_on, bool start_vm = true)
+{
+    g_tas_seek_continue_pending = false;
+    /* New recordings default to the reproducible policy. Loaded legacy movies
+     * still retain their stored deterministic flag until the user changes it. */
+    xemu_tas_set_deterministic_mode(true);
     if (g_tas_overdub_ui_active) TasStopOverdub();
     if (g_tas_read_only) {
         g_tas_read_only = false;
@@ -1850,34 +2912,260 @@ static void TasStartRecording(bool power_on)
     xemu_tas_clear_recording();
     g_tas_record_synced = 0;
     g_tas_last_autosave_record_count = 0;
-    g_tas_record_replace_placeholder = power_on;
+    /* A fresh/empty movie owns one editor placeholder frame. Replace that
+     * placeholder with the first captured input frame for either power-on or
+     * current-state recording so recordings never acquire an artificial blank
+     * frame zero. Existing non-empty movies keep their timeline intact. */
+    g_tas_record_replace_placeholder = power_on || g_tas_frames.size() == 1;
     g_tas_power_on_recording = power_on;
+    TasClearRewindCheckpoints();
 
     if (power_on) {
+        g_tas_movie_start_snapshot.clear();
+        g_tas_movie_start_state_hash = 0;
+        g_tas_movie_start_legacy_ram_hash = 0;
+        g_tas_movie_start_transaction = {};
         g_tas_frames.assign(1, TasFrame{});
         g_tas_lag_flags.assign(1, 0);
+        g_tas_poll_counts.assign(1, TasUnknownPollCounts());
         g_tas_selected_frame = 0;
+        g_tas_selection_anchor = 0;
+        g_tas_selection_end = 0;
         g_tas_rerecord_count = 0;
         g_tas_branches.clear();
         g_tas_current_branch = 0;
         g_tas_current_parent = UINT32_MAX;
         g_tas_next_branch_id = 1;
         g_tas_visible_frame_cache_dirty = true;
+        xemu_tas_clear_all_xid_reports();
         xemu_tas_set_frame(0);
+        xemu_tas_reset_lag_counters();
+
+        /* qemu_system_reset_request() is asynchronous. Arm the feature-owned
+         * reset observer first; it will request a VM stop during the actual
+         * reset transaction. Recording is armed only by TasPowerOnResetTick
+         * after that callback has fired and the VM is confirmed paused. */
+        g_tas_power_on_reset_sequence_before = xemu_tas_arm_post_reset_pause();
+        g_tas_power_on_reset_start_vm = start_vm;
+        g_tas_power_on_reset_deadline = std::chrono::steady_clock::now() +
+                                        std::chrono::seconds(10);
+        g_tas_power_on_reset_pending = true;
         ActionReset();
+        xemu_queue_notification("TAS power-on reset requested; waiting for canonical post-reset frame 0");
+        return;
     }
+
     xemu_tas_start_recording(true);
+    if (start_vm && !runstate_is_running()) vm_start();
+    xemu_queue_notification("TAS recording started from current state");
+}
+
+static void TasPowerOnResetTick()
+{
+    if (!g_tas_power_on_reset_pending) return;
+    const bool reset_observed =
+        xemu_tas_post_reset_sequence() != g_tas_power_on_reset_sequence_before;
+    if (!reset_observed) {
+        if (std::chrono::steady_clock::now() >= g_tas_power_on_reset_deadline) {
+            g_tas_power_on_reset_pending = false;
+            g_tas_power_on_reset_deadline = {};
+            xemu_tas_cancel_post_reset_pause();
+            xemu_tas_stop_recording();
+            xemu_queue_error_message(
+                "TAS power-on reset did not reach the canonical post-reset pause; recording was refused");
+        }
+        return;
+    }
+    /* The reset observer proves QEMU has traversed the real system reset. Its
+     * vmstop request is intentionally only a race-prevention hint; some main
+     * loop paths may still emerge running. Once the reset sequence changes we
+     * are allowed to stop synchronously here and establish the canonical
+     * post-reset boundary without guessing that ActionReset() was immediate. */
+    if (runstate_is_running()) {
+        vm_stop(RUN_STATE_PAUSED);
+    }
+    if (runstate_is_running()) {
+        if (std::chrono::steady_clock::now() >= g_tas_power_on_reset_deadline) {
+            g_tas_power_on_reset_pending = false;
+            g_tas_power_on_reset_deadline = {};
+            xemu_tas_cancel_post_reset_pause();
+            xemu_tas_stop_recording();
+            xemu_queue_error_message(
+                "TAS reset completed but Xemu could not establish the canonical post-reset pause; recording was refused");
+        }
+        return;
+    }
+
+    g_tas_power_on_reset_pending = false;
+    g_tas_power_on_reset_deadline = {};
+    xemu_tas_clear_all_xid_reports();
+    xemu_tas_set_frame(0);
+    xemu_tas_reset_lag_counters();
+
+    if (!TasCaptureMovieStartSnapshot()) {
+        xemu_tas_stop_recording();
+        xemu_queue_error_message(
+            "Power-on TAS reset completed, but canonical frame-0 capture failed; recording was not started");
+        return;
+    }
+
+    xemu_tas_start_recording(true);
+    if (g_tas_nonram_fingerprint_capability == 0) {
+        xemu_queue_notification(
+            "TAS recording active: native snapshot + RAM/TAS Strict Sync fallback (non-RAM fingerprint unavailable on this configuration)");
+    }
+    if (g_tas_rewind_enabled || g_tas_greenzone_enabled) {
+        TasSaveRewindCheckpointAtBoundary(0);
+    }
+    if (g_tas_power_on_reset_start_vm && !runstate_is_running()) vm_start();
+    xemu_queue_notification(
+        "TAS recording started from canonical post-reset frame 0");
+}
+
+static void TasStartFreshRecordingFromCurrentState()
+{
+    g_tas_seek_continue_pending = false;
+    /* Make current VM state an atomic movie frame-0 baseline: pause, snapshot,
+     * arm recording, then resume. This removes the old mid-frame start race. */
+    const bool was_running = runstate_is_running();
+    if (was_running) vm_stop(RUN_STATE_PAUSED);
+
+    if (g_tas_overdub_ui_active) TasStopOverdub();
+    xemu_tas_stop_recording();
+    xemu_tas_stop_playback();
+
+    g_tas_frames.assign(1, TasFrame{});
+    TasResetMovieMetadata();
+    g_tas_selected_frame = 0;
+    g_tas_selection_anchor = 0;
+    g_tas_selection_end = 0;
+    g_tas_movie_path.clear();
+    g_tas_power_on_recording = false;
+    g_tas_record_replace_placeholder = true;
+    xemu_tas_clear_all_xid_reports();
+    xemu_tas_set_frame(0);
+    xemu_tas_reset_lag_counters();
+
+    if (!TasCaptureMovieStartSnapshot()) {
+        xemu_queue_error_message(
+            "Could not capture the current-state TAS baseline; recording was not started");
+        if (was_running && !runstate_is_running()) vm_start();
+        return;
+    }
+
+    TasStartRecording(false, false);
+    if (g_tas_nonram_fingerprint_capability == 0) {
+        xemu_queue_notification(
+            "TAS recording active: native snapshot + RAM/TAS Strict Sync fallback (non-RAM fingerprint unavailable on this configuration)");
+    }
+    if (g_tas_rewind_enabled || g_tas_greenzone_enabled) {
+        TasSaveRewindCheckpointAtBoundary(0);
+    }
     if (!runstate_is_running()) vm_start();
-    xemu_queue_notification(power_on ? "TAS recording started from power-on/reset" :
-                                        "TAS recording started from current state");
+    xemu_queue_notification("Captured exact TAS start state; recording from current state");
+}
+
+static void TasStartContextualRecording()
+{
+    g_tas_seek_continue_pending = false;
+    /* TAStudio-style primary Record:
+     *  - inside an existing movie, rerecord from the exact live frame and
+     *    preserve the displaced future as a branch;
+     *  - at the movie end, continue recording;
+     *  - with no usable movie position, make the current VM a fresh frame 0.
+     * This action never resets the Xbox. */
+    const uint64_t live_frame = xemu_tas_playback() ? xemu_tas_playback_frame()
+                                                    : xemu_tas_frame();
+    const bool have_movie = g_tas_frames.size() > 1 || !g_tas_movie_path.empty();
+    if (have_movie && live_frame <= g_tas_frames.size()) {
+        if (g_tas_read_only) {
+            g_tas_read_only = false;
+            xemu_queue_notification("Read-only disabled for rerecording");
+        }
+        TasResumeMovieAtFrame(live_frame, true);
+        g_tas_rewind_next_frame = live_frame;
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "TAS recording resumed from movie frame %llu",
+                 (unsigned long long)live_frame);
+        xemu_queue_notification(msg);
+        return;
+    }
+
+    TasStartFreshRecordingFromCurrentState();
+}
+
+static bool TasFinishPendingOverdubStart()
+{
+    if (!g_tas_pending_overdub_start.active) return true;
+    const TasPendingOverdubStart pending = g_tas_pending_overdub_start;
+    g_tas_pending_overdub_start = {};
+
+    const uint64_t boundary = xemu_tas_frame();
+    if (boundary != pending.boundary || boundary >= g_tas_frames.size()) {
+        xemu_queue_error_message(
+            "TAS overdub exact-seek target was not reached; overdub was not started");
+        return false;
+    }
+
+    TasPushMovieToCore();
+    g_tas_overdub_start_frame = boundary;
+    g_tas_overdub_synced = 0;
+    g_tas_record_synced = 0;
+    g_tas_port = std::clamp((int)pending.port, 0, XEMU_TAS_MAX_PORTS - 1);
+    g_tas_overdub_ui_active = xemu_tas_start_overdub(
+        boundary, pending.port, pending.digital_mask,
+        pending.analog_mask, pending.stick_mask);
+    if (!g_tas_overdub_ui_active) {
+        xemu_queue_error_message("Could not start TAS overdub at the exact reconstructed boundary");
+        return false;
+    }
+    if (!runstate_is_running()) vm_start();
+    xemu_queue_notification("TAS punch-in/overdub recording started at exact movie boundary");
+    return true;
 }
 
 static void TasStartOverdub()
 {
-    if (g_tas_frames.empty()) return;
+    TasCancelPendingTransportAdvance();
+    if (g_tas_frames.empty() || g_tas_pending_overdub_start.active) return;
     if (g_tas_read_only) g_tas_read_only = false;
+
+    /* Drain any completed live recording first. Starting a punch-in is an
+     * explicit runtime transition; it must never relabel an unrelated live VM
+     * state as the selected movie frame. */
+    if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+    TasSyncRecordingFromCore();
+    xemu_tas_stop_recording();
+    xemu_tas_stop_overdub();
+    xemu_tas_stop_playback();
+    g_tas_overdub_ui_active = false;
+
     TasPushUndo("Punch-in / overdub recording");
-    TasPushMovieToCore();
+    const uint64_t start = (uint64_t)std::clamp(
+        g_tas_selected_frame, 0, (int)g_tas_frames.size() - 1);
+    g_tas_overdub_start_frame = start;
+
+    /* The old future poll trace is proof for the old input history. Punch-in
+     * input may legitimately change the game's later polling behavior, so do
+     * not compare the rerecord against stale evidence. The unchanged prefix
+     * remains useful; newly recorded frames repopulate their own poll counts. */
+    if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+    }
+    for (uint64_t i = start; i < g_tas_poll_counts.size(); ++i) {
+        g_tas_poll_counts[(size_t)i] = TasUnknownPollCounts();
+    }
+    g_tas_verify_baseline.erase(
+        std::remove_if(g_tas_verify_baseline.begin(), g_tas_verify_baseline.end(),
+                       [start](const TasHashRecord &h) { return h.frame >= start; }),
+        g_tas_verify_baseline.end());
+    g_tas_verify_revision = UINT64_MAX;
+    if (g_tas_verify_mode != TasVerifyMode::Idle) {
+        g_tas_verify_mode = TasVerifyMode::Idle;
+        g_tas_verify_status = "Verifier baseline invalidated by overdub";
+    }
+    g_tas_core_pushed_revision = UINT64_MAX;
 
     uint16_t digital_mask = 0;
     uint8_t analog_mask = 0;
@@ -1886,18 +3174,21 @@ static void TasStartOverdub()
     for (int i = 0; i < 8; ++i) if (g_tas_overdub_fields[8 + i]) analog_mask |= (uint8_t)(1u << i);
     for (int i = 0; i < 4; ++i) if (g_tas_overdub_fields[16 + i]) stick_mask |= (uint8_t)(1u << i);
 
-    g_tas_overdub_start_frame = (uint64_t)std::clamp(g_tas_selected_frame, 0,
-                                                      (int)g_tas_frames.size() - 1);
-    g_tas_overdub_synced = 0;
-    g_tas_record_synced = 0;
-    g_tas_overdub_ui_active = xemu_tas_start_overdub(g_tas_overdub_start_frame,
-        (uint8_t)g_tas_port, digital_mask, analog_mask, stick_mask);
-    if (g_tas_overdub_ui_active) {
-        xemu_tas_set_frame(g_tas_overdub_start_frame);
-        if (!runstate_is_running()) vm_start();
-        xemu_queue_notification("TAS punch-in/overdub recording started");
-    } else {
-        xemu_queue_error_message("Could not start TAS overdub; load/push a movie first");
+    g_tas_pending_overdub_start.active = true;
+    g_tas_pending_overdub_start.boundary = start;
+    g_tas_pending_overdub_start.port = (uint8_t)std::clamp(g_tas_port, 0, XEMU_TAS_MAX_PORTS - 1);
+    g_tas_pending_overdub_start.digital_mask = digital_mask;
+    g_tas_pending_overdub_start.analog_mask = analog_mask;
+    g_tas_pending_overdub_start.stick_mask = stick_mask;
+
+    if (!TasSeekFrameEx(start, false)) {
+        g_tas_pending_overdub_start = {};
+        xemu_queue_error_message(
+            "Could not reconstruct the selected TAS boundary; overdub was not started");
+        return;
+    }
+    if (!g_tas_seek_completion_pending && !runstate_is_running()) {
+        TasFinishPendingOverdubStart();
     }
 }
 
@@ -1923,21 +3214,24 @@ static void TasSyncRecordingFromCore()
     constexpr uint64_t kBatchFrames = 256;
     std::array<uint8_t, kBatchFrames * XEMU_TAS_FRAME_REPORT_BYTES> reports{};
     std::array<uint8_t, kBatchFrames> lag{};
+    std::array<uint32_t, kBatchFrames * XEMU_TAS_MAX_PORTS> polls{};
 
     bool changed = false;
     if (!g_tas_overdub_ui_active) {
         const uint64_t remaining = count - g_tas_record_synced;
         g_tas_frames.reserve(g_tas_frames.size() + (size_t)remaining);
         g_tas_lag_flags.reserve(g_tas_lag_flags.size() + (size_t)remaining);
+        g_tas_poll_counts.reserve(g_tas_poll_counts.size() + (size_t)remaining);
     }
 
     while (g_tas_record_synced < count) {
         const uint64_t wanted = std::min<uint64_t>(kBatchFrames,
                                                    count - g_tas_record_synced);
-        const uint64_t copied = xemu_tas_copy_recorded_frames(
+        const uint64_t copied = xemu_tas_copy_recorded_frames_ex(
             g_tas_record_synced, wanted,
             reports.data(), (size_t)wanted * XEMU_TAS_FRAME_REPORT_BYTES,
-            lag.data(), (size_t)wanted);
+            lag.data(), (size_t)wanted,
+            polls.data(), (size_t)wanted * XEMU_TAS_MAX_PORTS);
         if (!copied) {
             break;
         }
@@ -1945,10 +3239,15 @@ static void TasSyncRecordingFromCore()
         for (uint64_t j = 0; j < copied; ++j) {
             const uint8_t *packed = reports.data() + j * XEMU_TAS_FRAME_REPORT_BYTES;
             const bool lagged = lag[(size_t)j] != 0;
+            TasPollCounts poll{};
+            for (int port = 0; port < XEMU_TAS_MAX_PORTS; ++port) {
+                poll[(size_t)port] = polls[(size_t)j * XEMU_TAS_MAX_PORTS + (size_t)port];
+            }
 
             if (g_tas_record_replace_placeholder) {
                 g_tas_frames.clear();
                 g_tas_lag_flags.clear();
+                g_tas_poll_counts.clear();
                 g_tas_record_replace_placeholder = false;
             }
 
@@ -1966,6 +3265,10 @@ static void TasSyncRecordingFromCore()
                     if (target < g_tas_lag_flags.size()) {
                         g_tas_lag_flags[(size_t)target] = lagged ? 1 : 0;
                     }
+                    if (target >= g_tas_poll_counts.size()) {
+                        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+                    }
+                    g_tas_poll_counts[(size_t)target] = poll;
                     ++g_tas_overdub_synced;
                 } else {
                     TasStopOverdub();
@@ -1974,6 +3277,7 @@ static void TasSyncRecordingFromCore()
             } else {
                 g_tas_frames.push_back(std::move(frame));
                 g_tas_lag_flags.push_back(lagged ? 1 : 0);
+                g_tas_poll_counts.push_back(poll);
             }
             ++g_tas_record_synced;
             changed = true;
@@ -2000,24 +3304,419 @@ static void TasSyncRecordingFromCore()
     }
 }
 
+static TasRuntimeMode TasCurrentRuntimeMode()
+{
+    if (g_tas_overdub_ui_active || xemu_tas_overdub()) return TasRuntimeMode::Overdub;
+    if (xemu_tas_recording()) return TasRuntimeMode::Recording;
+    if (xemu_tas_playback()) return TasRuntimeMode::Playback;
+    return TasRuntimeMode::Idle;
+}
+
+static void TasNoteTimelineMutation(uint64_t first_frame)
+{
+    if (!g_tas_timeline_mutation.active) return;
+    g_tas_timeline_mutation.edited = true;
+    g_tas_timeline_mutation.first_frame = std::min(
+        g_tas_timeline_mutation.first_frame, first_frame);
+}
+
+static void TasPrepareTimelineMutation(uint64_t first_frame)
+{
+    if (g_tas_timeline_mutation.active) {
+        g_tas_timeline_mutation.first_frame = std::min(
+            g_tas_timeline_mutation.first_frame, first_frame);
+        return;
+    }
+
+    const TasRuntimeMode mode = TasCurrentRuntimeMode();
+    if (mode == TasRuntimeMode::Idle) return;
+
+    TasTimelineMutationTxn txn;
+    txn.active = true;
+    txn.mode = mode;
+    txn.vm_was_running = runstate_is_running();
+    txn.first_frame = first_frame;
+    txn.overdub_port = (uint32_t)std::clamp(g_tas_port, 0, XEMU_TAS_MAX_PORTS - 1);
+    txn.overdub_field_mask = TasOverdubFieldMask();
+    g_tas_timeline_mutation = txn;
+
+    /* Freeze before draining core-owned frames.  From this point until commit,
+     * Record/Overdub cannot advance the Xbox on history that the editor is in
+     * the process of changing. */
+    if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+    TasCancelPendingTransportAdvance();
+    TasSyncRecordingFromCore();
+    g_tas_timeline_mutation.boundary = xemu_tas_frame();
+
+    /* Overdub can naturally reach the movie end while the final completed
+     * frames are being drained.  Treat that as a cleanly finished runtime,
+     * rather than trying to resurrect an already-completed punch-in. */
+    if (g_tas_timeline_mutation.mode == TasRuntimeMode::Overdub &&
+        !g_tas_overdub_ui_active && !xemu_tas_overdub()) {
+        g_tas_timeline_mutation.mode = TasRuntimeMode::Idle;
+    } else if (g_tas_timeline_mutation.mode == TasRuntimeMode::Recording &&
+               !xemu_tas_recording()) {
+        g_tas_timeline_mutation.mode = TasRuntimeMode::Idle;
+    }
+
+    xemu_tas_stop_overdub();
+    xemu_tas_stop_recording();
+    xemu_tas_stop_playback();
+    g_tas_overdub_ui_active = false;
+}
+
+static void TasAbortTimelineMutation(const char *reason)
+{
+    if (!g_tas_timeline_mutation.active) return;
+    g_tas_timeline_mutation = {};
+    xemu_tas_stop_overdub();
+    xemu_tas_stop_recording();
+    xemu_tas_stop_playback();
+    g_tas_overdub_ui_active = false;
+    if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+    if (reason && *reason) xemu_queue_error_message(reason);
+}
+
+static bool TasRestoreTimelineRuntimeAfterMutation()
+{
+    if (!g_tas_timeline_mutation.active) return true;
+    const TasTimelineMutationTxn txn = g_tas_timeline_mutation;
+    g_tas_timeline_mutation = {};
+
+    uint64_t boundary = std::min<uint64_t>(txn.boundary, g_tas_frames.size());
+    xemu_tas_set_frame(boundary);
+    g_tas_record_synced = 0;
+    g_tas_record_replace_placeholder = false;
+    g_tas_overdub_ui_active = false;
+
+    switch (txn.mode) {
+    case TasRuntimeMode::Idle:
+        break;
+    case TasRuntimeMode::Playback:
+        TasPushMovieToCore();
+        if (boundary < g_tas_frames.size() && !xemu_tas_start_playback(boundary)) {
+            xemu_queue_error_message(
+                "Edited TAS was rebuilt, but playback mode could not be restored; VM remains paused");
+            return false;
+        }
+        break;
+    case TasRuntimeMode::Recording:
+        /* An insertion before the live boundary can create unexecuted future
+         * rows even though Record previously owned the end of the movie.  Keep
+         * that future as a branch, then continue recording from exact boundary N. */
+        if (boundary < g_tas_frames.size()) {
+            TasArchiveCurrentBranch(boundary,
+                                    "Preserved future after live recording edit");
+            ++g_tas_rerecord_count;
+            g_tas_movie_dirty = true;
+            ++g_tas_movie_revision;
+            g_tas_core_pushed_revision = UINT64_MAX;
+        }
+        if (boundary == 0 && g_tas_frames.size() == 1) {
+            g_tas_record_replace_placeholder = true;
+        }
+        xemu_tas_clear_recording();
+        xemu_tas_start_recording(true);
+        break;
+    case TasRuntimeMode::Overdub: {
+        if (boundary >= g_tas_frames.size()) {
+            xemu_queue_error_message(
+                "Edited TAS no longer has an input row at the overdub boundary; overdub was not resumed");
+            return false;
+        }
+        TasPushMovieToCore();
+        uint16_t digital_mask = (uint16_t)(txn.overdub_field_mask & 0xffu);
+        uint8_t analog_mask = (uint8_t)((txn.overdub_field_mask >> 8) & 0xffu);
+        uint8_t stick_mask = (uint8_t)((txn.overdub_field_mask >> 16) & 0x0fu);
+        g_tas_port = std::clamp((int)txn.overdub_port, 0, XEMU_TAS_MAX_PORTS - 1);
+        g_tas_overdub_start_frame = boundary;
+        g_tas_overdub_synced = 0;
+        g_tas_record_synced = 0;
+        g_tas_overdub_ui_active = xemu_tas_start_overdub(
+            boundary, (uint8_t)g_tas_port, digital_mask, analog_mask, stick_mask);
+        if (!g_tas_overdub_ui_active) {
+            xemu_queue_error_message(
+                "Edited TAS was rebuilt, but overdub mode could not be restored; VM remains paused");
+            return false;
+        }
+        break;
+    }
+    }
+
+    if (txn.vm_was_running && !runstate_is_running()) vm_start();
+    return true;
+}
+
+static void TasTimelineMutationTick()
+{
+    if (!g_tas_timeline_mutation.active ||
+        g_tas_timeline_mutation.reconstructing) {
+        return;
+    }
+
+    /* Keep a multi-frame ImGui drag as one atomic edit transaction. */
+    if (ImGui::IsAnyItemActive()) return;
+
+    if (!g_tas_timeline_mutation.edited) {
+        TasRestoreTimelineRuntimeAfterMutation();
+        return;
+    }
+
+    const uint64_t target = std::min<uint64_t>(
+        g_tas_timeline_mutation.boundary, g_tas_frames.size());
+    if (g_tas_timeline_mutation.first_frame >= target) {
+        TasRestoreTimelineRuntimeAfterMutation();
+        return;
+    }
+
+    g_tas_timeline_mutation.reconstructing = true;
+    if (!TasSeekFrameEx(target, false)) {
+        TasAbortTimelineMutation(
+            "TAS edit transaction could not reconstruct the edited timeline; VM remains paused");
+        return;
+    }
+
+    /* A target that is already the restored anchor completes synchronously. */
+    if (!g_tas_seek_completion_pending && !runstate_is_running()) {
+        TasRestoreTimelineRuntimeAfterMutation();
+    }
+}
+
+static void TasRetireBranchGuard(const TasBranchSwitchTxn &txn)
+{
+    if (!txn.guard_snapshot.empty() &&
+        g_tas_snapshot_delete_queued.emplace(txn.guard_snapshot).second) {
+        g_tas_snapshot_delete_queue.push_back(txn.guard_snapshot);
+    }
+    if (!txn.guard_bundle_path.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(txn.guard_bundle_path, ec);
+    }
+}
+
+static void TasRollbackBranchSwitch(const char *reason)
+{
+    if (!g_tas_branch_switch.active) return;
+    TasBranchSwitchTxn txn = std::move(g_tas_branch_switch);
+    g_tas_branch_switch = {};
+
+    xemu_tas_stop_overdub();
+    xemu_tas_stop_recording();
+    xemu_tas_stop_playback();
+    g_tas_overdub_ui_active = false;
+    if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+
+    const bool restored = TasLoadPairedSnapshot(
+        txn.guard_snapshot.c_str(), txn.guard_bundle_path);
+    TasRetireBranchGuard(txn);
+    if (!restored) {
+        xemu_queue_error_message(
+            "TAS branch switch failed and its transactional rollback also failed; VM remains paused");
+        return;
+    }
+    if (reason && *reason) xemu_queue_error_message(reason);
+}
+
+static void TasFinishBranchSwitch()
+{
+    if (!g_tas_branch_switch.active) return;
+    TasBranchSwitchTxn txn = std::move(g_tas_branch_switch);
+    g_tas_branch_switch = {};
+
+    const uint64_t boundary = std::min<uint64_t>(
+        txn.target_boundary, g_tas_frames.size());
+    const uint64_t selected = g_tas_frames.empty() ? 0 :
+        std::min<uint64_t>(boundary, g_tas_frames.size() - 1);
+    g_tas_selected_frame = (int)std::min<uint64_t>(selected, INT_MAX);
+    g_tas_selection_anchor = g_tas_selected_frame;
+    g_tas_selection_end = g_tas_selected_frame;
+    g_tas_follow_frame = txn.old_runtime.follow;
+    g_tas_read_only = txn.old_runtime.read_only;
+
+    /* Reuse the same runtime-intent restorer used by atomic live edits.  It
+     * resumes Playback/Record/Overdub only after the target branch has been
+     * reconstructed and verified at the exact requested boundary. */
+    g_tas_timeline_mutation.active = true;
+    g_tas_timeline_mutation.mode = txn.old_runtime.mode;
+    g_tas_timeline_mutation.vm_was_running = txn.old_runtime.vm_was_running;
+    g_tas_timeline_mutation.boundary = boundary;
+    g_tas_timeline_mutation.overdub_port = txn.old_runtime.overdub_port;
+    g_tas_timeline_mutation.overdub_field_mask = txn.old_runtime.overdub_field_mask;
+    const bool resumed = TasRestoreTimelineRuntimeAfterMutation();
+
+    if (!resumed) {
+        xemu_tas_stop_overdub();
+        xemu_tas_stop_recording();
+        xemu_tas_stop_playback();
+        g_tas_overdub_ui_active = false;
+        if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+        const bool rolled_back = TasLoadPairedSnapshot(
+            txn.guard_snapshot.c_str(), txn.guard_bundle_path);
+        TasRetireBranchGuard(txn);
+        if (rolled_back) {
+            xemu_queue_error_message(
+                "Target TAS branch could not restore the previous runtime mode; restored previous branch");
+        } else {
+            xemu_queue_error_message(
+                "Target TAS branch runtime restore failed and rollback failed; VM remains paused");
+        }
+        return;
+    }
+
+    TasRetireBranchGuard(txn);
+    xemu_queue_notification("Switched TAS branch transactionally");
+    TasAutosaveRecovery(true);
+}
+
+static bool TasSwitchToBranchIndex(size_t index)
+{
+    if (index >= g_tas_branches.size() || g_tas_branch_switch.active ||
+        g_tas_timeline_mutation.active) {
+        return false;
+    }
+
+    const bool was_running = runstate_is_running();
+    if (was_running) vm_stop(RUN_STATE_PAUSED);
+    TasSyncRecordingFromCore();
+
+    uint32_t title_id = 0;
+    if (!TasGetCurrentTitleId(&title_id)) {
+        if (was_running && !runstate_is_running()) vm_start();
+        xemu_queue_error_message("TAS branch switch requires a running XBE/title ID");
+        return false;
+    }
+
+    const uint64_t stamp = (uint64_t)std::chrono::steady_clock::now()
+        .time_since_epoch().count();
+    char guard_name[96];
+    snprintf(guard_name, sizeof(guard_name), "%08X_TAS_BRANCH_GUARD_%016llX",
+             title_id, (unsigned long long)stamp);
+    const std::string guard_bundle = TasStateBundlePath(guard_name);
+
+    TasStateBundleRuntime old_runtime;
+    if (!TasSavePairedSnapshot(guard_name, guard_bundle, &old_runtime)) {
+        if (was_running && !runstate_is_running()) vm_start();
+        return false;
+    }
+    old_runtime.vm_was_running = was_running;
+    if (!TasSaveMovieToPathInternal(guard_bundle.c_str(), false, false,
+                                    &old_runtime)) {
+        TasBranchSwitchTxn failed;
+        failed.guard_snapshot = guard_name;
+        failed.guard_bundle_path = guard_bundle;
+        TasRetireBranchGuard(failed);
+        if (was_running && !runstate_is_running()) vm_start();
+        xemu_queue_error_message("Could not finalize TAS branch rollback guard");
+        return false;
+    }
+
+    TasCancelPendingTransportAdvance();
+    xemu_tas_stop_overdub();
+    xemu_tas_stop_recording();
+    xemu_tas_stop_playback();
+    g_tas_overdub_ui_active = false;
+
+    TasBranch target = std::move(g_tas_branches[index]);
+    g_tas_branches.erase(g_tas_branches.begin() + index);
+    const uint64_t old_boundary = old_runtime.boundary;
+    TasStoreCurrentBranch(old_boundary, "Branch before switch");
+
+    g_tas_frames = std::move(target.frames);
+    g_tas_lag_flags = std::move(target.lag);
+    g_tas_poll_counts = std::move(target.polls);
+    if (g_tas_frames.empty()) g_tas_frames.resize(1);
+    if (g_tas_lag_flags.size() < g_tas_frames.size()) {
+        g_tas_lag_flags.resize(g_tas_frames.size(), 0);
+    }
+    if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+    }
+    g_tas_current_branch = target.id;
+    g_tas_current_parent = target.parent;
+    ++g_tas_movie_revision;
+    g_tas_movie_dirty = true;
+    g_tas_core_pushed_revision = UINT64_MAX;
+    g_tas_visible_frame_cache_dirty = true;
+    g_tas_verify_revision = UINT64_MAX;
+    g_tas_verify_baseline.clear();
+
+    g_tas_branch_switch.active = true;
+    g_tas_branch_switch.reconstructing = true;
+    g_tas_branch_switch.guard_snapshot = guard_name;
+    g_tas_branch_switch.guard_bundle_path = guard_bundle;
+    g_tas_branch_switch.old_runtime = old_runtime;
+    g_tas_branch_switch.target_boundary = std::min<uint64_t>(
+        old_boundary, g_tas_frames.size());
+
+    if (!TasSeekFrameEx(g_tas_branch_switch.target_boundary, false)) {
+        TasRollbackBranchSwitch(
+            "TAS branch switch could not reconstruct the target branch; restored previous branch");
+        return false;
+    }
+    if (!g_tas_seek_completion_pending && !runstate_is_running()) {
+        TasFinishBranchSwitch();
+    }
+    return true;
+}
+
+static void TasCancelPendingTransportAdvance()
+{
+    /* User transport always wins over maintenance transport. A Strict Sync
+     * checkpoint may have scheduled a one-frame pause+resume in the background;
+     * carrying that resume flag through a rewind/seek can restart the VM after
+     * the requested target was reached and look like a ~60-frame overshoot. */
+    if (xemu_tas_frame_advance_remaining() != 0 ||
+        g_tas_strict_checkpoint_pending || g_tas_strict_step_checkpoint_pending) {
+        xemu_tas_cancel_frame_advance();
+    }
+    g_tas_strict_checkpoint_pending = false;
+    g_tas_strict_checkpoint_resume = false;
+    g_tas_strict_step_checkpoint_pending = false;
+    xemu_tas_set_seek_catchup(false);
+    g_tas_seek_continue_pending = false;
+    g_tas_seek_completion_pending = false;
+    g_tas_step_completion_pending = false;
+    if (g_tas_verify_mode != TasVerifyMode::Idle) {
+        g_tas_verify_mode = TasVerifyMode::Idle;
+        g_tas_verify_status = "Verifier stopped by manual TAS transport";
+    }
+}
+
 static void TasAdvanceFrames(uint32_t count, bool skip_lag = false)
 {
     if (!count) return;
     if (!xemu_tas_enabled()) xemu_tas_set_enabled(true);
+
+    /* Freeze first, then discard every older transport request. This makes
+     * repeated/spammed +1/-1 operations replace the previous request instead
+     * of stacking a stale resume onto the new one. */
     if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+    TasCancelPendingTransportAdvance();
+
+    const uint64_t start_frame = xemu_tas_frame();
+    if (!skip_lag) {
+        g_tas_step_completion_pending = true;
+        g_tas_step_completion_target = start_frame + (uint64_t)count;
+    }
+    /* Every manual frame step is already an exact paused VBLANK boundary.
+     * Cache it regardless of the Det checkbox so +/- transport remains exact
+     * for normal users too. */
+    g_tas_strict_step_checkpoint_pending =
+        (g_tas_rewind_enabled || g_tas_greenzone_enabled);
     xemu_tas_request_frame_advance_ex(count, skip_lag);
     vm_start();
 }
 
 static void TasInsertMacro()
 {
-    TasPushUndo("Insert combo / macro");
+    TasPushTimelineUndo("Insert combo / macro", (uint64_t)std::max(0, g_tas_selected_frame));
     int start = std::clamp(g_tas_selected_frame, 0, (int)g_tas_frames.size());
     int total = std::max(1, g_tas_macro_repeats) *
                 (std::max(1, g_tas_macro_press_frames) + std::max(0, g_tas_macro_gap_frames));
     if (start + total > (int)g_tas_frames.size()) {
         g_tas_frames.resize(start + total);
         g_tas_lag_flags.resize(start + total, 0);
+        g_tas_poll_counts.resize(start + total, TasUnknownPollCounts());
     }
     for (int rep = 0; rep < std::max(1, g_tas_macro_repeats); ++rep) {
         int base = start + rep * (std::max(1, g_tas_macro_press_frames) + std::max(0, g_tas_macro_gap_frames));
@@ -2081,30 +3780,59 @@ static void TasServiceDeferredSnapshotDeletes()
     }
 }
 
-static void TasUpdateRewindCache()
+static bool TasSaveRewindCheckpointAtBoundary(uint64_t frame)
 {
-    if ((!g_tas_rewind_enabled && !g_tas_greenzone_enabled) ||
-        !xemu_tas_enabled() || !runstate_is_running()) return;
-    uint64_t frame = xemu_tas_frame();
-    if (frame < g_tas_rewind_next_frame) return;
+    uint32_t title_id = 0;
+    if (!TasGetCurrentTitleId(&title_id)) return false;
 
-    /* Snapshot creation is inherently nontrivial I/O. Guest-frame intervals
-     * collapse under Fast Forward, so enforce a small host-time floor to keep
-     * Greenzone/Rewind from generating many QCOW2 states per real second. */
-    const auto now = std::chrono::steady_clock::now();
-    if (g_tas_rewind_next_host_checkpoint.time_since_epoch().count() != 0 &&
-        now < g_tas_rewind_next_host_checkpoint) {
-        return;
+    const bool can_fingerprint = !runstate_is_running() &&
+                                 xemu_tas_deterministic_mode();
+    uint64_t current_hash = 0;
+    if (can_fingerprint && !TasComputeStateHash(&current_hash)) {
+        xemu_queue_error_message(
+            "Could not compute Strict Sync checkpoint fingerprint; checkpoint was not saved");
+        return false;
+    }
+    if (can_fingerprint) {
+        for (const TasRewindCheckpoint &known : g_tas_rewind_points) {
+            if (!known.valid || known.branch_id != g_tas_current_branch ||
+                known.frame != frame || !known.state_hash) {
+                continue;
+            }
+            if (known.state_hash != current_hash) {
+                g_tas_verify_failed = true;
+                g_tas_verify_first_bad_frame = frame;
+                g_tas_verify_expected = known.state_hash;
+                g_tas_verify_actual = current_hash;
+                g_tas_verify_status =
+                    "STRICT SYNC DESYNC at frame " + std::to_string(frame);
+                xemu_queue_error_message(g_tas_verify_status.c_str());
+                return false;
+            }
+            /* An identical checkpoint already proves this frame. Do not churn
+             * QCOW metadata or overwrite the known-good anchor unnecessarily.
+             * Still move the periodic checkpoint deadline forward so resuming
+             * from this exact anchor does not immediately schedule another save. */
+            const int interval = g_tas_greenzone_enabled
+                ? g_tas_greenzone_interval : g_tas_rewind_interval;
+            g_tas_rewind_next_frame = frame + (uint64_t)std::max(30, interval);
+            return true;
+        }
     }
 
-    uint32_t title_id = 0;
-    if (!TasGetCurrentTitleId(&title_id)) return;
     int capacity = std::clamp(g_tas_greenzone_enabled ? g_tas_greenzone_capacity :
                               (int)g_tas_rewind_points.size(), 4,
                               (int)g_tas_rewind_points.size());
     int slot = g_tas_rewind_slot % capacity;
     char name[64];
     snprintf(name, sizeof(name), "%08X_TAS_GZ_%02d", title_id, slot);
+
+    if (g_tas_snapshot_delete_queued.erase(name)) {
+        g_tas_snapshot_delete_queue.erase(
+            std::remove(g_tas_snapshot_delete_queue.begin(),
+                        g_tas_snapshot_delete_queue.end(), std::string(name)),
+            g_tas_snapshot_delete_queue.end());
+    }
 
     if (TasSnapshotExists(name)) {
         Error *del_err = NULL;
@@ -2115,27 +3843,111 @@ static void TasUpdateRewindCache()
             TasSnapshotCacheErase(name);
         }
     }
+
+    XemuTasTransactionId transaction{};
+    xemu_tas_transaction_mint(&transaction);
+
     Error *err = NULL;
+    xemu_tas_transaction_snapshot_begin();
     xemu_snapshots_save_no_thumbnail(name, &err);
-    if (!err) {
-        TasSnapshotCacheInsert(name);
-        g_tas_rewind_points[slot].valid = true;
-        g_tas_rewind_points[slot].frame = frame;
-        g_tas_rewind_points[slot].branch_id = g_tas_current_branch;
-        g_tas_rewind_points[slot].snapshot_name = name;
-        g_tas_rewind_slot = (slot + 1) % capacity;
-    } else {
+    xemu_tas_transaction_snapshot_end();
+    if (err) {
         error_free(err);
+        return false;
     }
-    int interval = g_tas_greenzone_enabled ? g_tas_greenzone_interval : g_tas_rewind_interval;
+
+    TasSnapshotCacheInsert(name);
+    TasRewindCheckpoint &cp = g_tas_rewind_points[slot];
+    cp.valid = true;
+    cp.frame = frame;
+    cp.branch_id = g_tas_current_branch;
+    /* Every transport checkpoint is canonical/paused. Strict Sync additionally
+     * fingerprints it; ordinary mode keeps exact navigation without treating
+     * legitimate nondeterminism as a verifier failure. */
+    cp.state_hash = current_hash;
+    cp.last_frame_lagged = xemu_tas_last_frame_lagged();
+    cp.lag_count = xemu_tas_lag_count();
+    cp.lag_streak = xemu_tas_lag_streak();
+    cp.transaction = transaction;
+    cp.snapshot_name = name;
+    g_tas_rewind_slot = (slot + 1) % capacity;
+
+    int interval = g_tas_greenzone_enabled ? g_tas_greenzone_interval
+                                           : g_tas_rewind_interval;
     g_tas_rewind_next_frame = frame + (uint64_t)std::max(30, interval);
-    g_tas_rewind_next_host_checkpoint = now + std::chrono::seconds(2);
+    return true;
 }
 
-static bool TasSeekFrame(uint64_t target)
+static void TasUpdateRewindCache()
 {
+    if (g_tas_strict_resim_pending) {
+        return;
+    }
+    if ((!g_tas_rewind_enabled && !g_tas_greenzone_enabled) ||
+        !xemu_tas_enabled()) {
+        return;
+    }
+
+    /* Rewind/seek correctness must not depend on the Det checkbox. All TAS
+     * transport checkpoints are canonical paused VBLANK boundaries. */
+    uint64_t frame = xemu_tas_frame();
+
+    {
+        if (g_tas_strict_step_checkpoint_pending) {
+            if (runstate_is_running() || xemu_tas_frame_advance_remaining() != 0) {
+                return;
+            }
+            g_tas_strict_step_checkpoint_pending = false;
+            frame = xemu_tas_frame();
+            TasSaveRewindCheckpointAtBoundary(frame);
+            /* A manual frame-step must remain paused. */
+            return;
+        }
+
+        if (g_tas_strict_checkpoint_pending) {
+            /* A manual pause may happen before our requested VBLANK. Only a
+             * consumed frame-advance (remaining == 0) proves the canonical
+             * boundary was reached. */
+            if (runstate_is_running() || xemu_tas_frame_advance_remaining() != 0) {
+                return;
+            }
+
+            const bool resume = g_tas_strict_checkpoint_resume;
+            g_tas_strict_checkpoint_pending = false;
+            g_tas_strict_checkpoint_resume = false;
+            frame = xemu_tas_frame();
+            const bool saved = TasSaveRewindCheckpointAtBoundary(frame);
+            if (resume && saved && !runstate_is_running()) {
+                vm_start();
+            } else if (resume && !saved) {
+                xemu_queue_error_message(
+                    "Strict Sync checkpoint failed; VM remains paused");
+            }
+            return;
+        }
+
+        if (!runstate_is_running() || frame < g_tas_rewind_next_frame ||
+            xemu_tas_frame_advance_remaining() != 0) {
+            return;
+        }
+
+        /* Do not snapshot a running frame. Arrange for the existing TAS VBLANK
+         * hook to stop us at the next exact boundary, then save on the UI tick
+         * above. Host time may delay the UI tick, but guest state cannot move
+         * while paused. */
+        g_tas_strict_checkpoint_pending = true;
+        g_tas_strict_checkpoint_resume = true;
+        xemu_tas_request_frame_advance(1);
+        return;
+    }
+}
+
+static bool TasSeekFrameEx(uint64_t target, bool continue_after_target)
+{
+    g_tas_seek_continue_pending = false;
+    g_tas_seek_completion_pending = false;
     if (g_tas_frames.empty()) return false;
-    target = std::min<uint64_t>(target, g_tas_frames.size() - 1);
+    target = std::min<uint64_t>(target, g_tas_frames.size());
     const TasRewindCheckpoint *best = nullptr;
     for (const auto &cp : g_tas_rewind_points) {
         if (cp.valid && cp.branch_id == g_tas_current_branch && cp.frame <= target &&
@@ -2144,6 +3956,10 @@ static bool TasSeekFrame(uint64_t target)
 
     uint64_t start = 0;
     if (best) {
+        /* Do not let an older Strict Sync checkpoint or frame-step resume the
+         * VM after this seek reaches its target. */
+        TasCancelPendingTransportAdvance();
+        xemu_tas_prepare_runtime();
         Error *err = NULL;
         bool was_running = false;
         const bool loaded = xemu_snapshots_load_paused(best->snapshot_name.c_str(),
@@ -2159,48 +3975,376 @@ static bool TasSeekFrame(uint64_t target)
             return false;
         }
         start = best->frame;
-    } else if (g_tas_power_on_recording) {
-        /* Power-on movies always have a canonical reset baseline. */
-        ActionReset();
-        start = 0;
+        if ((best->transaction.hi || best->transaction.lo) &&
+            !xemu_tas_transaction_matches(&best->transaction)) {
+            xemu_queue_error_message(
+                "TAS greenzone snapshot transaction ID mismatch; checkpoint was rejected");
+            return false;
+        }
+
+        /* TAS frame metadata is feature-owned rather than part of ordinary VM
+         * state, so restore it before checking the checkpoint fingerprint. */
+        if (!xemu_tas_enabled()) xemu_tas_set_enabled(true);
+        xemu_tas_set_frame(start);
+        xemu_tas_set_lag_state(best->last_frame_lagged, best->lag_count,
+                               best->lag_streak);
+        uint64_t restored_hash = 0;
+        if (best->state_hash &&
+            (!TasComputeStateHash(&restored_hash) || restored_hash != best->state_hash)) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "TAS checkpoint %llu failed Strict Sync validation; playback was not resumed",
+                     (unsigned long long)start);
+            xemu_queue_error_message(msg);
+            return false;
+        }
     } else {
-        xemu_queue_error_message("No greenzone/state checkpoint exists before that frame");
-        return false;
+        /* Greenzone is performance-only. If no cached anchor survives, restore
+         * the authoritative canonical movie-start snapshot and reconstruct from
+         * boundary 0. Cache settings may change seek cost, never correctness. */
+        TasCancelPendingTransportAdvance();
+        if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+        if (!TasRestoreMovieStartSnapshot()) {
+            xemu_queue_error_message(
+                "Exact seek has no valid greenzone and the canonical movie-start state could not be restored");
+            return false;
+        }
+        start = 0;
     }
 
     if (!xemu_tas_enabled()) xemu_tas_set_enabled(true);
     xemu_tas_set_frame(start);
     TasPushMovieToCore();
-    if (start < g_tas_frames.size()) xemu_tas_start_playback(start);
+    if (start < target && start < g_tas_frames.size() &&
+        !xemu_tas_start_playback(start)) {
+        xemu_queue_error_message(
+            "Could not start TAS playback while reconstructing the requested frame");
+        return false;
+    } else if (start >= target) {
+        xemu_tas_stop_playback();
+    }
     uint64_t delta = target - start;
     if (delta) {
+        g_tas_seek_completion_pending = true;
+        g_tas_seek_continue_target = target;
+        g_tas_seek_continue_pending =
+            continue_after_target && target < g_tas_frames.size();
+        /* The restored checkpoint is only an internal reconstruction anchor.
+         * Suppress its intermediate presentation frames so a <1 rewind or a
+         * double-click looks like an exact jump to the requested frame rather
+         * than visibly playing from the older checkpoint. Guest timing/input
+         * remains ordinary TAS frame stepping. */
+        xemu_tas_set_seek_catchup(true);
         xemu_tas_request_frame_advance((uint32_t)std::min<uint64_t>(delta, UINT32_MAX));
         vm_start();
-    } else if (runstate_is_running()) {
-        vm_stop(RUN_STATE_PAUSED);
+    } else {
+        xemu_tas_set_seek_catchup(false);
+        if (continue_after_target && target < g_tas_frames.size()) {
+            /* The requested boundary may itself be the restored checkpoint.
+             * Install row N explicitly; boundary N means row N is still the
+             * next input, including when N is the final movie row. */
+            TasPushMovieToCore();
+            if (!xemu_tas_start_playback(target)) {
+                xemu_queue_error_message(
+                    "Could not resume TAS playback from the exact seek boundary");
+                return false;
+            }
+            if (!runstate_is_running()) vm_start();
+        } else {
+            xemu_tas_stop_playback();
+            if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+        }
     }
-    g_tas_selected_frame = (int)std::min<uint64_t>(target, INT_MAX);
+    const uint64_t selected_target = g_tas_frames.empty() ? 0 :
+        std::min<uint64_t>(target, g_tas_frames.size() - 1);
+    g_tas_selected_frame = (int)std::min<uint64_t>(selected_target, INT_MAX);
     g_tas_selection_anchor = g_tas_selected_frame;
     g_tas_selection_end = g_tas_selected_frame;
-    g_tas_follow_frame = false;
+    /* Follow is a user preference. Seeking never toggles the checkbox. */
     return true;
+}
+
+static bool TasSeekFrame(uint64_t target)
+{
+    return TasSeekFrameEx(target, false);
+}
+
+static void TasStrictResimTick()
+{
+    if (!g_tas_strict_resim_pending) return;
+    if (runstate_is_running()) return;
+
+    const uint64_t target = g_tas_strict_resim_target;
+    const bool continue_after = g_tas_strict_resim_continue;
+    g_tas_strict_resim_pending = false;
+    g_tas_strict_resim_continue = false;
+
+    if (!TasSeekFrameEx(target, continue_after)) {
+        xemu_queue_error_message(
+            "Strict Sync could not rebuild the edited timeline; VM remains paused");
+    }
+}
+
+static void TasSeekContinueTick()
+{
+    if (!g_tas_seek_completion_pending && !g_tas_seek_continue_pending) return;
+
+    /* A user pause during hidden reconstruction is a cancellation, not a
+     * reason to leave a half-finished seek armed forever. */
+    if (g_tas_seek_completion_pending && !runstate_is_running() &&
+        xemu_tas_frame_advance_remaining() != 0) {
+        const uint64_t stopped = xemu_tas_frame();
+        xemu_tas_cancel_frame_advance();
+        xemu_tas_set_seek_catchup(false);
+        g_tas_seek_completion_pending = false;
+        g_tas_seek_continue_pending = false;
+        if (g_tas_pending_overdub_start.active) {
+            g_tas_pending_overdub_start = {};
+        }
+        if (g_tas_branch_switch.active && g_tas_branch_switch.reconstructing) {
+            TasRollbackBranchSwitch(
+                "TAS branch reconstruction was interrupted; restored previous branch");
+        } else if (g_tas_timeline_mutation.active &&
+                   g_tas_timeline_mutation.reconstructing) {
+            TasAbortTimelineMutation(nullptr);
+        }
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "TAS exact seek interrupted at frame %llu",
+                 (unsigned long long)stopped);
+        xemu_queue_notification(msg);
+        return;
+    }
+
+    /* Wait for the VBLANK transport to produce its requested pause. */
+    if (xemu_tas_frame_advance_remaining() != 0 || runstate_is_running()) return;
+
+    const uint64_t target = g_tas_seek_continue_target;
+    const uint64_t vm_frame = xemu_tas_frame();
+    const bool playing = xemu_tas_playback();
+    const uint64_t movie_frame = playing ? xemu_tas_playback_frame() : vm_frame;
+
+    xemu_tas_set_seek_catchup(false);
+
+    if (g_tas_seek_completion_pending &&
+        (vm_frame != target || movie_frame != target)) {
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+                 "TAS exact seek failed: requested frame %llu, VM stopped at %llu, movie cursor at %llu",
+                 (unsigned long long)target,
+                 (unsigned long long)vm_frame,
+                 (unsigned long long)movie_frame);
+        g_tas_seek_completion_pending = false;
+        g_tas_seek_continue_pending = false;
+        if (g_tas_pending_overdub_start.active) {
+            g_tas_pending_overdub_start = {};
+        }
+        if (g_tas_branch_switch.active && g_tas_branch_switch.reconstructing) {
+            TasRollbackBranchSwitch(
+                "TAS branch reconstruction missed its exact target; restored previous branch");
+        } else if (g_tas_timeline_mutation.active &&
+                   g_tas_timeline_mutation.reconstructing) {
+            TasAbortTimelineMutation(nullptr);
+        }
+        xemu_queue_error_message(msg);
+        return;
+    }
+
+    g_tas_seek_completion_pending = false;
+
+    /* Turn every successfully reached seek destination into a canonical exact
+     * anchor. Repeated frame-by-frame work therefore becomes progressively
+     * cheaper and never replaces the target with the checkpoint interval. */
+    if (g_tas_rewind_enabled || g_tas_greenzone_enabled) {
+        TasSaveRewindCheckpointAtBoundary(target);
+    }
+
+    if (g_tas_branch_switch.active && g_tas_branch_switch.reconstructing) {
+        TasFinishBranchSwitch();
+    } else if (g_tas_timeline_mutation.active &&
+               g_tas_timeline_mutation.reconstructing) {
+        TasRestoreTimelineRuntimeAfterMutation();
+    } else if (g_tas_pending_overdub_start.active) {
+        TasFinishPendingOverdubStart();
+    }
+
+    if (!g_tas_seek_continue_pending) return;
+
+    g_tas_seek_continue_pending = false;
+    if (!playing || g_tas_frames.empty() || target >= g_tas_frames.size()) {
+        return;
+    }
+
+    /* Continue movie playback from the exact requested frame. Follow remains
+     * whatever the user selected before/during the seek. */
+    vm_start();
+}
+
+static void TasFrameStepCompletionTick()
+{
+    if (!g_tas_step_completion_pending) return;
+    if (xemu_tas_frame_advance_remaining() != 0 || runstate_is_running()) return;
+
+    const uint64_t actual = xemu_tas_frame();
+    const uint64_t expected = g_tas_step_completion_target;
+    g_tas_step_completion_pending = false;
+    if (actual != expected) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "TAS frame-step failed: requested stop at %llu, stopped at %llu",
+                 (unsigned long long)expected,
+                 (unsigned long long)actual);
+        xemu_queue_error_message(msg);
+        return;
+    }
+
+    if (!g_tas_frames.empty()) {
+        const int selected = (int)std::min<uint64_t>(
+            std::min<uint64_t>(actual, g_tas_frames.size() - 1), INT_MAX);
+        g_tas_selected_frame = selected;
+        g_tas_selection_anchor = selected;
+        g_tas_selection_end = selected;
+    }
 }
 
 static void TasRewindFrames(uint64_t distance)
 {
-    uint64_t current = xemu_tas_frame();
+    /* Never throw away input that is still buffered in the recording core just
+     * because the user pressed a transport rewind button. */
+    if (g_tas_overdub_ui_active || xemu_tas_overdub()) {
+        TasSyncRecordingFromCore();
+        TasStopOverdub();
+    } else if (xemu_tas_recording()) {
+        xemu_tas_stop_recording();
+        TasSyncRecordingFromCore();
+        TasAutosaveRecovery(true);
+    }
+
+    const uint64_t current = xemu_tas_playback()
+        ? xemu_tas_playback_frame() : xemu_tas_frame();
     uint64_t target = current > distance ? current - distance : 0;
     TasSeekFrame(target);
 }
 
-static void TasStartVerifier(bool capture)
+static void TasSelectCurrentFrame()
 {
     if (g_tas_frames.empty()) return;
+    const uint64_t source = xemu_tas_playback() ? xemu_tas_playback_frame()
+                                                 : xemu_tas_frame();
+    const int frame = (int)std::min<uint64_t>(
+        std::min<uint64_t>(source, g_tas_frames.size() - 1), INT_MAX);
+    g_tas_selected_frame = frame;
+    g_tas_selection_anchor = frame;
+    g_tas_selection_end = frame;
+    g_tas_follow_frame = false;
+}
+
+static void TasVerifierFail(const std::string &reason, uint64_t frame = UINT64_MAX,
+                            uint64_t expected = 0, uint64_t actual = 0)
+{
+    xemu_tas_stop_playback();
+    xemu_tas_stop_recording();
+    xemu_tas_stop_overdub();
+    g_tas_overdub_ui_active = false;
+    TasCancelPendingTransportAdvance();
+    g_tas_seek_continue_pending = false;
+    g_tas_seek_completion_pending = false;
+    g_tas_strict_resim_pending = false;
+    if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+
+    g_tas_verify_mode = TasVerifyMode::Idle;
+    g_tas_verify_failed = true;
+    g_tas_verify_first_bad_frame = frame;
+    g_tas_verify_expected = expected;
+    g_tas_verify_actual = actual;
+    g_tas_verify_runs_remaining = 0;
+    g_tas_verify_status = reason;
+    xemu_queue_error_message(reason.c_str());
+}
+
+static bool TasRestoreVerifierStart()
+{
+    if (g_tas_verify_start_snapshot.empty() ||
+        !TasSnapshotExists(g_tas_verify_start_snapshot.c_str())) {
+        xemu_queue_error_message(
+            "Verifier canonical start snapshot is unavailable; capture a new baseline");
+        return false;
+    }
+
+    xemu_tas_prepare_runtime();
+    Error *err = NULL;
+    bool was_running = false;
+    const bool loaded = xemu_snapshots_load_paused(
+        g_tas_verify_start_snapshot.c_str(), &was_running, &err);
+    (void)was_running;
+    if (err || !loaded) {
+        if (err) {
+            xemu_queue_error_message(error_get_pretty(err));
+            error_free(err);
+        } else {
+            xemu_queue_error_message("Could not restore verifier canonical start state");
+        }
+        return false;
+    }
+    if ((g_tas_verify_start_transaction.hi || g_tas_verify_start_transaction.lo) &&
+        !xemu_tas_transaction_matches(&g_tas_verify_start_transaction)) {
+        xemu_queue_error_message(
+            "Verifier snapshot transaction ID mismatch; baseline was rejected");
+        return false;
+    }
+    xemu_tas_set_frame(g_tas_verify_start_frame);
+    /* Verifier baselines are captured from canonical movie boundary 0 after
+     * fresh lag bookkeeping. Restore those feature-owned counters too. */
+    if (g_tas_verify_start_frame == 0) {
+        xemu_tas_reset_lag_counters();
+    }
+    return true;
+}
+
+static bool TasBeginVerifierPass()
+{
+    if (!TasRestoreVerifierStart()) return false;
+    TasPushMovieToCore();
+    xemu_tas_stop_playback();
+    if (g_tas_verify_start_frame < g_tas_frames.size() &&
+        !xemu_tas_start_playback(g_tas_verify_start_frame)) {
+        xemu_queue_error_message("Could not start deterministic verifier playback");
+        return false;
+    }
+    g_tas_verify_index = 0;
+    g_tas_verify_next_frame = g_tas_verify_start_frame;
+    return true;
+}
+
+static void TasStartVerifier(bool capture, int runs = 1, bool exhaustive = false)
+{
+    if (g_tas_frames.empty()) return;
+    TasCancelPendingTransportAdvance();
     if (!xemu_tas_enabled()) xemu_tas_set_enabled(true);
     xemu_tas_set_deterministic_mode(true);
     if (runstate_is_running()) vm_stop(RUN_STATE_PAUSED);
+    xemu_tas_stop_recording();
+    xemu_tas_stop_overdub();
+    g_tas_overdub_ui_active = false;
+    xemu_tas_stop_playback();
 
     if (capture) {
+        /* Poll traces are verifier evidence for this exact movie revision, not
+         * user input.  Drop stale proof before the capture pass so the core
+         * measures actual polls without comparing against an older run. */
+        g_tas_poll_counts.assign(g_tas_frames.size(), TasUnknownPollCounts());
+        g_tas_core_pushed_revision = UINT64_MAX;
+        g_tas_verify_poll_sync_from = 0;
+
+        /* A proof always starts from the movie's authoritative boundary 0,
+         * never from an arbitrary current VM state. */
+        if (!TasRestoreMovieStartSnapshot()) {
+            xemu_queue_error_message(
+                "Determinism baseline requires the canonical movie-start state");
+            return;
+        }
+        xemu_tas_set_frame(0);
+
         uint32_t title_id = 0;
         if (!TasGetCurrentTitleId(&title_id)) {
             xemu_queue_error_message("Determinism verifier requires a running XBE/title ID");
@@ -2208,8 +4352,13 @@ static void TasStartVerifier(bool capture)
         }
         char name[64];
         snprintf(name, sizeof(name), "%08X_TAS_VERIFY_BASE", title_id);
+
+        XemuTasTransactionId transaction{};
+        xemu_tas_transaction_mint(&transaction);
         Error *err = NULL;
+        xemu_tas_transaction_snapshot_begin();
         xemu_snapshots_save_no_thumbnail(name, &err);
+        xemu_tas_transaction_snapshot_end();
         if (err) {
             xemu_queue_error_message(error_get_pretty(err));
             error_free(err);
@@ -2217,102 +4366,196 @@ static void TasStartVerifier(bool capture)
         }
         TasSnapshotCacheInsert(name);
         g_tas_verify_start_snapshot = name;
-        g_tas_verify_start_frame = std::min<uint64_t>(xemu_tas_frame(),
-                                                       g_tas_frames.size() - 1);
+        g_tas_verify_start_transaction = transaction;
+        g_tas_verify_start_frame = 0;
         g_tas_verify_branch = g_tas_current_branch;
         g_tas_verify_baseline.clear();
+        g_tas_verify_revision = UINT64_MAX; /* proof becomes valid only at boundary N */
+        g_tas_verify_exhaustive = exhaustive;
+        g_tas_verify_baseline_interval = exhaustive ? 1 : std::max(1, g_tas_verify_interval);
+        g_tas_verify_runs_total = 1;
+        g_tas_verify_runs_remaining = 1;
+        g_tas_verify_run_index = 1;
     } else {
+        runs = std::clamp(runs, 1, 100);
         if (g_tas_current_branch != g_tas_verify_branch) {
             xemu_queue_error_message(
                 "Verifier baseline belongs to a different movie branch. Switch to that branch first.");
             return;
         }
-        if (g_tas_verify_baseline.empty() || g_tas_verify_start_snapshot.empty() ||
-            !TasSnapshotExists(g_tas_verify_start_snapshot.c_str())) {
+        if (g_tas_verify_revision != g_tas_movie_revision) {
             xemu_queue_error_message(
-                "No local verifier start-state is available. Capture a baseline first.");
+                "Verifier proof belongs to an older movie revision. Capture a new baseline after edits.");
             return;
         }
-        Error *err = NULL;
-        bool was_running = false;
-        const bool loaded = xemu_snapshots_load_paused(
-            g_tas_verify_start_snapshot.c_str(), &was_running, &err);
-        (void)was_running;
-        if (err || !loaded) {
-            if (err) {
-                xemu_queue_error_message(error_get_pretty(err));
-                error_free(err);
-            } else {
-                xemu_queue_error_message("Could not restore verifier baseline state");
-            }
+        const uint64_t end_boundary = g_tas_frames.size();
+        if (g_tas_verify_baseline.empty() ||
+            g_tas_verify_baseline.front().frame != 0 ||
+            g_tas_verify_baseline.back().frame != end_boundary) {
+            xemu_queue_error_message(
+                "Verifier baseline does not include canonical boundary 0 through post-movie boundary N; recapture it");
             return;
         }
-        xemu_tas_set_frame(g_tas_verify_start_frame);
+        g_tas_verify_runs_total = runs;
+        g_tas_verify_runs_remaining = runs;
+        g_tas_verify_run_index = 1;
     }
 
     g_tas_verify_mode = capture ? TasVerifyMode::Capture : TasVerifyMode::Verify;
     g_tas_verify_failed = false;
     g_tas_verify_first_bad_frame = UINT64_MAX;
-    g_tas_verify_index = 0;
-    g_tas_verify_next_frame = g_tas_verify_start_frame;
-    g_tas_verify_status = capture ? "Capturing RAM/input baseline"
-                                  : "Verifying RAM/input baseline";
+    g_tas_verify_expected = 0;
+    g_tas_verify_actual = 0;
+    g_tas_verify_status = capture
+        ? (exhaustive ? "Capturing exhaustive every-boundary baseline"
+                      : "Capturing deterministic baseline")
+        : "Verifier pass 1/" + std::to_string(g_tas_verify_runs_total);
 
-    TasPushMovieToCore();
-    if (!xemu_tas_start_playback(g_tas_verify_start_frame)) {
+    if (!TasBeginVerifierPass()) {
         g_tas_verify_mode = TasVerifyMode::Idle;
-        g_tas_verify_status = "Could not start verifier movie playback";
+        g_tas_verify_runs_remaining = 0;
+        g_tas_verify_status = "Could not establish verifier canonical start";
     }
 }
 
 static void TasVerifierTick()
 {
     if (g_tas_verify_mode == TasVerifyMode::Idle || g_tas_frames.empty()) return;
-    uint64_t frame = std::min<uint64_t>(xemu_tas_frame(), g_tas_frames.size() - 1);
-
-    /* The verifier owns the VM in short deterministic chunks. Hash only while
-     * paused so the RAM image cannot change underneath the checksum. */
     if (runstate_is_running()) return;
 
-    uint64_t hash = TasComputeStateHash();
+    const uint64_t end_boundary = g_tas_frames.size();
+    const uint64_t frame = std::min<uint64_t>(xemu_tas_frame(), end_boundary);
+    if (frame != g_tas_verify_next_frame) {
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+                 "Verifier transport mismatch: expected boundary %llu, stopped at %llu",
+                 (unsigned long long)g_tas_verify_next_frame,
+                 (unsigned long long)frame);
+        TasVerifierFail(msg, frame);
+        return;
+    }
+
+    if (g_tas_verify_mode == TasVerifyMode::Capture &&
+        frame > g_tas_verify_poll_sync_from) {
+        const uint64_t count = frame - g_tas_verify_poll_sync_from;
+        std::vector<uint32_t> polls((size_t)count * XEMU_TAS_MAX_PORTS, 0);
+        const uint64_t copied = xemu_tas_copy_playback_poll_trace(
+            g_tas_verify_poll_sync_from, count, polls.data(), polls.size());
+        if (copied != count) {
+            TasVerifierFail("Verifier could not capture the complete XID poll trace",
+                            frame, count, copied);
+            return;
+        }
+        if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+            g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+        }
+        for (uint64_t i = 0; i < copied; ++i) {
+            TasPollCounts pc{};
+            for (int port = 0; port < XEMU_TAS_MAX_PORTS; ++port) {
+                pc[(size_t)port] = polls[(size_t)i * XEMU_TAS_MAX_PORTS + port];
+            }
+            g_tas_poll_counts[(size_t)(g_tas_verify_poll_sync_from + i)] = pc;
+        }
+        g_tas_verify_poll_sync_from = frame;
+    }
+
+    uint64_t hash = 0;
+    if (!TasComputeStateHash(&hash)) {
+        TasVerifierFail("Verifier could not compute complete machine fingerprint", frame);
+        return;
+    }
     if (g_tas_verify_mode == TasVerifyMode::Capture) {
         g_tas_verify_baseline.push_back({frame, hash});
     } else {
-        while (g_tas_verify_index < g_tas_verify_baseline.size() &&
-               g_tas_verify_baseline[g_tas_verify_index].frame < frame) ++g_tas_verify_index;
         if (g_tas_verify_index >= g_tas_verify_baseline.size() ||
             g_tas_verify_baseline[g_tas_verify_index].frame != frame) {
-            g_tas_verify_status = "Baseline has no checkpoint for current frame";
-            g_tas_verify_mode = TasVerifyMode::Idle;
+            TasVerifierFail("Verifier baseline checkpoint sequence is invalid", frame);
             return;
         }
-        uint64_t expected = g_tas_verify_baseline[g_tas_verify_index].hash;
+        const uint64_t expected = g_tas_verify_baseline[g_tas_verify_index].hash;
         if (expected != hash) {
-            g_tas_verify_failed = true;
-            g_tas_verify_first_bad_frame = frame;
-            g_tas_verify_expected = expected;
-            g_tas_verify_actual = hash;
-            g_tas_verify_status = "DESYNC detected at frame " + std::to_string(frame);
-            g_tas_verify_mode = TasVerifyMode::Idle;
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                     "TAS DESYNC at boundary %llu: machine fingerprint %016llX != %016llX",
+                     (unsigned long long)frame,
+                     (unsigned long long)hash,
+                     (unsigned long long)expected);
+            TasVerifierFail(msg, frame, expected, hash);
             return;
         }
         ++g_tas_verify_index;
     }
 
-    if (frame >= g_tas_frames.size() - 1) {
-        g_tas_verify_status = g_tas_verify_mode == TasVerifyMode::Capture
-            ? "Baseline captured" : "Verification passed";
-        g_tas_verify_mode = TasVerifyMode::Idle;
+    if (frame == end_boundary) {
         xemu_tas_stop_playback();
-        return;
+        if (g_tas_verify_mode == TasVerifyMode::Capture) {
+            /* The baseline is proof for exactly this movie revision and branch.
+             * It includes the state after final input row N-1 has executed. */
+            g_tas_verify_revision = g_tas_movie_revision;
+            /* Captured poll traces are synchronization evidence belonging to
+             * this movie revision. Persist them and force the next playback
+             * copy to carry the now-known expectations. */
+            g_tas_core_pushed_revision = UINT64_MAX;
+            g_tas_movie_dirty = true;
+            g_tas_verify_runs_remaining = 0;
+            g_tas_verify_status = g_tas_verify_exhaustive
+                ? "Exhaustive every-boundary baseline captured"
+                : "Deterministic baseline captured through post-movie boundary N";
+            g_tas_verify_mode = TasVerifyMode::Idle;
+            return;
+        }
+
+        --g_tas_verify_runs_remaining;
+        if (g_tas_verify_runs_remaining <= 0) {
+            g_tas_verify_status = "Verification passed x" +
+                                  std::to_string(g_tas_verify_runs_total);
+            g_tas_verify_mode = TasVerifyMode::Idle;
+            return;
+        }
+
+        ++g_tas_verify_run_index;
+        if (!TasBeginVerifierPass()) {
+            TasVerifierFail("Could not restore canonical verifier start for stress pass");
+            return;
+        }
+        g_tas_verify_status = "Verifier pass " + std::to_string(g_tas_verify_run_index) +
+                              "/" + std::to_string(g_tas_verify_runs_total);
+        return; /* hash boundary 0 on next paused maintenance tick */
     }
 
-    uint64_t next = std::min<uint64_t>(frame + (uint64_t)std::max(1, g_tas_verify_interval),
-                                       g_tas_frames.size() - 1);
+    uint64_t next = end_boundary;
+    if (g_tas_verify_mode == TasVerifyMode::Capture) {
+        next = std::min<uint64_t>(frame + (uint64_t)g_tas_verify_baseline_interval,
+                                  end_boundary);
+    } else {
+        if (g_tas_verify_index >= g_tas_verify_baseline.size()) {
+            TasVerifierFail("Verifier baseline ended before post-movie boundary N", frame);
+            return;
+        }
+        next = g_tas_verify_baseline[g_tas_verify_index].frame;
+        if (next <= frame || next > end_boundary) {
+            TasVerifierFail("Verifier baseline contains a non-monotonic checkpoint sequence", frame);
+            return;
+        }
+    }
+
     g_tas_verify_next_frame = next;
-    uint64_t delta = next - frame;
+    const uint64_t delta = next - frame;
     xemu_tas_request_frame_advance((uint32_t)std::min<uint64_t>(delta, UINT32_MAX));
     vm_start();
+}
+
+static void TasCheckCoreDesync()
+{
+    XemuTasDesyncInfo info{};
+    if (!xemu_tas_take_desync(&info) || !info.valid) return;
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "TAS DESYNC at frame %llu: XID polls P%u %u != %u",
+             (unsigned long long)info.frame, (unsigned)info.port + 1,
+             info.actual_polls, info.expected_polls);
+    TasVerifierFail(msg, info.frame, info.expected_polls, info.actual_polls);
 }
 
 
@@ -2321,16 +4564,26 @@ static void TasCopySelection()
     auto [a,b] = TasSelectionBounds();
     g_tas_clipboard_frames.assign(g_tas_frames.begin() + a, g_tas_frames.begin() + b + 1);
     g_tas_clipboard_lag.assign(g_tas_lag_flags.begin() + a, g_tas_lag_flags.begin() + b + 1);
+    if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+    }
+    g_tas_clipboard_polls.assign(g_tas_poll_counts.begin() + a,
+                                 g_tas_poll_counts.begin() + b + 1);
 }
 
 static void TasDeleteSelection()
 {
     if (g_tas_frames.size() <= 1) return;
     auto [a,b] = TasSelectionBounds();
-    TasPushUndo("Delete frame range");
+    TasPushTimelineUndo("Delete frame range", (uint64_t)a);
     g_tas_frames.erase(g_tas_frames.begin() + a, g_tas_frames.begin() + b + 1);
     if (b < (int)g_tas_lag_flags.size()) g_tas_lag_flags.erase(g_tas_lag_flags.begin() + a, g_tas_lag_flags.begin() + b + 1);
-    if (g_tas_frames.empty()) { g_tas_frames.resize(1); g_tas_lag_flags.assign(1,0); }
+    if (b < (int)g_tas_poll_counts.size()) g_tas_poll_counts.erase(g_tas_poll_counts.begin() + a, g_tas_poll_counts.begin() + b + 1);
+    if (g_tas_frames.empty()) {
+        g_tas_frames.resize(1);
+        g_tas_lag_flags.assign(1,0);
+        g_tas_poll_counts.assign(1, TasUnknownPollCounts());
+    }
     g_tas_selected_frame = std::min(a, (int)g_tas_frames.size() - 1);
     g_tas_selection_anchor = g_tas_selection_end = g_tas_selected_frame;
     TasMarkMovieEdited((uint64_t)a);
@@ -2348,15 +4601,36 @@ static void TasPasteSelection(bool insert)
 {
     if (g_tas_clipboard_frames.empty()) return;
     int at = std::clamp(g_tas_selected_frame, 0, (int)g_tas_frames.size());
-    TasPushUndo(insert ? "Paste insert" : "Paste overwrite");
+    TasPushTimelineUndo(insert ? "Paste insert" : "Paste overwrite", (uint64_t)at);
     if (insert) {
         g_tas_frames.insert(g_tas_frames.begin() + at, g_tas_clipboard_frames.begin(), g_tas_clipboard_frames.end());
         g_tas_lag_flags.insert(g_tas_lag_flags.begin() + at, g_tas_clipboard_lag.begin(), g_tas_clipboard_lag.end());
+        if (g_tas_clipboard_polls.size() == g_tas_clipboard_frames.size()) {
+            g_tas_poll_counts.insert(g_tas_poll_counts.begin() + at,
+                                     g_tas_clipboard_polls.begin(),
+                                     g_tas_clipboard_polls.end());
+        } else {
+            g_tas_poll_counts.insert(g_tas_poll_counts.begin() + at,
+                                     g_tas_clipboard_frames.size(),
+                                     TasUnknownPollCounts());
+        }
     } else {
         size_t need = (size_t)at + g_tas_clipboard_frames.size();
-        if (need > g_tas_frames.size()) { g_tas_frames.resize(need); g_tas_lag_flags.resize(need,0); }
+        if (need > g_tas_frames.size()) {
+            g_tas_frames.resize(need);
+            g_tas_lag_flags.resize(need,0);
+            g_tas_poll_counts.resize(need, TasUnknownPollCounts());
+        }
         std::copy(g_tas_clipboard_frames.begin(), g_tas_clipboard_frames.end(), g_tas_frames.begin() + at);
         for (size_t i=0;i<g_tas_clipboard_lag.size();++i) g_tas_lag_flags[(size_t)at+i]=g_tas_clipboard_lag[i];
+        if (g_tas_clipboard_polls.size() == g_tas_clipboard_frames.size()) {
+            std::copy(g_tas_clipboard_polls.begin(), g_tas_clipboard_polls.end(),
+                      g_tas_poll_counts.begin() + at);
+        } else {
+            std::fill(g_tas_poll_counts.begin() + at,
+                      g_tas_poll_counts.begin() + at + g_tas_clipboard_frames.size(),
+                      TasUnknownPollCounts());
+        }
     }
     g_tas_selection_anchor = at;
     g_tas_selection_end = at + (int)g_tas_clipboard_frames.size() - 1;
@@ -2572,7 +4846,7 @@ static void TasImportCsvFromPath(const char *path)
     std::ifstream in(path?path:""); if(!in){xemu_queue_error_message("Could not open TAS CSV");return;}
     std::string line; std::getline(in,line); std::vector<TasFrame> frames; std::vector<uint8_t> lag;
     while(std::getline(in,line)){ if(line.empty())continue; std::stringstream ss(line); std::vector<std::string> f; std::string x; while(std::getline(ss,x,','))f.push_back(x); if(f.size()<6)continue; TasFrame fr{}; bool ok=true; for(int pidx=0;pidx<4;++pidx)ok&=TasParseHexReport(f[2+pidx],&fr.xid[pidx]); if(!ok)continue; frames.push_back(fr); lag.push_back((uint8_t)(atoi(f[1].c_str())?1:0)); }
-    if(frames.empty()){xemu_queue_error_message("CSV contained no valid TAS frames");return;} TasPushUndo("Import CSV"); g_tas_frames=std::move(frames);g_tas_lag_flags=std::move(lag);g_tas_selected_frame=0;g_tas_selection_anchor=g_tas_selection_end=0;TasMarkMovieEdited(0);xemu_queue_notification("Imported TAS CSV");
+    if(frames.empty()){xemu_queue_error_message("CSV contained no valid TAS frames");return;} TasPushTimelineUndo("Import CSV", 0); g_tas_frames=std::move(frames);g_tas_lag_flags=std::move(lag);g_tas_poll_counts.assign(g_tas_frames.size(),TasUnknownPollCounts());g_tas_selected_frame=0;g_tas_selection_anchor=g_tas_selection_end=0;TasMarkMovieEdited(0);xemu_queue_notification("Imported TAS CSV");
 }
 
 static void TasImportCsvDialog()
@@ -2589,6 +4863,9 @@ static bool TasValidateProject(std::string *report)
     }
     if (g_tas_lag_flags.size() != g_tas_frames.size()) {
         problems.emplace_back("lag flag count does not match movie frame count");
+    }
+    if (g_tas_poll_counts.size() != g_tas_frames.size()) {
+        problems.emplace_back("XID poll-trace count does not match movie frame count");
     }
     if (!g_tas_frames.empty()) {
         const int last = (int)g_tas_frames.size() - 1;
@@ -2621,6 +4898,29 @@ static bool TasValidateProject(std::string *report)
         if (b.lag.size() != b.frames.size()) {
             problems.emplace_back("branch " + std::to_string(b.id) +
                                   " lag/frame counts differ");
+        }
+        if (b.polls.size() != b.frames.size()) {
+            problems.emplace_back("branch " + std::to_string(b.id) +
+                                  " XID poll/frame counts differ");
+        }
+    }
+
+    if (!g_tas_verify_baseline.empty()) {
+        uint64_t prev = UINT64_MAX;
+        for (const TasHashRecord &h : g_tas_verify_baseline) {
+            if (prev != UINT64_MAX && h.frame <= prev) {
+                problems.emplace_back("verifier baseline checkpoints are not strictly increasing");
+                break;
+            }
+            prev = h.frame;
+        }
+        if (g_tas_verify_revision == g_tas_movie_revision &&
+            g_tas_verify_branch == g_tas_current_branch) {
+            if (g_tas_verify_baseline.front().frame != 0 ||
+                g_tas_verify_baseline.back().frame != g_tas_frames.size()) {
+                problems.emplace_back(
+                    "current verifier proof does not span boundary 0 through post-movie boundary N");
+            }
         }
     }
 
@@ -2781,13 +5081,25 @@ static void TasDrawBranchTreeNode(uint32_t id, std::set<uint32_t> &visited)
 
 static void DrawTasStudio()
 {
-    if (!g_tas_studio_open) return;
-    ImGui::SetNextWindowSize(ImVec2(1180, 640), ImGuiCond_FirstUseEver);
+    static constexpr const char *kDetachId = "tas.studio";
+    xemu_feature_detach::Register(kDetachId, "TAS Studio - XMT Piano Roll",
+                                  &g_tas_studio_open, DrawTasStudio);
+    // TAS Studio is the first custom-tool draw in Xemu's normal frame order.
+    // Pumping here keeps already-detached windows responsive even when the
+    // Studio itself is closed; later pumps are frame-deduplicated.
+    xemu_feature_detach::Pump();
+    if (!g_tas_studio_open || !xemu_feature_detach::ShouldDraw(kDetachId)) return;
+    if (xemu_feature_detach::IsDetachedPass(kDetachId)) {
+        xemu_feature_detach::PrepareWindow(kDetachId);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(1180, 640), ImGuiCond_FirstUseEver);
+    }
     if (!ImGui::Begin("TAS Studio - XMT Piano Roll", &g_tas_studio_open,
-                      ImGuiWindowFlags_MenuBar)) {
+                      xemu_feature_detach::WindowFlags(kDetachId, ImGuiWindowFlags_MenuBar))) {
         ImGui::End();
         return;
     }
+    xemu_feature_detach::ObserveCurrentWindow(kDetachId);
 
     if (g_tas_frames.empty()) {
         g_tas_frames.resize(1);
@@ -2796,10 +5108,13 @@ static void DrawTasStudio()
     if (g_tas_lag_flags.size() < g_tas_frames.size()) {
         g_tas_lag_flags.resize(g_tas_frames.size(), 0);
     }
+    if (g_tas_poll_counts.size() < g_tas_frames.size()) {
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+    }
 
     const uint64_t tas_frame = xemu_tas_frame();
     static bool scroll_to_followed_frame = false;
-    if (xemu_tas_enabled() && g_tas_follow_frame) {
+    if (xemu_tas_enabled() && g_tas_follow_frame && !xemu_tas_seek_catchup()) {
         const uint64_t last_movie_frame = g_tas_frames.size() - 1;
         const uint64_t source_frame = xemu_tas_playback() ? xemu_tas_playback_frame() : tas_frame;
         const int followed = (int)std::min<uint64_t>(
@@ -2828,18 +5143,22 @@ static void DrawTasStudio()
             if (ImGui::MenuItem("Save Movie As...")) TasSaveMovieAs();
             ImGui::Separator();
             if (!xemu_tas_recording()) {
-                if (ImGui::MenuItem("Record From Power-On")) TasStartRecording(true);
-                if (ImGui::MenuItem("Record From Current State")) TasStartRecording(false);
+                if (ImGui::MenuItem("Record / Rerecord From Current Position")) TasStartContextualRecording();
+                if (ImGui::MenuItem("New Movie From Current State")) TasStartFreshRecordingFromCurrentState();
+                if (ImGui::MenuItem("Record From Power-On / Reset")) TasStartRecording(true);
             } else if (ImGui::MenuItem("Stop Recording")) {
                 xemu_tas_stop_recording();
                 TasSyncRecordingFromCore();
                 TasAutosaveRecovery(true);
             }
+            if (ImGui::MenuItem("Play Movie From Beginning")) {
+                TasPlayMovieFromBeginning();
+            }
             if (!xemu_tas_playback()) {
                 if (ImGui::MenuItem("Play From Selected Frame"))
                     TasStartPlayback((uint64_t)g_tas_selected_frame);
             } else if (ImGui::MenuItem("Stop Playback")) {
-                xemu_tas_stop_playback();
+                TasStopPlaybackFromUi();
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Movie Properties / Comments"))
@@ -2866,17 +5185,19 @@ static void DrawTasStudio()
             ImGui::Separator();
             if (ImGui::MenuItem("Insert Frame")) {
                 int at = std::clamp(g_tas_selected_frame, 0, (int)g_tas_frames.size());
-                TasPushUndo("Insert frame");
+                TasPushTimelineUndo("Insert frame", (uint64_t)at);
                 g_tas_frames.insert(g_tas_frames.begin() + at, TasFrame{});
                 g_tas_lag_flags.insert(g_tas_lag_flags.begin() + at, 0);
+                g_tas_poll_counts.insert(g_tas_poll_counts.begin() + at, TasUnknownPollCounts());
                 TasSetSelection(at, false);
                 TasMarkMovieEdited((uint64_t)at);
             }
             if (ImGui::MenuItem("Append 60 Blank Frames")) {
-                TasPushUndo("Append 60 blank frames");
                 size_t old = g_tas_frames.size();
+                TasPushTimelineUndo("Append 60 blank frames", (uint64_t)old);
                 g_tas_frames.resize(old + 60);
                 g_tas_lag_flags.resize(g_tas_frames.size(), 0);
+                g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
                 TasMarkMovieEdited((uint64_t)old);
             }
             if (ImGui::MenuItem("Analog Curves...")) g_tas_curve_open = true;
@@ -2889,6 +5210,30 @@ static void DrawTasStudio()
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Navigate")) {
+            if (ImGui::MenuItem("Rewind 1 Frame")) TasRewindFrames(1);
+            if (ImGui::MenuItem("Rewind 10 Frames")) TasRewindFrames(10);
+            if (ImGui::MenuItem("Rewind 60 Frames")) TasRewindFrames(60);
+            if (ImGui::MenuItem("Rewind 300 Frames")) TasRewindFrames(300);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Advance 1 Frame")) TasAdvanceFrames(1);
+            if (ImGui::MenuItem("Advance 10 Frames")) TasAdvanceFrames(10);
+            if (ImGui::MenuItem("Advance 60 Frames")) TasAdvanceFrames(60);
+            if (ImGui::MenuItem("Advance 300 Frames")) TasAdvanceFrames(300);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Select Current TAS Frame")) TasSelectCurrentFrame();
+            if (ImGui::MenuItem("Seek To Selected (Greenzone)"))
+                TasSeekFrame((uint64_t)g_tas_selected_frame);
+            if (ImGui::MenuItem("Play Movie From Beginning")) TasPlayMovieFromBeginning();
+            if (ImGui::BeginMenu("Double-Click Frame Behavior")) {
+                if (ImGui::MenuItem("Seek && Stop at Frame", nullptr,
+                                    !g_tas_double_click_continue))
+                    g_tas_double_click_continue = false;
+                if (ImGui::MenuItem("Seek && Continue Playback", nullptr,
+                                    g_tas_double_click_continue))
+                    g_tas_double_click_continue = true;
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Previous Input Change")) TasFindFrame(-1, 0);
             if (ImGui::MenuItem("Next Input Change")) TasFindFrame(1, 0);
             if (ImGui::MenuItem("Previous Lag Frame")) TasFindFrame(-1, 1);
@@ -2900,8 +5245,6 @@ static void DrawTasStudio()
                 g_tas_goto_frame_value = g_tas_selected_frame;
                 g_tas_goto_dialog_requested = true;
             }
-            if (ImGui::MenuItem("Seek To Selected (Greenzone)"))
-                TasSeekFrame((uint64_t)g_tas_selected_frame);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Tools")) {
@@ -2959,28 +5302,43 @@ static void DrawTasStudio()
             ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.45f, 1.0f), "PLAYBACK");
 
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 2.0f));
+
+        /* Session row: keep the high-frequency movie controls and savestate
+         * workflow at the top. Dynamic labels keep fixed slots, so recording
+         * or playback state changes never push neighboring buttons around. */
         const bool running_compact = runstate_is_running();
-        if (ImGui::Button(running_compact ? "Pause" : "Resume")) ActionTogglePause();
-        ImGui::SameLine(); if (ImGui::Button("+1")) TasAdvanceFrames(1);
-        ImGui::SameLine(); if (ImGui::Button("+1 Skip Lag")) TasAdvanceFrames(1, true);
-        ImGui::SameLine(); if (ImGui::Button("+10")) TasAdvanceFrames(10);
-        ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        if (ImGui::Button(running_compact ? "Pause###tas_run_c" : "Resume###tas_run_c",
+                          ImVec2(64.0f, 0))) ActionTogglePause();
+        ImGui::SameLine();
         if (!xemu_tas_recording()) {
-            if (ImGui::Button("Record")) TasStartRecording(true);
-        } else if (ImGui::Button("Stop Rec")) {
-            xemu_tas_stop_recording(); TasSyncRecordingFromCore(); TasAutosaveRecovery(true);
+            if (ImGui::Button("Record###tas_record_c", ImVec2(72.0f, 0)))
+                TasStartContextualRecording();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Record/rerecord from the exact current movie/emulation position. Never resets the Xbox.");
+        } else if (ImGui::Button("Stop Rec###tas_record_c", ImVec2(72.0f, 0))) {
+            xemu_tas_stop_recording();
+            TasSyncRecordingFromCore();
+            TasAutosaveRecovery(true);
         }
         ImGui::SameLine();
         if (!xemu_tas_playback()) {
-            if (ImGui::Button("Play")) TasStartPlayback((uint64_t)g_tas_selected_frame);
-        } else if (ImGui::Button("Stop Play")) xemu_tas_stop_playback();
-        ImGui::SameLine(); if (ImGui::Button("Save Movie")) TasSaveMovie();
+            if (ImGui::Button("Play###tas_play_c", ImVec2(72.0f, 0)))
+                TasStartPlayback((uint64_t)g_tas_selected_frame);
+        } else if (ImGui::Button("Stop Play###tas_play_c", ImVec2(72.0f, 0))) {
+            TasStopPlaybackFromUi();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Play Start", ImVec2(76.0f, 0))) TasPlayMovieFromBeginning();
+        ImGui::SameLine();
+        if (ImGui::Button("Save Movie", ImVec2(82.0f, 0))) TasSaveMovie();
         ImGui::SameLine(); ImGui::Checkbox("Follow", &g_tas_follow_frame);
         ImGui::SameLine(); ImGui::Checkbox("RO", &g_tas_read_only);
         ImGui::SameLine();
         bool det_compact = xemu_tas_deterministic_mode();
         if (ImGui::Checkbox("Det", &det_compact)) xemu_tas_set_deterministic_mode(det_compact);
 
+        /* Savestates belong directly under Pause/Record/Play, not below
+         * navigation. This row is stable regardless of transport mode. */
         ImGui::TextUnformatted("State"); ImGui::SameLine();
         const bool compact_prev_disabled = g_tas_state_slot == 0;
         if (compact_prev_disabled) ImGui::BeginDisabled();
@@ -2994,8 +5352,11 @@ static void DrawTasStudio()
         if (ImGui::BeginCombo("##tas_state_slot_c", compact_slot_preview)) {
             TasGetStateSlotStatus(compact_state_slots);
             for (int slot = 0; slot < 100; ++slot) {
-                char label[32]; snprintf(label, sizeof(label), "%02d%s", slot, compact_state_slots[slot] ? " [saved]" : "");
-                if (ImGui::Selectable(label, slot == g_tas_state_slot)) g_tas_state_slot = slot;
+                char label[32];
+                snprintf(label, sizeof(label), "%02d%s", slot,
+                         compact_state_slots[slot] ? " [saved]" : "");
+                if (ImGui::Selectable(label, slot == g_tas_state_slot))
+                    g_tas_state_slot = slot;
             }
             ImGui::EndCombo();
         }
@@ -3008,17 +5369,52 @@ static void DrawTasStudio()
         char compact_state_name[64];
         const bool compact_have_title = TasBuildStateName(compact_state_name, sizeof(compact_state_name));
         if (!compact_have_title) ImGui::BeginDisabled();
-        if (ImGui::Button("Save State")) TasSaveSelectedState();
-        ImGui::SameLine(); if (ImGui::Button("Load")) TasLoadSelectedState();
-        ImGui::SameLine(); if (ImGui::Button("Resume Rec")) { g_tas_read_only = false; TasLoadSelectedState(); }
+        if (ImGui::Button("Save State", ImVec2(82.0f, 0))) TasSaveSelectedState();
+        ImGui::SameLine(); if (ImGui::Button("Load", ImVec2(54.0f, 0))) TasLoadSelectedState();
+        ImGui::SameLine();
+        if (ImGui::Button("Resume Rec", ImVec2(82.0f, 0))) {
+            g_tas_read_only = false;
+            TasLoadSelectedState();
+        }
         if (!compact_have_title) ImGui::EndDisabled();
-        ImGui::SameLine(); if (ImGui::Button("Undo Load")) TasUndoStateLoad();
+        ImGui::SameLine(); if (ImGui::Button("Undo Load", ImVec2(78.0f, 0))) TasUndoStateLoad();
         ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
         const char *compact_ports[] = {"P1", "P2", "P3", "P4"};
-        ImGui::SetNextItemWidth(54.0f); ImGui::Combo("##tas_port_c", &g_tas_port, compact_ports, 4);
-        ImGui::SameLine(); if (ImGui::Button("Capture")) TasCaptureCurrentFrame();
-        ImGui::SameLine(); if (ImGui::Button("Apply")) TasApplySelectedFrame();
-        ImGui::SameLine(); if (ImGui::Button("Release")) xemu_tas_clear_xid_report((uint8_t)g_tas_port);
+        ImGui::SetNextItemWidth(54.0f);
+        ImGui::Combo("##tas_port_c", &g_tas_port, compact_ports, 4);
+        ImGui::SameLine(); if (ImGui::Button("Capture", ImVec2(66.0f, 0))) TasCaptureCurrentFrame();
+        ImGui::SameLine(); if (ImGui::Button("Apply", ImVec2(54.0f, 0))) TasApplySelectedFrame();
+        ImGui::SameLine(); if (ImGui::Button("Release", ImVec2(62.0f, 0))) xemu_tas_clear_xid_report((uint8_t)g_tas_port);
+
+        /* Symmetric transport pairs. Left is rewind, right is advance. The
+         * labels intentionally read like a timeline rather than +/- math. */
+        ImGui::TextDisabled("Frames"); ImGui::SameLine();
+        if (ImGui::Button("< 1##tas_rw1_c", ImVec2(42.0f, 0))) TasRewindFrames(1);
+        ImGui::SameLine(); if (ImGui::Button("1 >##tas_fw1_c", ImVec2(42.0f, 0))) TasAdvanceFrames(1);
+        ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        if (ImGui::Button("< 10##tas_rw10_c", ImVec2(48.0f, 0))) TasRewindFrames(10);
+        ImGui::SameLine(); if (ImGui::Button("10 >##tas_fw10_c", ImVec2(48.0f, 0))) TasAdvanceFrames(10);
+        ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        if (ImGui::Button("< 60##tas_rw60_c", ImVec2(48.0f, 0))) TasRewindFrames(60);
+        ImGui::SameLine(); if (ImGui::Button("60 >##tas_fw60_c", ImVec2(48.0f, 0))) TasAdvanceFrames(60);
+        ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        if (ImGui::Button("< 300##tas_rw300_c", ImVec2(56.0f, 0))) TasRewindFrames(300);
+        ImGui::SameLine(); if (ImGui::Button("300 >##tas_fw300_c", ImVec2(56.0f, 0))) TasAdvanceFrames(300);
+        ImGui::SameLine();
+        if (ImGui::Button("1 > Skip Lag##tas_skip_c", ImVec2(88.0f, 0))) TasAdvanceFrames(1, true);
+
+        ImGui::TextDisabled("Seek"); ImGui::SameLine();
+        if (ImGui::Button("Select Current##tas_c", ImVec2(98.0f, 0))) TasSelectCurrentFrame();
+        ImGui::SameLine();
+        if (ImGui::Button("Seek Selected##tas_c", ImVec2(96.0f, 0)))
+            TasSeekFrame((uint64_t)g_tas_selected_frame);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Restore an internal checkpoint, reconstruct invisibly, and land on the exact selected frame");
+        ImGui::SameLine();
+        ImGui::Checkbox("Double-click continues", &g_tas_double_click_continue);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Off: land exactly on the double-clicked frame and remain paused. On: land exactly there, then continue playback. This never changes Follow.");
+
         ImGui::PopStyleVar();
     } else {
     ImGui::Text("Movie: %s%s   TAS frame: %llu   Movie frames: %zu   Lag: %llu   Rerecords: %llu   Rev: %llu",
@@ -3032,7 +5428,7 @@ static void DrawTasStudio()
 
     bool deterministic_mode = xemu_tas_deterministic_mode();
     ImGui::SameLine();
-    if (ImGui::Checkbox("Deterministic (experimental)", &deterministic_mode)) {
+    if (ImGui::Checkbox("Strict Sync / Deterministic", &deterministic_mode)) {
         xemu_tas_set_deterministic_mode(deterministic_mode);
     }
     ImGui::SameLine();
@@ -3048,71 +5444,43 @@ static void DrawTasStudio()
         ImGui::TextDisabled("EDITABLE");
     }
 
-    bool running = runstate_is_running();
-    if (ImGui::Button(running ? "Pause" : "Resume")) ActionTogglePause();
-    ImGui::SameLine();
-    if (ImGui::Button("Frame +1")) TasAdvanceFrames(1);
-    ImGui::SameLine();
-    if (ImGui::Button("Frame +1 Skip Lag")) TasAdvanceFrames(1, true);
-    ImGui::SameLine();
-    if (ImGui::Button("Frame +10")) TasAdvanceFrames(10);
-    ImGui::SameLine();
-    ImGui::TextDisabled("Last frame: %s  streak: %llu",
-                        xemu_tas_last_frame_lagged() ? "LAG" : "input",
-                        (unsigned long long)xemu_tas_lag_streak());
+    /* Primary session controls. Keep dynamic labels in fixed slots. */
+    const bool running = runstate_is_running();
+    const bool recording_now = xemu_tas_recording();
+    const bool overdub_now = g_tas_overdub_ui_active || xemu_tas_overdub();
+    const bool playback_now = xemu_tas_playback();
 
-    if (!xemu_tas_recording()) {
-        if (ImGui::Button("Record (Power-On)")) TasStartRecording(true);
-        ImGui::SameLine();
-        if (ImGui::Button("Record From Current State")) TasStartRecording(false);
-    } else {
-        if (ImGui::Button("Stop Recording")) {
-            xemu_tas_stop_recording();
-            TasSyncRecordingFromCore();
-            TasAutosaveRecovery(true);
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("RECORDING");
+    if (ImGui::Button(running ? "Pause###tas_run" : "Resume###tas_run", ImVec2(78.0f, 0)))
+        ActionTogglePause();
+    ImGui::SameLine();
+    if (!recording_now) {
+        if (ImGui::Button("Record###tas_record", ImVec2(94.0f, 0))) TasStartContextualRecording();
+    } else if (ImGui::Button("Stop Recording###tas_record", ImVec2(94.0f, 0))) {
+        xemu_tas_stop_recording();
+        TasSyncRecordingFromCore();
+        TasAutosaveRecovery(true);
     }
     ImGui::SameLine();
-    if (!g_tas_overdub_ui_active && !xemu_tas_overdub()) {
-        if (ImGui::Button("Punch-In / Overdub")) TasStartOverdub();
-    } else {
-        if (ImGui::Button("Stop Overdub")) TasStopOverdub();
-        ImGui::SameLine();
-        ImGui::TextDisabled("OVERDUB @ %llu", (unsigned long long)g_tas_overdub_start_frame);
+    if (overdub_now) ImGui::BeginDisabled();
+    if (!playback_now || overdub_now) {
+        if (ImGui::Button("Play###tas_play", ImVec2(94.0f, 0)) && !overdub_now)
+            TasStartPlayback((uint64_t)g_tas_selected_frame);
+    } else if (ImGui::Button("Stop Playback###tas_play", ImVec2(94.0f, 0))) {
+        TasStopPlaybackFromUi();
     }
+    if (overdub_now) ImGui::EndDisabled();
     ImGui::SameLine();
-    if (!xemu_tas_playback() || g_tas_overdub_ui_active) {
-        if (!g_tas_overdub_ui_active && ImGui::Button("Play From Selected")) TasStartPlayback((uint64_t)g_tas_selected_frame);
-    } else {
-        if (ImGui::Button("Stop Playback")) xemu_tas_stop_playback();
-        ImGui::SameLine();
-        ImGui::TextDisabled("PLAY %llu/%llu",
-                            (unsigned long long)xemu_tas_playback_frame(),
-                            (unsigned long long)xemu_tas_playback_frame_count());
-    }
+    if (ImGui::Button("Play Beginning", ImVec2(112.0f, 0))) TasPlayMovieFromBeginning();
     ImGui::SameLine();
-    if (ImGui::Button("Save Movie")) TasSaveMovie();
-    ImGui::SameLine();
-    if (ImGui::Button("Movie Properties")) g_tas_properties_open = !g_tas_properties_open;
-    ImGui::SameLine();
-    if (ImGui::Button("Compatibility")) g_tas_compatibility_open = true;
-    ImGui::SameLine();
-    if (ImGui::Button("RAM Tools")) g_tas_ram_tools_open = true;
-    ImGui::SameLine();
-    ImGui::Checkbox("TAS HUD", &g_tas_hud_enabled);
+    if (ImGui::Button("Save Movie", ImVec2(90.0f, 0))) TasSaveMovie();
 
-    // Keep TAS state selection on its own row so it can never be pushed or
-    // clipped off the right side by the playback/frame controls above.
-    ImGui::TextUnformatted("State Slot");
-    ImGui::SameLine();
+    /* Savestate workflow stays next to the primary playback/record controls. */
+    ImGui::TextUnformatted("State"); ImGui::SameLine();
     const bool prev_state_disabled = g_tas_state_slot == 0;
     if (prev_state_disabled) ImGui::BeginDisabled();
     if (ImGui::Button("<##tas_state_prev")) --g_tas_state_slot;
     if (prev_state_disabled) ImGui::EndDisabled();
     ImGui::SameLine();
-
     static std::array<bool, 100> state_slots{};
     char slot_preview[16];
     snprintf(slot_preview, sizeof(slot_preview), "Slot %02d", g_tas_state_slot);
@@ -3124,44 +5492,88 @@ static void DrawTasStudio()
             snprintf(slot_label, sizeof(slot_label), "%02d%s", slot,
                      state_slots[slot] ? "   [saved]" : "");
             const bool selected = slot == g_tas_state_slot;
-            if (ImGui::Selectable(slot_label, selected)) {
-                g_tas_state_slot = slot;
-            }
+            if (ImGui::Selectable(slot_label, selected)) g_tas_state_slot = slot;
             if (selected) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Select TAS save-state slot 00-99");
     }
     ImGui::SameLine();
     const bool next_state_disabled = g_tas_state_slot == 99;
     if (next_state_disabled) ImGui::BeginDisabled();
     if (ImGui::Button(">##tas_state_next")) ++g_tas_state_slot;
     if (next_state_disabled) ImGui::EndDisabled();
-
     ImGui::SameLine();
     char tas_state_name[64];
     const bool have_title_id = TasBuildStateName(tas_state_name, sizeof(tas_state_name));
     if (!have_title_id) {
-        snprintf(tas_state_name, sizeof(tas_state_name), "--------_TAS_%02d",
-                 g_tas_state_slot);
+        snprintf(tas_state_name, sizeof(tas_state_name), "--------_TAS_%02d", g_tas_state_slot);
         ImGui::BeginDisabled();
     }
-    if (ImGui::Button("Save State")) TasSaveSelectedState();
+    if (ImGui::Button("Save State", ImVec2(88.0f, 0))) TasSaveSelectedState();
+    ImGui::SameLine(); if (ImGui::Button("Load State", ImVec2(86.0f, 0))) TasLoadSelectedState();
     ImGui::SameLine();
-    if (ImGui::Button("Load State")) TasLoadSelectedState();
-    ImGui::SameLine();
-    if (ImGui::Button("Resume Recording From State")) {
+    if (ImGui::Button("Resume Recording", ImVec2(126.0f, 0))) {
         g_tas_read_only = false;
         TasLoadSelectedState();
     }
     if (!have_title_id) ImGui::EndDisabled();
+    ImGui::SameLine(); if (ImGui::Button("Undo Load", ImVec2(82.0f, 0))) TasUndoStateLoad();
+
+    /* Symmetric exact-frame transport. Checkpoint spacing is not transport
+     * spacing: rewind restores an internal anchor and reconstructs invisibly to
+     * the exact target. */
+    ImGui::TextDisabled("Frames"); ImGui::SameLine();
+    if (ImGui::Button("< 1##tas_rw1", ImVec2(46.0f, 0))) TasRewindFrames(1);
+    ImGui::SameLine(); if (ImGui::Button("1 >##tas_fw1", ImVec2(46.0f, 0))) TasAdvanceFrames(1);
+    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    if (ImGui::Button("< 10##tas_rw10", ImVec2(52.0f, 0))) TasRewindFrames(10);
+    ImGui::SameLine(); if (ImGui::Button("10 >##tas_fw10", ImVec2(52.0f, 0))) TasAdvanceFrames(10);
+    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    if (ImGui::Button("< 60##tas_rw60", ImVec2(52.0f, 0))) TasRewindFrames(60);
+    ImGui::SameLine(); if (ImGui::Button("60 >##tas_fw60", ImVec2(52.0f, 0))) TasAdvanceFrames(60);
+    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    if (ImGui::Button("< 300##tas_rw300", ImVec2(60.0f, 0))) TasRewindFrames(300);
+    ImGui::SameLine(); if (ImGui::Button("300 >##tas_fw300", ImVec2(60.0f, 0))) TasAdvanceFrames(300);
+    ImGui::SameLine(); if (ImGui::Button("1 > Skip Lag", ImVec2(92.0f, 0))) TasAdvanceFrames(1, true);
     ImGui::SameLine();
-    if (ImGui::Button("Undo State Load")) TasUndoStateLoad();
+    ImGui::TextDisabled("Last: %s (%llu)",
+                        xemu_tas_last_frame_lagged() ? "LAG" : "input",
+                        (unsigned long long)xemu_tas_lag_streak());
+
+    ImGui::TextDisabled("Seek"); ImGui::SameLine();
+    if (ImGui::Button("Select Current", ImVec2(104.0f, 0))) TasSelectCurrentFrame();
     ImGui::SameLine();
-    ImGui::TextDisabled("%s%s", tas_state_name,
-                        g_tas_state_meta[g_tas_state_slot].valid ? "  [movie-linked]" : "");
+    if (ImGui::Button("Seek Selected", ImVec2(102.0f, 0)))
+        TasSeekFrame((uint64_t)g_tas_selected_frame);
+    ImGui::SameLine();
+    ImGui::Checkbox("Double-click continues", &g_tas_double_click_continue);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Off: exact seek and stop. On: exact seek, then continue. Follow is never changed by seeking.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(88.0f);
+    ImGui::InputInt("##tas_rw_custom", &g_tas_rewind_distance, 0, 0);
+    g_tas_rewind_distance = std::clamp(g_tas_rewind_distance, 1, 36000);
+    ImGui::SameLine();
+    if (ImGui::Button("< Custom", ImVec2(80.0f, 0))) TasRewindFrames((uint64_t)g_tas_rewind_distance);
+
+    /* Less-frequent movie creation/overdub controls stay below transport. */
+    if (recording_now) ImGui::BeginDisabled();
+    if (ImGui::Button("New Current-State Movie", ImVec2(154.0f, 0)))
+        TasStartFreshRecordingFromCurrentState();
+    ImGui::SameLine();
+    if (ImGui::Button("Record From Power-On", ImVec2(150.0f, 0))) TasStartRecording(true);
+    if (recording_now) ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (!overdub_now) {
+        if (ImGui::Button("Punch-In / Overdub###tas_overdub", ImVec2(136.0f, 0))) TasStartOverdub();
+    } else if (ImGui::Button("Stop Overdub###tas_overdub", ImVec2(136.0f, 0))) {
+        TasStopOverdub();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Movie Properties", ImVec2(112.0f, 0))) g_tas_properties_open = !g_tas_properties_open;
+    ImGui::SameLine(); if (ImGui::Button("Compatibility", ImVec2(104.0f, 0))) g_tas_compatibility_open = true;
+    ImGui::SameLine(); if (ImGui::Button("RAM Tools", ImVec2(86.0f, 0))) g_tas_ram_tools_open = true;
+    ImGui::SameLine(); ImGui::Checkbox("TAS HUD", &g_tas_hud_enabled);
 
     const char *ports[] = {"Port 1", "Port 2", "Port 3", "Port 4"};
     ImGui::SetNextItemWidth(100);
@@ -3287,13 +5699,13 @@ static void DrawTasStudio()
         }
         if (!drew_root || !visited_branches.count(g_tas_current_branch)) TasDrawBranchTreeNode(g_tas_current_branch, visited_branches);
         if (ImGui::Button("Create Branch From Selected Frame")) {
-            TasPushUndo("Create branch");
-            uint64_t f = (uint64_t)std::clamp(g_tas_selected_frame, 0, (int)g_tas_frames.size() - 1);
-            TasArchiveCurrentBranch(f, "Manual branch snapshot");
-            g_tas_frames.resize((size_t)f + 1);
-            g_tas_lag_flags.resize((size_t)f + 1);
+            const uint64_t row = (uint64_t)std::clamp(
+                g_tas_selected_frame, 0, (int)g_tas_frames.size() - 1);
+            const uint64_t fork_boundary = std::min<uint64_t>(row + 1, g_tas_frames.size());
+            TasPushTimelineUndo("Create branch", row);
+            TasArchiveCurrentBranch(fork_boundary, "Manual branch snapshot");
             ++g_tas_rerecord_count;
-            TasMarkMovieEdited(f);
+            TasMarkMovieEdited(row);
             TasAutosaveRecovery(true);
         }
         if (ImGui::BeginTable("##tas_branches", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
@@ -3313,28 +5725,7 @@ static void DrawTasStudio()
                 ImGui::TableSetColumnIndex(3); ImGui::Text("%zu", b.frames.size());
                 ImGui::TableSetColumnIndex(4);
                 if (ImGui::Button("Switch")) {
-                    /* A branch becomes the live movie, so transfer its storage
-                     * rather than cloning an entire potentially long TAS. */
-                    TasBranch target = std::move(g_tas_branches[i]);
-                    g_tas_branches.erase(g_tas_branches.begin() + i);
-                    /* A branch switch does not need the prefix copy performed
-                     * when forking for rerecording. Store the current branch by
-                     * move and immediately make the target live. */
-                    TasStoreCurrentBranch((uint64_t)g_tas_selected_frame,
-                                          "Branch before switch");
-                    g_tas_frames = std::move(target.frames);
-                    g_tas_lag_flags = std::move(target.lag);
-                    if (g_tas_frames.empty()) g_tas_frames.resize(1);
-                    if (g_tas_lag_flags.size() < g_tas_frames.size()) {
-                        g_tas_lag_flags.resize(g_tas_frames.size(), 0);
-                    }
-                    g_tas_current_branch = target.id;
-                    g_tas_current_parent = target.parent;
-                    g_tas_selected_frame = (int)std::min<uint64_t>(target.fork_frame, INT_MAX);
-                    g_tas_follow_frame = false;
-                    g_tas_core_pushed_revision = UINT64_MAX;
-                    g_tas_visible_frame_cache_dirty = true;
-                    TasAutosaveRecovery(true);
+                    TasSwitchToBranchIndex(i);
                     ImGui::PopID();
                     break;
                 }
@@ -3392,12 +5783,19 @@ static void DrawTasStudio()
     if ((!g_tas_compact_ui || g_tas_verifier_panel_open) &&
         ImGui::CollapsingHeader("Determinism Verifier",
             g_tas_compact_ui ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
-        ImGui::TextWrapped("Verifier checkpoints hash guest RAM plus the canonical XID movie input while paused at deterministic frame boundaries. This catches practical desyncs; device-specific hashes can be added later.");
+        ImGui::TextWrapped("Verifier starts at canonical movie boundary 0 and hashes RAM + QEMU non-RAM VM/device state + TAS input/lag metadata through post-movie boundary N. Known XID poll counts are checked every frame and fail closed on the first mismatch.");
         ImGui::SetNextItemWidth(120); ImGui::InputInt("Hash interval",&g_tas_verify_interval); g_tas_verify_interval=std::clamp(g_tas_verify_interval,1,36000);
         if(g_tas_verify_mode==TasVerifyMode::Idle){
-            if(ImGui::Button("Capture Baseline From Current State")) TasStartVerifier(true);
-            ImGui::SameLine(); bool can_verify=!g_tas_verify_baseline.empty(); if(!can_verify)ImGui::BeginDisabled(); if(ImGui::Button("Verify Against Baseline")) TasStartVerifier(false); if(!can_verify)ImGui::EndDisabled();
-        } else { ImGui::Text("Verifier running: %s",g_tas_verify_status.c_str()); ImGui::SameLine(); if(ImGui::Button("Stop Verification")){g_tas_verify_mode=TasVerifyMode::Idle;xemu_tas_stop_playback();if(runstate_is_running())vm_stop(RUN_STATE_PAUSED);} }
+            if(ImGui::Button("Capture Baseline")) TasStartVerifier(true);
+            ImGui::SameLine();
+            if(ImGui::Button("Capture Every-Frame")) TasStartVerifier(true, 1, true);
+            bool can_verify=!g_tas_verify_baseline.empty() && g_tas_verify_revision==g_tas_movie_revision;
+            if(!can_verify)ImGui::BeginDisabled();
+            if(ImGui::Button("Verify x1")) TasStartVerifier(false,1);
+            ImGui::SameLine(); if(ImGui::Button("Stress Verify x10")) TasStartVerifier(false,10);
+            ImGui::SameLine(); if(ImGui::Button("Stress Verify x100")) TasStartVerifier(false,100);
+            if(!can_verify)ImGui::EndDisabled();
+        } else { ImGui::Text("Verifier running: %s",g_tas_verify_status.c_str()); ImGui::SameLine(); if(ImGui::Button("Stop Verification")){g_tas_verify_mode=TasVerifyMode::Idle;g_tas_verify_runs_remaining=0;xemu_tas_stop_playback();TasCancelPendingTransportAdvance();if(runstate_is_running())vm_stop(RUN_STATE_PAUSED);} }
         ImGui::Text("Status: %s   checkpoints: %zu",g_tas_verify_status.c_str(),g_tas_verify_baseline.size());
         if(g_tas_verify_failed) ImGui::Text("First divergence: %llu  expected=%016llX actual=%016llX",(unsigned long long)g_tas_verify_first_bad_frame,(unsigned long long)g_tas_verify_expected,(unsigned long long)g_tas_verify_actual);
     }
@@ -3478,7 +5876,6 @@ static void DrawTasStudio()
         ImGui::SameLine(); ImGui::TextDisabled("More editing/navigation is in the Edit and Navigate menus");
         ImGui::PopStyleVar();
     } else {
-    auto [sel_a, sel_b] = TasSelectionBounds();
     ImGui::Text("Selection: %d - %d (%d frame%s)", sel_a, sel_b, sel_b-sel_a+1,
                 sel_b==sel_a ? "" : "s");
     ImGui::SameLine();
@@ -3491,12 +5888,22 @@ static void DrawTasStudio()
     ImGui::SameLine(); if(ImGui::Button("Clear Range"))TasClearSelection();
 
     if (ImGui::Button("+60 blank frames")) {
-        TasPushUndo("Append 60 blank frames");
-        size_t old=g_tas_frames.size(); g_tas_frames.resize(old+60); g_tas_lag_flags.resize(g_tas_frames.size(),0); TasMarkMovieEdited((uint64_t)old);
+        size_t old=g_tas_frames.size();
+        TasPushTimelineUndo("Append 60 blank frames", (uint64_t)old);
+        g_tas_frames.resize(old+60);
+        g_tas_lag_flags.resize(g_tas_frames.size(),0);
+        g_tas_poll_counts.resize(g_tas_frames.size(), TasUnknownPollCounts());
+        TasMarkMovieEdited((uint64_t)old);
     }
     ImGui::SameLine();
     if (ImGui::Button("Insert frame")) {
-        int at=std::clamp(g_tas_selected_frame,0,(int)g_tas_frames.size()); TasPushUndo("Insert frame"); g_tas_frames.insert(g_tas_frames.begin()+at,TasFrame{});g_tas_lag_flags.insert(g_tas_lag_flags.begin()+at,0);TasSetSelection(at,false);TasMarkMovieEdited((uint64_t)at);
+        int at=std::clamp(g_tas_selected_frame,0,(int)g_tas_frames.size());
+        TasPushTimelineUndo("Insert frame", (uint64_t)at);
+        g_tas_frames.insert(g_tas_frames.begin()+at,TasFrame{});
+        g_tas_lag_flags.insert(g_tas_lag_flags.begin()+at,0);
+        g_tas_poll_counts.insert(g_tas_poll_counts.begin()+at,TasUnknownPollCounts());
+        TasSetSelection(at,false);
+        TasMarkMovieEdited((uint64_t)at);
     }
     ImGui::SameLine(); if(ImGui::Button("Analog Curves"))g_tas_curve_open=!g_tas_curve_open;
     ImGui::SameLine(); if(ImGui::Button("Save Pattern..."))TasSavePatternDialog();
@@ -3523,6 +5930,22 @@ static void DrawTasStudio()
     }
 
     ImGui::Separator();
+    const uint64_t transport_vm_frame = xemu_tas_frame();
+    const uint64_t transport_movie_frame = xemu_tas_playback()
+        ? xemu_tas_playback_frame() : transport_vm_frame;
+    ImGui::TextDisabled("Transport: VM %llu  |  Movie %llu  |  Selected %d",
+                        (unsigned long long)transport_vm_frame,
+                        (unsigned long long)transport_movie_frame,
+                        g_tas_selected_frame);
+    if (g_tas_seek_completion_pending) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("| reconstructing exact frame %llu...",
+                            (unsigned long long)g_tas_seek_continue_target);
+    } else if (g_tas_step_completion_pending) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("| stepping to exact frame %llu...",
+                            (unsigned long long)g_tas_step_completion_target);
+    }
     ImGui::TextUnformatted("Piano roll - frames run downward; mouse wheel scrolls back to frame 0");
 
     static const char *headers[20] = {
@@ -3587,6 +6010,7 @@ static void DrawTasStudio()
         const int visible_count = g_tas_hide_lag_frames
             ? (int)g_tas_visible_frame_cache.size()
             : (int)g_tas_frames.size();
+        auto visible_selection = TasSelectionBounds();
         ImGuiListClipper clipper;
         clipper.Begin(visible_count, row_h);
         while (clipper.Step()) {
@@ -3604,15 +6028,18 @@ static void DrawTasStudio()
                 ImGui::PushID(f);
                 char frame_text[32];
                 snprintf(frame_text, sizeof(frame_text), "%d", f);
-                auto bounds_now = TasSelectionBounds();
-                bool selected_range = f >= bounds_now.first && f <= bounds_now.second;
+                bool selected_range = f >= visible_selection.first &&
+                                      f <= visible_selection.second;
                 if (ImGui::Selectable(frame_text, selected_range,
                                       ImGuiSelectableFlags_None,
                                       ImVec2(0.0f, row_h - 2.0f))) {
                     TasSetSelection(f, ImGui::GetIO().KeyShift);
+                    // Keep later visible rows in this same frame consistent
+                    // without recomputing selection bounds for every row.
+                    visible_selection = TasSelectionBounds();
                 }
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    TasSeekFrame((uint64_t)f);
+                    TasSeekFrameEx((uint64_t)f, g_tas_double_click_continue);
                 }
 
                 ImGui::TableSetColumnIndex(1);
@@ -3792,18 +6219,29 @@ static void DrawTasStudio()
     }
 
     if (!g_tas_compact_ui) {
-        ImGui::TextDisabled("The roll is bounded by the current movie length. Follow TAS frame auto-scrolls downward as recording/playback appends frames; manual wheel scrolling disables Follow so frame 0 is always reachable. Shift-click frames selects a range; double-click a frame seeks through the greenzone.");
+        ImGui::TextDisabled("The roll is bounded by the current movie length. Follow TAS frame auto-scrolls downward as recording/playback appends frames; manual wheel scrolling disables Follow so frame 0 is always reachable. Shift-click frames selects a range; double-click seeks through the greenzone and either stops or continues according to the toolbar option.");
     } else {
-        ImGui::TextDisabled("Shift-click = range | double-click = seek | wheel = manual timeline scroll");
+        ImGui::TextDisabled(g_tas_double_click_continue
+            ? "Shift-click = range | double-click = seek + continue | wheel = manual timeline scroll"
+            : "Shift-click = range | double-click = seek + stop | wheel = manual timeline scroll");
     }
     ImGui::End();
 }
 
 static void DrawTasCompatibilityWindow()
 {
-    if (!g_tas_compatibility_open) return;
-    ImGui::SetNextWindowSize(ImVec2(640, 480), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("TAS Movie Compatibility", &g_tas_compatibility_open)) { ImGui::End(); return; }
+    static constexpr const char *kDetachId = "tas.compatibility";
+    xemu_feature_detach::Register(kDetachId, "TAS Movie Compatibility",
+                                  &g_tas_compatibility_open, DrawTasCompatibilityWindow);
+    if (!g_tas_compatibility_open || !xemu_feature_detach::ShouldDraw(kDetachId)) return;
+    if (xemu_feature_detach::IsDetachedPass(kDetachId)) {
+        xemu_feature_detach::PrepareWindow(kDetachId);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(640, 480), ImGuiCond_FirstUseEver);
+    }
+    if (!ImGui::Begin("TAS Movie Compatibility", &g_tas_compatibility_open,
+                      xemu_feature_detach::WindowFlags(kDetachId, 0))) { ImGui::End(); return; }
+    xemu_feature_detach::ObserveCurrentWindow(kDetachId);
     static std::vector<std::pair<std::string,bool>> checks;
     static std::chrono::steady_clock::time_point next_refresh{};
     const auto now = std::chrono::steady_clock::now();
@@ -3840,8 +6278,16 @@ static void DrawTasCompatibilityWindow()
 
 static void DrawTasHistoryWindow()
 {
-    if(!g_tas_history_open)return;
-    if(!ImGui::Begin("TAS Movie Backup History",&g_tas_history_open)){ImGui::End();return;}
+    static constexpr const char *kDetachId = "tas.history";
+    xemu_feature_detach::Register(kDetachId, "TAS Movie Backup History",
+                                  &g_tas_history_open, DrawTasHistoryWindow);
+    if(!g_tas_history_open || !xemu_feature_detach::ShouldDraw(kDetachId))return;
+    if (xemu_feature_detach::IsDetachedPass(kDetachId)) {
+        xemu_feature_detach::PrepareWindow(kDetachId);
+    }
+    if(!ImGui::Begin("TAS Movie Backup History",&g_tas_history_open,
+                     xemu_feature_detach::WindowFlags(kDetachId, 0))){ImGui::End();return;}
+    xemu_feature_detach::ObserveCurrentWindow(kDetachId);
     const auto &files = TasMovieHistoryFiles();
     if(files.empty())ImGui::TextDisabled("No backup history exists for the current movie yet.");
     for(size_t i=0;i<files.size();++i){ImGui::PushID((int)i);ImGui::TextUnformatted(files[i].filename().string().c_str());ImGui::SameLine();if(ImGui::Button("Load"))TasLoadMovieFromPath(files[i].string().c_str());ImGui::SameLine();if(ImGui::Button("Restore Over Current")&&!g_tas_movie_path.empty()){std::error_code ec;std::filesystem::copy_file(files[i],g_tas_movie_path,std::filesystem::copy_options::overwrite_existing,ec);if(!ec)TasLoadMovieFromPath(g_tas_movie_path.c_str());}ImGui::PopID();}
@@ -3850,9 +6296,18 @@ static void DrawTasHistoryWindow()
 
 static void DrawTasRamToolsWindow()
 {
-    if(!g_tas_ram_tools_open)return;
-    ImGui::SetNextWindowSize(ImVec2(860,620),ImGuiCond_FirstUseEver);
-    if(!ImGui::Begin("TAS RAM Watch / Search / RNG",&g_tas_ram_tools_open)){ImGui::End();return;}
+    static constexpr const char *kDetachId = "tas.ram-tools";
+    xemu_feature_detach::Register(kDetachId, "TAS RAM Watch / Search / RNG",
+                                  &g_tas_ram_tools_open, DrawTasRamToolsWindow);
+    if(!g_tas_ram_tools_open || !xemu_feature_detach::ShouldDraw(kDetachId))return;
+    if (xemu_feature_detach::IsDetachedPass(kDetachId)) {
+        xemu_feature_detach::PrepareWindow(kDetachId);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(860,620),ImGuiCond_FirstUseEver);
+    }
+    if(!ImGui::Begin("TAS RAM Watch / Search / RNG",&g_tas_ram_tools_open,
+                     xemu_feature_detach::WindowFlags(kDetachId, 0))){ImGui::End();return;}
+    xemu_feature_detach::ObserveCurrentWindow(kDetachId);
     ImGui::TextUnformatted("RAM Watches");
     ImGui::SetNextItemWidth(130);ImGui::InputScalar("Address",ImGuiDataType_U32,&g_tas_new_watch_address,nullptr,nullptr,"%08X",ImGuiInputTextFlags_CharsHexadecimal);ImGui::SameLine();const char *sizes[]={"8-bit","16-bit","32-bit","64-bit"};int si=g_tas_new_watch_size==1?0:g_tas_new_watch_size==2?1:g_tas_new_watch_size==4?2:3;ImGui::SetNextItemWidth(100);if(ImGui::Combo("Size",&si,sizes,4))g_tas_new_watch_size=1<<si;ImGui::SameLine();ImGui::SetNextItemWidth(180);ImGui::InputText("Label",g_tas_new_watch_label,sizeof(g_tas_new_watch_label));ImGui::SameLine();if(ImGui::Button("Add Watch")){TasRamWatch w;w.address=g_tas_new_watch_address;w.size=g_tas_new_watch_size;w.label=g_tas_new_watch_label[0]?g_tas_new_watch_label:"Watch";g_tas_ram_watches.push_back(std::move(w));}
     if(ImGui::BeginTable("##ramwatches",6,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,210))){
@@ -3994,17 +6449,21 @@ void DrawTasMenu()
             if (ImGui::MenuItem("Save Movie As...")) TasSaveMovieAs();
             ImGui::Separator();
             if (!xemu_tas_recording()) {
-                if (ImGui::MenuItem("Start Recording (Power-On)")) TasStartRecording(true);
-                if (ImGui::MenuItem("Start Recording (Current State)")) TasStartRecording(false);
+                if (ImGui::MenuItem("Record / Rerecord From Current Position")) TasStartContextualRecording();
+                if (ImGui::MenuItem("New Movie From Current State")) TasStartFreshRecordingFromCurrentState();
+                if (ImGui::MenuItem("Start Recording (Power-On / Reset)")) TasStartRecording(true);
             } else if (ImGui::MenuItem("Stop Recording")) {
                 xemu_tas_stop_recording();
                 TasSyncRecordingFromCore();
                 TasAutosaveRecovery(true);
             }
+            if (ImGui::MenuItem("Play Movie From Beginning")) {
+                TasPlayMovieFromBeginning();
+            }
             if (!xemu_tas_playback()) {
                 if (ImGui::MenuItem("Play From Selected Frame")) TasStartPlayback((uint64_t)g_tas_selected_frame);
             } else if (ImGui::MenuItem("Stop Playback")) {
-                xemu_tas_stop_playback();
+                TasStopPlaybackFromUi();
             }
             ImGui::Separator();
             ImGui::Text("Frame: %llu   Lag: %llu", (unsigned long long)xemu_tas_frame(),
@@ -4012,6 +6471,8 @@ void DrawTasMenu()
             if (ImGui::MenuItem("Frame Advance")) TasAdvanceFrames(1);
             if (ImGui::MenuItem("Frame Advance - Skip Lag")) TasAdvanceFrames(1, true);
             if (ImGui::MenuItem("Advance 10 Frames")) TasAdvanceFrames(10);
+            if (ImGui::MenuItem("Advance 60 Frames")) TasAdvanceFrames(60);
+            if (ImGui::MenuItem("Advance 300 Frames")) TasAdvanceFrames(300);
             if (ImGui::MenuItem("Go To Frame...")) {
                 g_tas_goto_frame_value = g_tas_selected_frame;
                 g_tas_goto_dialog_requested = true;
@@ -4022,7 +6483,10 @@ void DrawTasMenu()
             if (ImGui::MenuItem("Rewind Cache", NULL, g_tas_rewind_enabled)) {
                 g_tas_rewind_enabled = !g_tas_rewind_enabled;
             }
+            if (ImGui::MenuItem("Rewind 1 Frame")) TasRewindFrames(1);
+            if (ImGui::MenuItem("Rewind 10 Frames")) TasRewindFrames(10);
             if (ImGui::MenuItem("Rewind 60 Frames")) TasRewindFrames(60);
+            if (ImGui::MenuItem("Rewind 300 Frames")) TasRewindFrames(300);
             if (ImGui::MenuItem("Greenzone Cache", NULL, g_tas_greenzone_enabled)) g_tas_greenzone_enabled = !g_tas_greenzone_enabled;
             if (ImGui::MenuItem("Seek To Selected Frame")) TasSeekFrame((uint64_t)g_tas_selected_frame);
             ImGui::Separator();
@@ -4039,8 +6503,8 @@ void DrawTasMenu()
             if (ImGui::MenuItem("TAS HUD Overlay", NULL, g_tas_hud_enabled)) g_tas_hud_enabled = !g_tas_hud_enabled;
             ImGui::Separator();
             ImGui::TextDisabled(deterministic
-                ? "Deterministic boundary: Xbox guest VBLANK (experimental)."
-                : "Deterministic TAS Mode is available above.");
+                ? "Strict Sync: canonical VBLANK checkpoints; Fast Forward locked off."
+                : "Strict Sync / Deterministic TAS is available above.");
             ImGui::EndMenu();
         }
 }
@@ -4055,20 +6519,32 @@ void ShowTasWindows()
     const bool ui_active = TasWindowsOpen() || g_tas_hud_enabled ||
                            g_tas_goto_dialog_requested;
     const bool maintenance_active =
-        !g_tas_snapshot_delete_queue.empty() ||
-        g_tas_verify_mode != TasVerifyMode::Idle || g_tas_rng_watch >= 0;
+        !g_tas_snapshot_delete_queue.empty() || g_tas_seek_continue_pending ||
+        g_tas_seek_completion_pending || xemu_tas_seek_catchup() ||
+        g_tas_step_completion_pending || g_tas_verify_mode != TasVerifyMode::Idle ||
+        g_tas_power_on_reset_pending || g_tas_rng_watch >= 0 ||
+        g_tas_timeline_mutation.active || g_tas_branch_switch.active ||
+        g_tas_pending_overdub_start.active;
     if (!runtime_active && !ui_active && !maintenance_active) {
         return;
     }
 
     /* Recording/playback bookkeeping must continue even with TAS Studio closed. */
+    TasPowerOnResetTick();
     TasSyncRecordingFromCore();
     TasUpdateRewindCache();
     TasServiceDeferredSnapshotDeletes();
+    TasStrictResimTick();
+    TasSeekContinueTick();
+    TasFrameStepCompletionTick();
+    TasCheckCoreDesync();
     TasVerifierTick();
     TasUpdateRamWatches();
     TasCheckRecoveryNotice();
     DrawTasStudio();
+    /* Commit atomic editor transactions only after the Studio has drawn, so an
+     * active analog drag remains paused until the user releases the control. */
+    TasTimelineMutationTick();
     DrawTasInputDisplay();
     DrawTasGoToFrameDialog();
     DrawTasCompatibilityWindow();
@@ -4079,41 +6555,7 @@ void ShowTasWindows()
 
 void FeatureTasDrawGeneralSettings()
 {
-    SectionTitle("TAS Tools (Experimental)");
-
-    bool tas_enabled = xemu_tas_enabled();
-    if (Toggle("Enable TAS mode", &tas_enabled,
-               "Enable the additive TAS core. Normal Xemu features, including "
-               "Fast Forward, remain available. Host controller input is only "
-               "bypassed on a port when TAS playback explicitly injects an "
-               "exact Xbox XID report.")) {
-        xemu_tas_set_enabled(tas_enabled);
-    }
-
-    ImGui::Text("TAS frame: %llu",
-                (unsigned long long)xemu_tas_frame());
-
-    uint8_t xid[20];
-    if (xemu_tas_get_last_xid_report(0, xid, sizeof(xid))) {
-        uint16_t buttons;
-        int16_t lx, ly, rx, ry;
-        memcpy(&buttons, &xid[2], sizeof(buttons));
-        memcpy(&lx, &xid[12], sizeof(lx));
-        memcpy(&ly, &xid[14], sizeof(ly));
-        memcpy(&rx, &xid[16], sizeof(rx));
-        memcpy(&ry, &xid[18], sizeof(ry));
-        ImGui::Text("Port 1 XID: buttons=%04X  LT=%u RT=%u",
-                    buttons, xid[10], xid[11]);
-        ImGui::Text("A=%u B=%u X=%u Y=%u Black=%u White=%u",
-                    xid[4], xid[5], xid[6], xid[7], xid[8], xid[9]);
-        ImGui::Text("LX=%d LY=%d  RX=%d RY=%d", lx, ly, rx, ry);
-    } else {
-        ImGui::TextDisabled("Port 1 XID: waiting for first guest poll");
-    }
-
-    ImGui::TextWrapped(
-        "Milestone 1 uses guest Xbox VBLANK as the canonical frame boundary "
-        "and provides exact 20-byte XID report injection/capture. Deterministic "
-        "frame advance, movie recording/playback, state hashing, and TAS Studio "
-        "build on this isolated core.");
+    // TAS configuration and status now live exclusively under the TAS menu.
+    // Keep the existing native General hook neutral so no duplicate TAS block
+    // appears in Settings.
 }

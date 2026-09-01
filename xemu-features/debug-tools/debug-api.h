@@ -40,6 +40,28 @@ typedef struct XemuDbgInsn {
     bool     valid;      /* false when the address is unmapped or undecodable */
 } XemuDbgInsn;
 
+/* Feature-owned description of the latest guest-debug stop.  This lets the
+ * scripting feature wait for breakpoint/watchpoint hits without reaching into
+ * QEMU internals or requiring a remote GDB connection. */
+enum {
+    XEMU_DBG_STOP_NONE = 0,
+    XEMU_DBG_STOP_BREAKPOINT = 1,
+    XEMU_DBG_STOP_WATCHPOINT = 2,
+    XEMU_DBG_STOP_STEP = 3,
+    XEMU_DBG_STOP_DEBUG = 4,
+};
+
+typedef struct XemuDbgStopEvent {
+    uint64_t sequence;
+    uint32_t pc;
+    uint32_t address;
+    uint32_t length;
+    int flags;
+    int type;
+    bool physical;
+    bool valid;
+} XemuDbgStopEvent;
+
 /* True when capstone was compiled in. The window says so rather than
  * silently showing nothing. */
 bool xemu_dbg_have_disasm(void);
@@ -57,17 +79,29 @@ bool xemu_dbg_set_reg(const char *name, uint32_t value);
  */
 int xemu_dbg_disasm(uint32_t addr, int count, XemuDbgInsn *out);
 
-/* Execution breakpoints (guest virtual address). */
+/*
+ * Execution breakpoints. The legacy helpers are guest-virtual. The *_space
+ * variants also accept a physical RAM address when virt=false; Xemu arms all
+ * currently mapped virtual aliases of that physical byte.
+ */
 bool xemu_dbg_bp_insert(uint32_t addr);
 bool xemu_dbg_bp_remove(uint32_t addr);
+bool xemu_dbg_bp_insert_space(uint32_t addr, bool virt);
+bool xemu_dbg_bp_remove_space(uint32_t addr, bool virt);
 
 /*
  * Data watchpoints. `flags` is BP_MEM_READ (1), BP_MEM_WRITE (2) or both (3).
- * This is the facility that located the Morrowind invert flag from outside;
- * in-tree it needs no gdbstub at all.
+ * Virtual watchpoints use QEMU's CPU watchpoint facility. Physical watchpoints
+ * use Xemu's Xbox RAM access callback path, so every CPU virtual alias of
+ * that RAM address is watched; host-side tools and device DMA are ignored.
+ * They are not merely translated once to a VA.
  */
 bool xemu_dbg_wp_insert(uint32_t addr, uint32_t len, int flags);
 bool xemu_dbg_wp_remove(uint32_t addr, uint32_t len, int flags);
+bool xemu_dbg_wp_insert_space(uint32_t addr, uint32_t len, int flags,
+                              bool virt);
+bool xemu_dbg_wp_remove_space(uint32_t addr, uint32_t len, int flags,
+                              bool virt);
 
 /*
  * Address space. The Xbox maps its XBE through page tables, so the same byte
@@ -104,6 +138,10 @@ bool xemu_dbg_is_running(void);
 void xemu_dbg_pause(void);
 void xemu_dbg_resume(void);
 void xemu_dbg_step(void);
+
+/* Return the most recent guest-debug stop and a monotonically increasing
+ * sequence number.  `valid` is false until the first EXCP_DEBUG stop. */
+bool xemu_dbg_get_stop_event(XemuDbgStopEvent *event);
 
 #ifdef __cplusplus
 }

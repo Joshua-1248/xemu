@@ -16,3 +16,8 @@ CORE/FRONTEND INTEGRATION SITES:
 - root meson.build — conditional debug-api.c and shared guest-memory.
 
 See README.md for API, dependencies, threading, hot-path and disabled behavior.
+
+FEATURES #5 ADDITIONS:
+- xemu-features/debug-tools/function-index.cc/.hh — function/symbol/xref index.
+- Optional handoff through xemu-features/cheats/debug-bridge.hh when Cheats is enabled.
+- Reserved Type F remains untouched; debugger-generated cheats use existing 8/9/A writes.

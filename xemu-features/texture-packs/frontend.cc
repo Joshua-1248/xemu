@@ -83,6 +83,109 @@ void FeatureTexturePacksDrawSettings()
                "Load replacement textures from the replacements directory")) {
         xemu_texture_packs_rebuild_replacement_index();
     }
+
+    XemuTexturePacksMaterialConfig material_cfg;
+    xemu_texture_packs_get_material_config(&material_cfg);
+    bool material_changed = false;
+    bool material_binding_change = false;
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Replacement Material Enhancement");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Defaults##material")) {
+        material_cfg.flip_normal_y = false;
+        material_cfg.normal_strength = 1.0f;
+        material_cfg.ambient_strength = 0.20f;
+        material_cfg.diffuse_strength = 1.00f;
+        material_cfg.specular_strength = 0.35f;
+        material_cfg.specular_power = 32.0f;
+        material_cfg.parallax_scale = 0.02f;
+        material_cfg.ao_strength = 1.00f;
+        material_cfg.light_mode =
+            XEMU_TEXTURE_PACKS_MATERIAL_LIGHT_HEADLIGHT;
+        material_cfg.light_dir[0] = 0.35f;
+        material_cfg.light_dir[1] = -0.35f;
+        material_cfg.light_dir[2] = 0.87f;
+        material_changed = true;
+    }
+
+    if (Toggle("Enable material-map enhancement", &material_cfg.enabled,
+               "Apply game-agnostic enhancement lighting to replacement textures using optional _n/_s/_d/_ao sidecars")) {
+        material_changed = true;
+        material_binding_change = true;
+    }
+
+    if (material_cfg.enabled) {
+        ImGui::Indent();
+
+        int light_mode = material_cfg.light_mode;
+        if (ImGui::Combo("Light mode", &light_mode,
+                         "Camera-reactive headlight\0Directional\0")) {
+            material_cfg.light_mode = light_mode;
+            material_changed = true;
+        }
+
+        if (ImGui::SliderFloat("Normal strength", &material_cfg.normal_strength,
+                               0.0f, 4.0f, "%.2f")) {
+            material_changed = true;
+        }
+        if (ImGui::SliderFloat("Ambient", &material_cfg.ambient_strength,
+                               0.0f, 2.0f, "%.2f")) {
+            material_changed = true;
+        }
+        if (ImGui::SliderFloat("Diffuse", &material_cfg.diffuse_strength,
+                               0.0f, 4.0f, "%.2f")) {
+            material_changed = true;
+        }
+        if (ImGui::SliderFloat("Specular", &material_cfg.specular_strength,
+                               0.0f, 4.0f, "%.2f")) {
+            material_changed = true;
+        }
+        if (ImGui::SliderFloat("Gloss power", &material_cfg.specular_power,
+                               1.0f, 128.0f, "%.1f")) {
+            material_changed = true;
+        }
+        if (ImGui::SliderFloat("Parallax scale", &material_cfg.parallax_scale,
+                               0.0f, 0.10f, "%.3f")) {
+            material_changed = true;
+        }
+        if (ImGui::SliderFloat("AO strength", &material_cfg.ao_strength,
+                               0.0f, 1.0f, "%.2f")) {
+            material_changed = true;
+        }
+
+        bool flip_y = material_cfg.flip_normal_y;
+        if (Toggle("Flip normal Y (OpenGL-style maps)", &flip_y,
+                   "Enable this when a normal map looks inverted because its green channel was authored for OpenGL instead of DirectX")) {
+            material_cfg.flip_normal_y = flip_y;
+            material_changed = true;
+        }
+
+        if (material_cfg.light_mode == XEMU_TEXTURE_PACKS_MATERIAL_LIGHT_DIRECTIONAL) {
+            if (ImGui::SliderFloat("Light X", &material_cfg.light_dir[0],
+                                   -1.0f, 1.0f, "%.2f")) {
+                material_changed = true;
+            }
+            if (ImGui::SliderFloat("Light Y", &material_cfg.light_dir[1],
+                                   -1.0f, 1.0f, "%.2f")) {
+                material_changed = true;
+            }
+            if (ImGui::SliderFloat("Light Z", &material_cfg.light_dir[2],
+                                   -1.0f, 1.0f, "%.2f")) {
+                material_changed = true;
+            }
+        }
+
+        ImGui::Unindent();
+    }
+
+    if (material_changed) {
+        xemu_texture_packs_set_material_config(&material_cfg);
+        if (material_binding_change) {
+            g_reload_pending = true;
+        }
+    }
+
     if (Toggle("Skip already-replaced textures when dumping",
                &g_config.general.texture_dump_skip_replaced,
                "Do not dump textures that already have a replacement")) {

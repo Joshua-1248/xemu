@@ -43,6 +43,7 @@ bool xemu_texture_packs_vk_binding_has_shader(TextureBinding *binding);
 void xemu_texture_packs_vk_binding_dimensions(TextureBinding *binding,
                                               uint32_t *width, uint32_t *height);
 uint32_t xemu_texture_packs_vk_binding_mip_levels(TextureBinding *binding);
+bool xemu_texture_packs_vk_bound_hash(void *pgraph, int stage, uint64_t *out_hash);
 #else
 static inline void xemu_texture_packs_vk_plan(XemuTexturePacksVKPlan *plan, uint64_t hash,
                                               int dimensionality, bool cubemap,
@@ -79,5 +80,7 @@ static inline void xemu_texture_packs_vk_binding_dimensions(TextureBinding *bind
 { (void)binding; if (width) *width = 0; if (height) *height = 0; }
 static inline uint32_t xemu_texture_packs_vk_binding_mip_levels(TextureBinding *binding)
 { (void)binding; return 0; }
+static inline bool xemu_texture_packs_vk_bound_hash(void *pgraph, int stage, uint64_t *out_hash)
+{ (void)pgraph; (void)stage; if (out_hash) *out_hash = 0; return false; }
 #endif
 #endif

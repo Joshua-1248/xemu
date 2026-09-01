@@ -15,3 +15,8 @@ CORE/FRONTEND INTEGRATION SITES:
 - root meson.build — includes xemu-features/shared/guest-memory.c only when tooling that needs guest memory is enabled.
 
 See README.md for API, dependencies, threading, hot-path and disabled behavior.
+
+FEATURES #5 OPTIONAL DEBUGGER INTEGRATION:
+- xemu-features/cheats/debug-bridge.hh — neutral Debug Tools -> Cheats handoff.
+- `[ASM]` leaf cheats journal original bytes and restore them on disable.
+- Reserved Type F remains unchanged/unimplemented.

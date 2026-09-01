@@ -1,8 +1,12 @@
-Shared guest-memory service
+Shared optional-tool services
 
 COPY WHEN NEEDED BY: cheats, TAS, scripting, or debug-tools.
 FILES:
   xemu-features/shared/guest-memory.c
   xemu-features/shared/guest-memory.h
+  xemu-features/shared/detachable-windows.hh
 BUILD INTEGRATION:
-  root meson.build conditional specific_ss source inclusion.
+  guest-memory: root meson.build conditional specific_ss source inclusion.
+  detachable-windows: header-only; compiled only by feature translation units
+  that opt into native detachable-window hosting. No native Xemu/QEMU source
+  or Meson change is required.

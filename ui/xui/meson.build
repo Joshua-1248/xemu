@@ -55,6 +55,7 @@ if get_option('xemu_feature_scripting')
 endif
 if get_option('xemu_feature_debug_tools')
   xemu_ss.add(files(
+    '../../xemu-features/debug-tools/function-index.cc',
     '../../xemu-features/debug-tools/disassembler.cc',
     '../../xemu-features/debug-tools/frontend.cc',
   ))

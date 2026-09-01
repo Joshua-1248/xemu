@@ -16,8 +16,19 @@
 #include "xemu-features/texture-packs/texture-packs.h"
 #include "xemu-features/texture-packs/texture-packs-gl.h"
 
-#include <glib/gstdio.h>
 #include "hw/xbox/nv2a/pgraph/gl/renderer.h"
+
+enum {
+    MATERIAL_MAP_NORMAL = 0,
+    MATERIAL_MAP_SPECULAR,
+    MATERIAL_MAP_DISPLACEMENT,
+    MATERIAL_MAP_AO,
+    MATERIAL_MAP_COUNT,
+};
+
+static const char *const material_map_variants[MATERIAL_MAP_COUNT] = {
+    "n", "s", "d", "ao",
+};
 
 typedef struct XemuTexturePacksGLBindingState {
     TextureBinding *binding;
@@ -36,6 +47,26 @@ typedef struct XemuTexturePacksGLBindingState {
     GLint shader_u_frame;
     GLint shader_u_has_channel0;
     GLint shader_u_channel0;
+    GLuint shader_material_map[MATERIAL_MAP_COUNT];
+    bool shader_has_material_map[MATERIAL_MAP_COUNT];
+    GLint shader_u_material_map[MATERIAL_MAP_COUNT];
+    GLint shader_u_has_material_map[MATERIAL_MAP_COUNT];
+    GLint shader_u_material_light_mode;
+    GLint shader_u_material_normal_strength;
+    GLint shader_u_material_ambient_strength;
+    GLint shader_u_material_diffuse_strength;
+    GLint shader_u_material_specular_strength;
+    GLint shader_u_material_specular_power;
+    GLint shader_u_material_parallax_scale;
+    GLint shader_u_material_ao_strength;
+    GLint shader_u_material_flip_normal_y;
+    GLint shader_u_material_light_dir;
+    GLint shader_u_material_view_dir;
+    bool shader_builtin_material;
+    uint64_t shader_material_revision;
+    uint64_t shader_light_revision;
+    bool shader_light_dirty;
+    float shader_view_light_dir[3];
     int shader_width;
     int shader_height;
     int shader_frame;
@@ -43,16 +74,62 @@ typedef struct XemuTexturePacksGLBindingState {
     bool shader_src_animated;
     int shader_src_frame;
     uint64_t shader_hash;
-    int64_t shader_mtime;
+    XemuTexturePacksFileStamp shader_stamp;
+    bool shader_stamp_valid;
     int64_t shader_check_us;
+    bool timed_registered;
+    guint timed_index;
 } XemuTexturePacksGLBindingState;
 
 static GHashTable *gl_binding_states;
+static GPtrArray *gl_timed_states;
 
 static XemuTexturePacksGLBindingState *gl_binding_state_lookup(TextureBinding *binding)
 {
     return gl_binding_states != NULL ?
         g_hash_table_lookup(gl_binding_states, binding) : NULL;
+}
+
+static bool gl_state_needs_timed_refresh(
+    const XemuTexturePacksGLBindingState *state)
+{
+    return state != NULL &&
+           (state->is_animated ||
+            (state->has_shader &&
+             (!state->shader_builtin_material || state->shader_src_animated)));
+}
+
+static void gl_timed_state_register(XemuTexturePacksGLBindingState *state)
+{
+    if (!gl_state_needs_timed_refresh(state) || state->timed_registered) {
+        return;
+    }
+    if (gl_timed_states == NULL) {
+        gl_timed_states = g_ptr_array_new();
+    }
+    state->timed_index = gl_timed_states->len;
+    state->timed_registered = true;
+    g_ptr_array_add(gl_timed_states, state);
+}
+
+static void gl_timed_state_unregister(XemuTexturePacksGLBindingState *state)
+{
+    if (!state || !state->timed_registered || gl_timed_states == NULL) {
+        return;
+    }
+    guint index = state->timed_index;
+    guint last = gl_timed_states->len - 1;
+    XemuTexturePacksGLBindingState *moved =
+        g_ptr_array_index(gl_timed_states, last);
+    g_ptr_array_remove_index_fast(gl_timed_states, index);
+    state->timed_registered = false;
+    if (index != last && moved != NULL) {
+        moved->timed_index = index;
+    }
+    if (gl_timed_states->len == 0) {
+        g_ptr_array_free(gl_timed_states, TRUE);
+        gl_timed_states = NULL;
+    }
 }
 
 static XemuTexturePacksGLBindingState *gl_binding_state_create(TextureBinding *binding)
@@ -63,11 +140,29 @@ static XemuTexturePacksGLBindingState *gl_binding_state_create(TextureBinding *b
     XemuTexturePacksGLBindingState *state = g_new0(XemuTexturePacksGLBindingState, 1);
     state->binding = binding;
     state->anim_frame = 0;
+    state->shader_view_light_dir[0] = 0.0f;
+    state->shader_view_light_dir[1] = 0.0f;
+    state->shader_view_light_dir[2] = 1.0f;
     state->shader_u_time = -1;
     state->shader_u_resolution = -1;
     state->shader_u_frame = -1;
     state->shader_u_has_channel0 = -1;
     state->shader_u_channel0 = -1;
+    for (int i = 0; i < MATERIAL_MAP_COUNT; i++) {
+        state->shader_u_material_map[i] = -1;
+        state->shader_u_has_material_map[i] = -1;
+    }
+    state->shader_u_material_light_mode = -1;
+    state->shader_u_material_normal_strength = -1;
+    state->shader_u_material_ambient_strength = -1;
+    state->shader_u_material_diffuse_strength = -1;
+    state->shader_u_material_specular_strength = -1;
+    state->shader_u_material_specular_power = -1;
+    state->shader_u_material_parallax_scale = -1;
+    state->shader_u_material_ao_strength = -1;
+    state->shader_u_material_flip_normal_y = -1;
+    state->shader_u_material_light_dir = -1;
+    state->shader_u_material_view_dir = -1;
     state->shader_last_us = INT64_MIN;
     state->shader_check_us = INT64_MIN;
     g_hash_table_insert(gl_binding_states, binding, state);
@@ -276,23 +371,103 @@ static const char *texture_shader_fs_prologue =
     "uniform int iFrame;\n"
     "uniform sampler2D iChannel0;\n"
     "uniform bool iHasChannel0;\n"
+    "uniform sampler2D iNormalMap;\n"
+    "uniform sampler2D iSpecularMap;\n"
+    "uniform sampler2D iDisplacementMap;\n"
+    "uniform sampler2D iAOMap;\n"
+    "uniform bool iHasNormalMap;\n"
+    "uniform bool iHasSpecularMap;\n"
+    "uniform bool iHasDisplacementMap;\n"
+    "uniform bool iHasAOMap;\n"
+    "uniform int xemuMaterialLightMode;\n"
+    "uniform float xemuMaterialNormalStrength;\n"
+    "uniform float xemuMaterialAmbientStrength;\n"
+    "uniform float xemuMaterialDiffuseStrength;\n"
+    "uniform float xemuMaterialSpecularStrength;\n"
+    "uniform float xemuMaterialSpecularPower;\n"
+    "uniform float xemuMaterialParallaxScale;\n"
+    "uniform float xemuMaterialAOStrength;\n"
+    "uniform int xemuMaterialFlipNormalY;\n"
+    "uniform vec3 xemuMaterialLightDir;\n"
+    "uniform vec3 xemuMaterialViewDir;\n"
     "#line 1\n";
 
+static const char *builtin_material_shader_body =
+    "vec3 xemu_fetch_normal(vec2 t) {\n"
+    "    if (!iHasNormalMap) {\n"
+    "        return vec3(0.0, 0.0, 1.0);\n"
+    "    }\n"
+    "    vec3 n = texture(iNormalMap, t).xyz * 2.0 - 1.0;\n"
+    "    if (xemuMaterialFlipNormalY != 0) {\n"
+    "        n.y = -n.y;\n"
+    "    }\n"
+    "    n.xy *= xemuMaterialNormalStrength;\n"
+    "    return normalize(vec3(n.xy, max(n.z, 0.0001)));\n"
+    "}\n"
+    "vec3 xemu_safe_dir(vec3 v) {\n"
+    "    float len2 = dot(v, v);\n"
+    "    return len2 > 0.000001 ? v * inversesqrt(len2) : vec3(0.0, 0.0, 1.0);\n"
+    "}\n"
+    "vec2 xemu_parallax_uv(vec2 baseUV, vec3 viewTS) {\n"
+    "    if (!iHasDisplacementMap || xemuMaterialParallaxScale <= 0.0) {\n"
+    "        return baseUV;\n"
+    "    }\n"
+    "    float vz = max(viewTS.z, 0.06);\n"
+    "    float grazingFade = smoothstep(0.055, 0.22, viewTS.z);\n"
+    "    float layers = mix(16.0, 8.0, clamp(viewTS.z, 0.0, 1.0));\n"
+    "    float layerDepth = 1.0 / layers;\n"
+    "    vec2 ray = (viewTS.xy / vz) * (xemuMaterialParallaxScale * grazingFade);\n"
+    "    vec2 delta = ray / layers;\n"
+    "    vec2 tc = baseUV;\n"
+    "    float currentLayer = 0.0;\n"
+    "    float surfaceDepth = 1.0 - texture(iDisplacementMap, tc).r;\n"
+    "    for (int i = 0; i < 16; ++i) {\n"
+    "        if (float(i) >= layers || currentLayer >= surfaceDepth) {\n"
+    "            break;\n"
+    "        }\n"
+    "        tc -= delta;\n"
+    "        currentLayer += layerDepth;\n"
+    "        surfaceDepth = 1.0 - texture(iDisplacementMap, tc).r;\n"
+    "    }\n"
+    "    vec2 prevTC = tc + delta;\n"
+    "    float after = surfaceDepth - currentLayer;\n"
+    "    float beforeDepth = 1.0 - texture(iDisplacementMap, prevTC).r;\n"
+    "    float before = beforeDepth - (currentLayer - layerDepth);\n"
+    "    float denom = after - before;\n"
+    "    float weight = abs(denom) > 0.00001 ? clamp(after / denom, 0.0, 1.0) : 0.0;\n"
+    "    return mix(tc, prevTC, weight);\n"
+    "}\n"
+    "void main() {\n"
+    "    vec3 viewTS = xemu_safe_dir(xemuMaterialViewDir);\n"
+    "    viewTS.z = max(viewTS.z, 0.0001);\n"
+    "    viewTS = xemu_safe_dir(viewTS);\n"
+    "    vec3 lightTS = xemu_safe_dir(xemuMaterialLightDir);\n"
+    "    vec2 t = xemu_parallax_uv(uv, viewTS);\n"
+    "    vec4 base = iHasChannel0 ? texture(iChannel0, t) : vec4(1.0);\n"
+    "    vec3 n = xemu_fetch_normal(t);\n"
+    "    float ao = 1.0;\n"
+    "    if (iHasAOMap) {\n"
+    "        ao = mix(1.0, texture(iAOMap, t).r, clamp(xemuMaterialAOStrength, 0.0, 1.0));\n"
+    "    }\n"
+    "    float ndotl = max(dot(n, lightTS), 0.0);\n"
+    "    float lighting = xemuMaterialAmbientStrength + xemuMaterialDiffuseStrength * ndotl;\n"
+    "    float specMask = iHasSpecularMap ? texture(iSpecularMap, t).r : 0.0;\n"
+    "    vec3 halfTS = normalize(lightTS + viewTS);\n"
+    "    float spec = 0.0;\n"
+    "    if (specMask > 0.0 && xemuMaterialSpecularStrength > 0.0) {\n"
+    "        spec = pow(max(dot(n, halfTS), 0.0), max(xemuMaterialSpecularPower, 1.0)) * specMask * xemuMaterialSpecularStrength;\n"
+    "    }\n"
+    "    vec3 color = base.rgb * lighting * ao + vec3(spec);\n"
+    "    fragColor = vec4(clamp(color, 0.0, 1.0), base.a);\n"
+    "}\n";
+
 /*
- * Compile a user shader. Errors are reported once, at load, and leave the
- * binding without a shader rather than failing the texture entirely -- a bad
- * shader file should not stop the game from rendering.
+ * Compile a fragment shader body against the shared texture-shader prologue.
+ * User-authored .shader files and the built-in material-enhancement shader
+ * both use this path.
  */
-static GLuint compile_texture_shader(const char *path)
+static GLuint compile_texture_shader_body(const char *label, const char *body)
 {
-    g_autofree char *body = NULL;
-    gsize body_len = 0;
-
-    if (!g_file_get_contents(path, &body, &body_len, NULL)) {
-        fprintf(stderr, "nv2a: texture-io: could not read shader %s\n", path);
-        return 0;
-    }
-
     g_autofree char *fs_src =
         g_strconcat(texture_shader_fs_prologue, body, NULL);
 
@@ -311,8 +486,9 @@ static GLuint compile_texture_shader(const char *path)
 
     if (ok != GL_TRUE) {
         glGetShaderInfoLog(fs, sizeof(log), NULL, log);
-        fprintf(stderr, "nv2a: texture-io: shader %s failed to compile:\n%s\n",
-                path, log);
+        fprintf(stderr,
+                "nv2a: texture-io: shader %s failed to compile:\n%s\n",
+                label, log);
         glDeleteShader(vs);
         glDeleteShader(fs);
         return 0;
@@ -329,14 +505,28 @@ static GLuint compile_texture_shader(const char *path)
 
     if (ok != GL_TRUE) {
         glGetProgramInfoLog(program, sizeof(log), NULL, log);
-        fprintf(stderr, "nv2a: texture-io: shader %s failed to link:\n%s\n",
-                path, log);
+        fprintf(stderr,
+                "nv2a: texture-io: shader %s failed to link:\n%s\n",
+                label, log);
         glDeleteProgram(program);
         return 0;
     }
 
-    fprintf(stderr, "nv2a: texture-io: loaded shader %s\n", path);
+    fprintf(stderr, "nv2a: texture-io: loaded shader %s\n", label);
     return program;
+}
+
+static GLuint compile_texture_shader(const char *path)
+{
+    g_autofree char *body = NULL;
+    gsize body_len = 0;
+
+    if (!g_file_get_contents(path, &body, &body_len, NULL)) {
+        fprintf(stderr, "nv2a: texture-io: could not read shader %s\n", path);
+        return 0;
+    }
+
+    return compile_texture_shader_body(path, body);
 }
 
 static void cache_texture_shader_uniforms(XemuTexturePacksGLBindingState *state)
@@ -351,6 +541,111 @@ static void cache_texture_shader_uniforms(XemuTexturePacksGLBindingState *state)
         glGetUniformLocation(state->shader_program, "iHasChannel0");
     state->shader_u_channel0 =
         glGetUniformLocation(state->shader_program, "iChannel0");
+
+    static const char *const sampler_names[MATERIAL_MAP_COUNT] = {
+        "iNormalMap", "iSpecularMap", "iDisplacementMap", "iAOMap",
+    };
+    static const char *const present_names[MATERIAL_MAP_COUNT] = {
+        "iHasNormalMap", "iHasSpecularMap", "iHasDisplacementMap",
+        "iHasAOMap",
+    };
+    for (int i = 0; i < MATERIAL_MAP_COUNT; i++) {
+        state->shader_u_material_map[i] =
+            glGetUniformLocation(state->shader_program, sampler_names[i]);
+        state->shader_u_has_material_map[i] =
+            glGetUniformLocation(state->shader_program, present_names[i]);
+    }
+    state->shader_u_material_light_mode =
+        glGetUniformLocation(state->shader_program, "xemuMaterialLightMode");
+    state->shader_u_material_normal_strength =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialNormalStrength");
+    state->shader_u_material_ambient_strength =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialAmbientStrength");
+    state->shader_u_material_diffuse_strength =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialDiffuseStrength");
+    state->shader_u_material_specular_strength =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialSpecularStrength");
+    state->shader_u_material_specular_power =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialSpecularPower");
+    state->shader_u_material_parallax_scale =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialParallaxScale");
+    state->shader_u_material_ao_strength =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialAOStrength");
+    state->shader_u_material_flip_normal_y =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialFlipNormalY");
+    state->shader_u_material_light_dir =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialLightDir");
+    state->shader_u_material_view_dir =
+        glGetUniformLocation(state->shader_program,
+                             "xemuMaterialViewDir");
+}
+
+static GLuint create_shader_material_map(uint64_t hash, const char *variant,
+                                         bool *out_present)
+{
+    int width = 0, height = 0;
+    const uint8_t *src = NULL;
+    uint8_t *pixels = NULL;
+    uint8_t fallback[4] = { 0, 0, 0, 255 };
+
+    bool animated = xemu_texture_packs_replacement_is_animated(hash, variant);
+    if (animated) {
+        src = xemu_texture_packs_animated_frame_pixels(
+            hash, variant, 0, &width, &height);
+    } else {
+        pixels = xemu_texture_packs_load_replacement_rgba_variant(
+            hash, variant, &width, &height);
+        src = pixels;
+    }
+
+    *out_present = src != NULL && width > 0 && height > 0;
+    if (!*out_present) {
+        width = 1;
+        height = 1;
+        if (strcmp(variant, "n") == 0) {
+            fallback[0] = 128;
+            fallback[1] = 128;
+            fallback[2] = 255;
+        } else if (strcmp(variant, "d") == 0) {
+            fallback[0] = fallback[1] = fallback[2] = 128;
+        } else if (strcmp(variant, "ao") == 0) {
+            fallback[0] = fallback[1] = fallback[2] = 255;
+        }
+        src = fallback;
+    }
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, src);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+    if (pixels != NULL) {
+        xemu_texture_packs_free_pixels(pixels);
+    }
+    return tex;
+}
+
+static bool has_builtin_material_shader(uint64_t hash)
+{
+    return xemu_texture_packs_material_enhancement_enabled() &&
+           xemu_texture_packs_material_sidecars_present(hash);
 }
 
 /*
@@ -362,11 +657,19 @@ static void setup_texture_shader(XemuTexturePacksGLBindingState *state, uint64_t
                                  int guest_width, int guest_height)
 {
     const char *path = xemu_texture_packs_get_shader_path(hash, NULL);
-    if (path == NULL) {
-        return;
+    bool builtin_material = has_builtin_material_shader(hash);
+    GLuint program = 0;
+
+    /* Material Enhancement is an explicit UI mode. When enabled and a
+     * material sidecar exists, it must win over a legacy per-texture .shader
+     * or the UI controls would appear to do nothing. */
+    if (builtin_material) {
+        program = compile_texture_shader_body("<built-in material enhancer>",
+                                              builtin_material_shader_body);
+    } else if (path != NULL) {
+        program = compile_texture_shader(path);
     }
 
-    GLuint program = compile_texture_shader(path);
     if (program == 0) {
         return;
     }
@@ -432,6 +735,11 @@ static void setup_texture_shader(XemuTexturePacksGLBindingState *state, uint64_t
         }
     }
 
+    for (int i = 0; i < MATERIAL_MAP_COUNT; i++) {
+        state->shader_material_map[i] = create_shader_material_map(
+            hash, material_map_variants[i], &state->shader_has_material_map[i]);
+    }
+
     /* Allocate the render target at the chosen size. */
     glBindTexture(GL_TEXTURE_2D, state->binding->gl_texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
@@ -460,10 +768,19 @@ static void setup_texture_shader(XemuTexturePacksGLBindingState *state, uint64_t
         if (src_tex) {
             glDeleteTextures(1, &src_tex);
         }
+        for (int i = 0; i < MATERIAL_MAP_COUNT; i++) {
+            if (state->shader_material_map[i]) {
+                glDeleteTextures(1, &state->shader_material_map[i]);
+                state->shader_material_map[i] = 0;
+            }
+            state->shader_has_material_map[i] = false;
+        }
         return;
     }
 
     state->has_shader = true;
+    state->shader_builtin_material = builtin_material;
+    state->shader_material_revision = 0;
     state->shader_program = program;
     cache_texture_shader_uniforms(state);
     state->shader_fbo = fbo;
@@ -476,8 +793,8 @@ static void setup_texture_shader(XemuTexturePacksGLBindingState *state, uint64_t
     state->shader_src_frame = 0;
     state->shader_hash = hash;
 
-    GStatBuf st;
-    state->shader_mtime = (g_stat(path, &st) == 0) ? (int64_t)st.st_mtime : 0;
+    state->shader_stamp_valid =
+        path != NULL && xemu_texture_packs_get_file_stamp(path, &state->shader_stamp);
     state->shader_check_us = INT64_MIN;
 }
 
@@ -488,14 +805,14 @@ static void setup_texture_shader(XemuTexturePacksGLBindingState *state, uint64_t
  * error while editing leaves the last working shader on screen (with the
  * error logged) instead of blanking the texture.
  *
- * The file is stat'd at most a few times a second: this runs from the
- * per-bind sweep, and stat'ing per draw call would be its own performance
- * problem.
+ * File metadata is checked at most a few times a second: this runs from the
+ * per-bind sweep, and doing filesystem work per draw call would be its own
+ * performance problem.
  */
 static void reload_texture_shader_if_changed(XemuTexturePacksGLBindingState *state,
                                              int64_t now_us)
 {
-    if (!state->has_shader) {
+    if (!state->has_shader || state->shader_builtin_material) {
         return;
     }
 
@@ -512,16 +829,21 @@ static void reload_texture_shader_if_changed(XemuTexturePacksGLBindingState *sta
         return;
     }
 
-    GStatBuf st;
-    if (g_stat(path, &st) != 0) {
+    XemuTexturePacksFileStamp stamp;
+    if (!xemu_texture_packs_get_file_stamp(path, &stamp)) {
         return;
     }
 
-    int64_t mtime = (int64_t)st.st_mtime;
-    if (mtime == state->shader_mtime) {
+    if (state->shader_stamp_valid &&
+        xemu_texture_packs_file_stamp_equal(&stamp, &state->shader_stamp)) {
         return;
     }
-    state->shader_mtime = mtime;
+
+    /* Record the observed save before compiling. A broken edit is therefore
+     * tried once, while the next actual save (including a rapid same-second
+     * save) gets a new high-resolution stamp and retries immediately. */
+    state->shader_stamp = stamp;
+    state->shader_stamp_valid = true;
 
     GLuint program = compile_texture_shader(path);
     if (program == 0) {
@@ -543,6 +865,82 @@ static void reload_texture_shader_if_changed(XemuTexturePacksGLBindingState *sta
  * Refresh an animated iChannel0 before the shader samples it, so a .shader
  * paired with a .gif/.webp distorts live frames instead of a frozen one.
  */
+static void apply_material_shader_uniforms(
+    XemuTexturePacksGLBindingState *state)
+{
+    XemuTexturePacksMaterialConfig cfg;
+    xemu_texture_packs_get_material_config(&cfg);
+
+    if (state->shader_u_material_light_mode >= 0) {
+        glUniform1i(state->shader_u_material_light_mode, cfg.light_mode);
+    }
+    if (state->shader_u_material_normal_strength >= 0) {
+        glUniform1f(state->shader_u_material_normal_strength,
+                    cfg.normal_strength);
+    }
+    if (state->shader_u_material_ambient_strength >= 0) {
+        glUniform1f(state->shader_u_material_ambient_strength,
+                    cfg.ambient_strength);
+    }
+    if (state->shader_u_material_diffuse_strength >= 0) {
+        glUniform1f(state->shader_u_material_diffuse_strength,
+                    cfg.diffuse_strength);
+    }
+    if (state->shader_u_material_specular_strength >= 0) {
+        glUniform1f(state->shader_u_material_specular_strength,
+                    cfg.specular_strength);
+    }
+    if (state->shader_u_material_specular_power >= 0) {
+        glUniform1f(state->shader_u_material_specular_power,
+                    cfg.specular_power);
+    }
+    if (state->shader_u_material_parallax_scale >= 0) {
+        glUniform1f(state->shader_u_material_parallax_scale,
+                    cfg.parallax_scale);
+    }
+    if (state->shader_u_material_ao_strength >= 0) {
+        glUniform1f(state->shader_u_material_ao_strength,
+                    cfg.ao_strength);
+    }
+    if (state->shader_u_material_flip_normal_y >= 0) {
+        glUniform1i(state->shader_u_material_flip_normal_y,
+                    cfg.flip_normal_y ? 1 : 0);
+    }
+    if (state->shader_u_material_light_dir >= 0) {
+        const float *dir = cfg.light_mode ==
+                XEMU_TEXTURE_PACKS_MATERIAL_LIGHT_HEADLIGHT
+            ? state->shader_view_light_dir : cfg.light_dir;
+        glUniform3f(state->shader_u_material_light_dir,
+                    dir[0], dir[1], dir[2]);
+    }
+    if (state->shader_u_material_view_dir >= 0) {
+        glUniform3f(state->shader_u_material_view_dir,
+                    state->shader_view_light_dir[0],
+                    state->shader_view_light_dir[1],
+                    state->shader_view_light_dir[2]);
+    }
+}
+
+static bool update_material_hash_light(XemuTexturePacksGLBindingState *state)
+{
+    if (state == NULL || !state->shader_builtin_material) {
+        return false;
+    }
+
+    float dir[3];
+    uint64_t revision = 0;
+    xemu_texture_packs_material_get_hash_view_light(
+        state->shader_hash, dir, &revision);
+    if (revision == 0 || revision == state->shader_light_revision) {
+        return false;
+    }
+
+    memcpy(state->shader_view_light_dir, dir, sizeof(dir));
+    state->shader_light_revision = revision;
+    state->shader_light_dirty = true;
+    return true;
+}
+
 static void refresh_shader_source(XemuTexturePacksGLBindingState *state, int64_t now_us)
 {
     if (!state->shader_src_animated || state->shader_src == 0) {
@@ -563,12 +961,21 @@ static void refresh_shader_source(XemuTexturePacksGLBindingState *state, int64_t
         return;
     }
 
+    /* The caller has already snapshotted texture-unit state and selected unit
+     * 0. Preserve pixel-store state too: the NV2A upload path may rely on
+     * non-default unpack settings after this helper returns. */
+    GLint prev_unpack_row_length = 0;
+    GLint prev_unpack_alignment = 0;
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &prev_unpack_row_length);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_unpack_alignment);
+
     glBindTexture(GL_TEXTURE_2D, state->shader_src);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, sw, sh, GL_RGBA,
                     GL_UNSIGNED_BYTE, pixels);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, prev_unpack_row_length);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_alignment);
 
     state->shader_src_frame = frame;
 }
@@ -590,37 +997,83 @@ static void render_texture_shader(XemuTexturePacksGLBindingState *state, int64_t
         return;
     }
 
-    /* ~60Hz. INT64_MIN on a fresh binding forces the first render. */
-    if (state->shader_last_us != INT64_MIN &&
-        now_us >= state->shader_last_us &&
-        (now_us - state->shader_last_us) < 16000) {
+    /* ~60Hz for time-driven shaders, but material controls must refresh
+     * immediately even when QEMU_CLOCK_VIRTUAL is stopped by a paused UI. */
+    uint64_t material_revision =
+        state->shader_builtin_material ?
+            xemu_texture_packs_material_config_revision() : 0;
+    bool material_changed = state->shader_builtin_material &&
+        material_revision != state->shader_material_revision;
+
+    if (state->shader_builtin_material) {
+        bool needs_render = material_changed || state->shader_light_dirty ||
+                            state->shader_src_animated;
+        if (!needs_render) {
+            return;
+        }
+        /* Camera light is draw-synchronous. Do not add a 16 ms throttle to a
+         * real camera/config change: differently oriented draws may reuse the
+         * same replacement hash and each must be able to refresh before it is
+         * sampled. Only a purely time-driven animated source keeps the shader
+         * rate cap. */
+        if (!material_changed && !state->shader_light_dirty &&
+            state->shader_src_animated && state->shader_last_us != INT64_MIN &&
+            now_us >= state->shader_last_us &&
+            (now_us - state->shader_last_us) < 16000) {
+            return;
+        }
+    } else if (state->shader_last_us != INT64_MIN &&
+               now_us >= state->shader_last_us &&
+               (now_us - state->shader_last_us) < 16000) {
         return;
     }
     state->shader_last_us = now_us;
 
-    /* Live iChannel0 before sampling it. */
-    refresh_shader_source(state, now_us);
-
     /* --- save state --- */
     GLint prev_fbo = 0, prev_program = 0, prev_vao = 0, prev_active = 0;
     GLint prev_viewport[4];
+    GLint prev_texture_binding[1 + MATERIAL_MAP_COUNT] = { 0 };
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_fbo);
     glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
     glGetIntegerv(GL_VIEWPORT, prev_viewport);
+    for (int i = 0; i < 1 + MATERIAL_MAP_COUNT; i++) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_texture_binding[i]);
+    }
+    glActiveTexture(prev_active);
 
     GLboolean prev_depth = glIsEnabled(GL_DEPTH_TEST);
     GLboolean prev_blend = glIsEnabled(GL_BLEND);
     GLboolean prev_cull = glIsEnabled(GL_CULL_FACE);
     GLboolean prev_scissor = glIsEnabled(GL_SCISSOR_TEST);
     GLboolean prev_stencil = glIsEnabled(GL_STENCIL_TEST);
+    GLboolean prev_rasterizer_discard = glIsEnabled(GL_RASTERIZER_DISCARD);
+    GLboolean prev_framebuffer_srgb = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+    GLboolean prev_color_mask[4];
+    GLint prev_polygon_mode[2];
+    glGetBooleanv(GL_COLOR_WRITEMASK, prev_color_mask);
+    glGetIntegerv(GL_POLYGON_MODE, prev_polygon_mode);
 
+    /* This helper can run immediately before a guest geometry draw. Do not
+     * inherit that draw's channel mask, wireframe mode, rasterizer discard or
+     * framebuffer-sRGB state into the material prepass. */
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_STENCIL_TEST);
+    glDisable(GL_RASTERIZER_DISCARD);
+    glDisable(GL_FRAMEBUFFER_SRGB);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+    /* Live iChannel0 before sampling it. Do this only after the renderer's
+     * texture-unit bindings have been captured; otherwise glBindTexture()
+     * would overwrite the current NV2A unit before we knew what to restore. */
+    glActiveTexture(GL_TEXTURE0);
+    refresh_shader_source(state, now_us);
 
     /* --- render --- */
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state->shader_fbo);
@@ -638,6 +1091,15 @@ static void render_texture_shader(XemuTexturePacksGLBindingState *state, int64_t
     glBindTexture(GL_TEXTURE_2D, state->shader_src);
     glUniform1i(state->shader_u_channel0, 0);
 
+    for (int i = 0; i < MATERIAL_MAP_COUNT; i++) {
+        glActiveTexture(GL_TEXTURE1 + i);
+        glBindTexture(GL_TEXTURE_2D, state->shader_material_map[i]);
+        glUniform1i(state->shader_u_material_map[i], 1 + i);
+        glUniform1i(state->shader_u_has_material_map[i],
+                    state->shader_has_material_map[i] ? 1 : 0);
+    }
+    apply_material_shader_uniforms(state);
+
     /*
      * A VAO is required by core profile even when the vertex shader reads no
      * attributes. One is kept for the lifetime of the process rather than
@@ -651,6 +1113,10 @@ static void render_texture_shader(XemuTexturePacksGLBindingState *state, int64_t
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     state->shader_frame++;
+    if (state->shader_builtin_material) {
+        state->shader_material_revision = material_revision;
+        state->shader_light_dirty = false;
+    }
 
     /* --- restore state --- */
     glBindVertexArray(prev_vao);
@@ -659,14 +1125,49 @@ static void render_texture_shader(XemuTexturePacksGLBindingState *state, int64_t
     glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2],
                prev_viewport[3]);
 
+    glColorMask(prev_color_mask[0], prev_color_mask[1],
+                prev_color_mask[2], prev_color_mask[3]);
+    glPolygonMode(GL_FRONT, prev_polygon_mode[0]);
+    glPolygonMode(GL_BACK, prev_polygon_mode[1]);
     if (prev_depth) glEnable(GL_DEPTH_TEST);
     if (prev_blend) glEnable(GL_BLEND);
     if (prev_cull) glEnable(GL_CULL_FACE);
     if (prev_scissor) glEnable(GL_SCISSOR_TEST);
     if (prev_stencil) glEnable(GL_STENCIL_TEST);
+    if (prev_rasterizer_discard) glEnable(GL_RASTERIZER_DISCARD);
+    if (prev_framebuffer_srgb) glEnable(GL_FRAMEBUFFER_SRGB);
 
+    for (int i = 0; i < 1 + MATERIAL_MAP_COUNT; i++) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)prev_texture_binding[i]);
+    }
     glActiveTexture(prev_active);
-    glBindTexture(GL_TEXTURE_2D, state->binding->gl_texture);
+}
+
+static void refresh_material_stage_for_draw(void *opaque, int stage,
+                                            uint64_t hash)
+{
+    PGRAPHState *pg = opaque;
+    if (pg == NULL || pg->gl_renderer_state == NULL || hash == 0 ||
+        stage < 0 || stage >= NV2A_MAX_TEXTURES) {
+        return;
+    }
+
+    /* GL binds the NV2A textures at BEGIN, before the draw's complete vertex
+     * data is available to the geometry observer. At END the observer now has
+     * the correct per-draw TBN, so refresh exactly the binding that stage will
+     * sample before pgraph_gl_flush_draw() issues the geometry draw. */
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    TextureBinding *binding = r->texture_binding[stage];
+    XemuTexturePacksGLBindingState *state = gl_binding_state_lookup(binding);
+    if (state == NULL || !state->has_shader || !state->shader_builtin_material ||
+        state->shader_hash != hash) {
+        return;
+    }
+
+    if (update_material_hash_light(state)) {
+        render_texture_shader(state, xemu_texture_packs_anim_now_us());
+    }
 }
 
 static void refresh_animated_state(XemuTexturePacksGLBindingState *state, int64_t now_us)
@@ -725,9 +1226,11 @@ static void refresh_animated_state(XemuTexturePacksGLBindingState *state, int64_
 
 void xemu_texture_packs_gl_refresh_dynamic(void)
 {
-    if (!xemu_texture_packs_dynamic_enabled() ||
-        gl_binding_states == NULL ||
-        g_hash_table_size(gl_binding_states) == 0) {
+    /* Only states with genuine time/file-driven work live in this compact
+     * array. Static built-in material bindings are refreshed by exact draw
+     * binding/config events and never participate in the 250 Hz sweep. */
+    if (!xemu_texture_packs_dynamic_enabled() || gl_timed_states == NULL ||
+        gl_timed_states->len == 0) {
         return;
     }
 
@@ -739,21 +1242,41 @@ void xemu_texture_packs_gl_refresh_dynamic(void)
     }
     last_refresh_us = now_us;
 
-    GHashTableIter iter;
-    gpointer value;
-    g_hash_table_iter_init(&iter, gl_binding_states);
-    while (g_hash_table_iter_next(&iter, NULL, &value)) {
-        XemuTexturePacksGLBindingState *state = value;
+    for (guint i = 0; i < gl_timed_states->len; ++i) {
+        XemuTexturePacksGLBindingState *state =
+            g_ptr_array_index(gl_timed_states, i);
         if (state->is_animated) {
             refresh_animated_state(state, now_us);
         }
         if (state->has_shader) {
             reload_texture_shader_if_changed(state, now_us);
+            (void)update_material_hash_light(state);
             render_texture_shader(state, now_us);
         }
     }
 }
 
+
+
+bool xemu_texture_packs_gl_bound_hash(void *opaque, int stage,
+                                      uint64_t *out_hash)
+{
+    if (out_hash) {
+        *out_hash = 0;
+    }
+    PGRAPHState *pg = opaque;
+    if (!pg || !out_hash || stage < 0 || stage >= NV2A_MAX_TEXTURES ||
+        !pg->gl_renderer_state) {
+        return false;
+    }
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    TextureBinding *binding = r->texture_binding[stage];
+    if (!binding) {
+        return false;
+    }
+    *out_hash = binding->data_hash;
+    return true;
+}
 
 void xemu_texture_packs_gl_binding_created(TextureBinding *binding,
                                            uint64_t hash,
@@ -762,13 +1285,21 @@ void xemu_texture_packs_gl_binding_created(TextureBinding *binding,
                                            bool animated,
                                            bool animated_has_mips)
 {
+    /* GL texture binding occurs at NV097 BEGIN, before complete geometry for
+     * the draw exists. Register the feature-owned END-time refresh callback so
+     * the geometry observer can update exactly this draw before flush_draw. */
+    xemu_texture_packs_material_set_draw_refresh_callback(
+        refresh_material_stage_for_draw);
     const char *shader_path = NULL;
+    bool builtin_material = false;
     if (xemu_texture_packs_replace_enabled() && hash != 0 &&
         binding->gl_target == GL_TEXTURE_2D) {
         shader_path = xemu_texture_packs_get_shader_path(hash, NULL);
+        builtin_material = xemu_texture_packs_material_enhancement_enabled() &&
+            xemu_texture_packs_material_sidecars_present(hash);
     }
 
-    if (!animated && shader_path == NULL) {
+    if (!animated && shader_path == NULL && !builtin_material) {
         return;
     }
 
@@ -779,12 +1310,15 @@ void xemu_texture_packs_gl_binding_created(TextureBinding *binding,
     state->anim_frame = 0;
     state->anim_has_mips = animated && animated_has_mips;
 
-    if (shader_path != NULL) {
+    if (shader_path != NULL || builtin_material) {
         setup_texture_shader(state, hash, guest_width, guest_height);
         if (state->has_shader) {
+            (void)update_material_hash_light(state);
             render_texture_shader(state, xemu_texture_packs_anim_now_us());
         }
     }
+
+    gl_timed_state_register(state);
 
     if (!state->is_animated && !state->has_shader) {
         g_hash_table_remove(gl_binding_states, binding);
@@ -803,6 +1337,7 @@ void xemu_texture_packs_gl_binding_destroy(TextureBinding *binding)
         return;
     }
 
+    gl_timed_state_unregister(state);
     g_free(state->anim_variant);
     if (state->shader_fbo) {
         glDeleteFramebuffers(1, &state->shader_fbo);
@@ -812,6 +1347,11 @@ void xemu_texture_packs_gl_binding_destroy(TextureBinding *binding)
     }
     if (state->shader_src) {
         glDeleteTextures(1, &state->shader_src);
+    }
+    for (int i = 0; i < MATERIAL_MAP_COUNT; i++) {
+        if (state->shader_material_map[i]) {
+            glDeleteTextures(1, &state->shader_material_map[i]);
+        }
     }
 
     g_hash_table_remove(gl_binding_states, binding);
@@ -844,7 +1384,21 @@ void xemu_texture_packs_gl_refresh_binding(TextureBinding *binding)
         return;
     }
     XemuTexturePacksGLBindingState *state = gl_binding_state_lookup(binding);
-    if (state != NULL && state->is_animated) {
+    if (state == NULL) {
+        return;
+    }
+
+    if (state->is_animated) {
         refresh_animated_state(state, xemu_texture_packs_anim_now_us());
+    }
+    if (state->has_shader && state->shader_builtin_material) {
+        (void)update_material_hash_light(state);
+        uint64_t config_revision = xemu_texture_packs_material_config_revision();
+        if (state->shader_light_dirty ||
+            state->shader_material_revision != config_revision) {
+            /* Configuration is rare and draw-synchronous light updates are
+             * handled again at END. Acquire time only when a render is needed. */
+            render_texture_shader(state, xemu_texture_packs_anim_now_us());
+        }
     }
 }

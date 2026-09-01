@@ -2,26 +2,7 @@
 
 ## Purpose
 
-Cheat/patch database parsing, UI, and optimized runtime execution, including the
-custom Type-6 pointer format with 1–255 offsets.
-
-## Source lineage and license
-
-The native C++ interpreter/parser in this directory is a port of Joshua-1248's
-earlier Python project:
-
-- <https://github.com/Joshua-1248/Xemu-Cheat-Engine-and-Trainer>
-- `xemu_trainer_lib/codes.py` is the principal source/reference for
-  `codes-engine.cc`;
-- `xemu_trainer_lib/cheatfiles.py` is the principal source/reference for
-  `cheatfile.cc`;
-- the source project is licensed under the **MIT License**.
-
-The Python package itself is not bundled with this xemu fork. The native C++
-implementation is distributed here under **GPL-2.0-or-later**, while the MIT
-source provenance and notice are retained in `licenses/xemu_trainer_lib.license.txt`,
-`THIRD_PARTY_NOTICES.md`, `CREDITS.md`, and the source comments of the ported
-files.
+Cheat/patch database parsing, UI and optimized runtime execution, including the custom Type-6 pointer format with 1–255 offsets.
 
 ## Build gate
 
@@ -31,9 +12,7 @@ files.
 
 ## Public API
 
-`runtime.hh` is the generic frontend tick boundary. `codes.hh`,
-`codes-engine.hh`, and `cheatfile.hh` contain the feature implementation and
-editor/parser interfaces.
+`runtime.hh` is the generic frontend tick boundary. `codes.hh`, `codes-engine.hh` and `cheatfile.hh` contain the feature implementation and editor/parser interfaces.
 
 ## Files owned
 
@@ -43,43 +22,83 @@ editor/parser interfaces.
 - `codes-engine.hh`
 - `codes.cc`
 - `codes.hh`
+- `debug-bridge.hh`
 - `runtime.cc`
 - `runtime.hh`
 
-## Exact xemu hook sites
+## Exact Xemu hook sites
 
 - `ui/xui/main.cc` — one `FeatureCodesTick()` runtime hook.
 - `ui/xui/meson.build` — conditional frontend/engine source inclusion.
-- root `meson.build` — includes `xemu-features/shared/guest-memory.c` only when
-  tooling that needs guest memory is enabled.
+- root `meson.build` — includes `xemu-features/shared/guest-memory.c` only when tooling that needs guest memory is enabled.
 
 ## Dependencies
 
-Uses the shared guest-memory service and existing XBE/title/settings/UI helpers.
-It does not require TAS, scripting, debug tools, audio, texture, or fast forward.
+Uses the shared guest-memory service and existing XBE/title/settings/UI helpers. It does not require TAS, scripting, debug tools, audio, texture or fast forward.
 
 ## Threading model
 
-Runs through the existing frontend/BQL integration. No dedicated feature worker
-thread is created.
+Runs through the existing frontend/BQL integration. No dedicated feature worker thread is created.
 
 ## Hot-path behavior
 
-Compiled enabled blocks, page caching, generation invalidation, and lightweight
-title polling keep the active path bounded. If codes are disabled in settings,
-the runtime returns immediately.
+Compiled enabled blocks, page caching, generation invalidation and lightweight title polling keep the active path bounded. If codes are disabled in settings the runtime returns immediately.
 
 ## Build-disabled behavior
 
-Cheat engine/editor/runtime translation units are omitted. The UI tick hook is
-an inline no-op; shared guest-memory is also omitted unless another enabled tool
-requires it.
+Cheat engine/editor/runtime translation units are omitted. The UI tick hook is an inline no-op; shared guest-memory is also omitted unless another enabled tool requires it.
 
 ## Porting only this feature
 
-Copy `xemu-features/cheats/` and `xemu-features/shared/guest-memory.*`, wire the
-single UI tick and Meson option, retain the settings schema used by the feature,
-and preserve the `xemu_trainer_lib` MIT provenance above.
+Copy `xemu-features/cheats/` and `xemu-features/shared/guest-memory.*`, wire the single UI tick and Meson option, and retain the settings schema used by the feature.
 
-The neutral public-header contract should be retained when porting so unrelated
-core code does not need `#ifdef` forests.
+The neutral public-header contract should be retained when porting so unrelated core code does not need `#ifdef` forests.
+
+## `[ASM]` patch ownership / debugger handoff (Features #5)
+
+A cheat whose leaf name ends in `[ASM]` keeps using the existing cheat-code
+interpreter and existing write types. It gains reversible patch semantics:
+
+- Original guest physical bytes are captured once, immediately before that
+  `[ASM]` block first writes them.
+- Re-applying the block does not overwrite the saved originals.
+- Disabling the individual `[ASM]` cheat restores those original bytes
+  immediately.
+- Disabling the entire Codes feature restores all active `[ASM]` journals.
+- A same-title reload restores active patches before rebuilding node IDs.
+- A transient XBE-identification miss stops applying codes but does not destroy
+  restore data; a positively identified different title invalidates it.
+
+`debug-bridge.hh` is the optional Debug Tools -> Cheats boundary used by the
+in-Xemu debugger's **Save ASM Cheat** action. The debugger hands over ordinary
+existing command/value pairs (currently virtual write types 8/9/A) only after
+it has restored its temporary live patch, so this feature records the real
+pre-patch bytes as the restore image.
+
+**Reserved Type F is unchanged.** The bridge neither generates nor assigns any
+new meaning to Type F.
+
+## In-Xemu individual cheat/group editor (Features #5)
+
+The Cheats and Patches panes now keep the existing raw **Edit entire .txt**
+editor while also exposing tree-level editing directly in Xemu:
+
+- Add a cheat/patch at the top level.
+- Add a group at the top level.
+- Right-click a group to add a cheat or nested group inside it.
+- Edit a cheat/patch name, author, description, enabled state and code lines.
+- Move a cheat/patch between groups by changing its group path.
+- Rename groups.
+- Duplicate cheats, patches or whole groups. Duplicates intentionally start
+  disabled so a copy cannot immediately double-apply a freeze or `[ASM]` patch.
+- Delete cheats, patches or groups (with confirmation); deleting a group also
+  deletes its contents.
+
+All edits are serialized immediately through the existing atomic `.txt`
+writer. Individual code-line parsing uses the same two-hex-value shape as the
+trainer (`COMMAND VALUE`) but reports invalid lines instead of silently dropping
+them. Missing group paths entered in the individual editor are created on save.
+
+Active `[ASM]` nodes are restored before an edit or deletion changes their node
+identity/content, then an edited enabled `[ASM]` node is re-applied through the
+normal feature-owned journal path. Reserved Type F remains unchanged.

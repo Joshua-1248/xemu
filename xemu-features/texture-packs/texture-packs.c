@@ -14,15 +14,24 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "hw/xbox/nv2a/nv2a_regs.h"
 
 #include <glib.h>
 #include <glib/gstdio.h>
+#include <math.h>
+#ifdef G_OS_WIN32
+#include <windows.h>
+#endif
 
 #include "xemu-xbe.h"
 #include "ui/xemu-settings.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
 #include "xemu-features/texture-packs/texture-packs.h"
+#include "xemu-features/texture-packs/texture-packs-gl.h"
+#include "xemu-features/texture-packs/texture-packs-vk.h"
+#include "xemu-features/geometry-dumper/geometry-dumper.h"
 
 /*
  * PNG encode/decode.
@@ -53,6 +62,108 @@
 
 static XemuTexturePacksBackend g_backend = XEMU_TEXTURE_PACKS_BACKEND_NONE;
 
+static bool g_has_material_sidecars;
+/* Renderer-hot summaries. Configuration mutation remains mutex protected, but
+ * draw paths must not take that mutex merely to discover whether the feature
+ * is enabled or whether camera-dependent material state is needed. */
+static int g_material_enabled_hot;
+static int g_material_needs_view_hot;
+static int g_material_sidecars_hot;
+/* Hash-only membership set built with the replacement index. Camera tracking
+ * hits this on the draw hot path, so sidecar presence must never require
+ * opening/probing image files. */
+static GHashTable *g_material_sidecar_hashes;
+static uint64_t g_material_config_revision = 1;
+
+typedef struct XemuTexturePacksMaterialLightState {
+    float dir[3];
+    uint64_t revision;
+} XemuTexturePacksMaterialLightState;
+
+/* Camera-reactive light state is keyed by the actual replacement texture
+ * hash, never by NV2A texture stage. Stages 0-3 are transient routing slots
+ * and are reused by unrelated draws; using them as persistent material keys
+ * caused stale directions, popping, and "reload fixes it" behavior. */
+static GHashTable *g_material_hash_lights;
+static uint64_t g_material_light_revision = 1;
+static XemuTexturePacksMaterialDrawRefreshFn g_material_draw_refresh;
+
+static XemuTexturePacksMaterialConfig g_material_config = {
+    .enabled = false,
+    .flip_normal_y = false,
+    .normal_strength = 1.0f,
+    .ambient_strength = 0.20f,
+    .diffuse_strength = 1.00f,
+    .specular_strength = 0.35f,
+    .specular_power = 32.0f,
+    .parallax_scale = 0.02f,
+    .ao_strength = 1.00f,
+    .light_mode = XEMU_TEXTURE_PACKS_MATERIAL_LIGHT_HEADLIGHT,
+    .light_dir = { 0.35f, -0.35f, 0.87f },
+};
+
+static QemuMutex g_material_config_lock;
+static gsize g_material_config_lock_once;
+
+static void material_config_lock_init(void)
+{
+    if (g_once_init_enter(&g_material_config_lock_once)) {
+        qemu_mutex_init(&g_material_config_lock);
+        g_once_init_leave(&g_material_config_lock_once, 1);
+    }
+}
+
+static float clampf_feature(float v, float lo, float hi)
+{
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+static void material_hash_lights_clear(void)
+{
+    if (g_material_hash_lights != NULL) {
+        g_hash_table_remove_all(g_material_hash_lights);
+    }
+    g_material_light_revision++;
+    if (g_material_light_revision == 0) {
+        g_material_light_revision = 1;
+    }
+}
+
+static XemuTexturePacksMaterialLightState *material_hash_light_lookup(
+    uint64_t hash, bool create)
+{
+    if (hash == 0) {
+        return NULL;
+    }
+    if (g_material_hash_lights == NULL) {
+        if (!create) {
+            return NULL;
+        }
+        g_material_hash_lights = g_hash_table_new_full(
+            g_int64_hash, g_int64_equal, g_free, g_free);
+    }
+
+    XemuTexturePacksMaterialLightState *state =
+        g_hash_table_lookup(g_material_hash_lights, &hash);
+    if (state != NULL || !create) {
+        return state;
+    }
+
+    uint64_t *key = g_new(uint64_t, 1);
+    *key = hash;
+    state = g_new0(XemuTexturePacksMaterialLightState, 1);
+    state->dir[2] = 1.0f;
+    state->revision = 0;
+    g_hash_table_insert(g_material_hash_lights, key, state);
+    return state;
+}
+
 bool xemu_texture_packs_dump_enabled(void)
 {
     return g_config.general.texture_dump_enabled;
@@ -77,17 +188,317 @@ bool xemu_texture_packs_should_dump_level(unsigned int level)
 bool xemu_texture_packs_dynamic_enabled(void)
 {
     return xemu_texture_packs_replace_enabled() &&
-           xemu_texture_packs_has_dynamic_replacements();
+           (xemu_texture_packs_has_dynamic_replacements() ||
+            (xemu_texture_packs_material_enhancement_enabled() &&
+             g_has_material_sidecars));
 }
 
 void xemu_texture_packs_set_backend(XemuTexturePacksBackend backend)
 {
     g_backend = backend;
+    /* Backend adapters re-register any draw-synchronous callback after their
+     * resources are initialized. Never carry a GL callback across a renderer
+     * switch into Vulkan (or vice versa). */
+    g_material_draw_refresh = NULL;
+
+    /* Feature-owned renderer integration point. Texture cache setup happens
+     * during the active PGRAPH renderer init, after pg->renderer is selected.
+     * Geometry dumping uses that moment to install a copied/wrapped renderer
+     * descriptor without modifying upstream GL/Vulkan/PGRAPH source. */
+    xemu_geometry_dumper_renderer_ready();
 }
 
 XemuTexturePacksBackend xemu_texture_packs_get_backend(void)
 {
     return g_backend;
+}
+
+void xemu_texture_packs_get_material_config(
+    XemuTexturePacksMaterialConfig *out_config)
+{
+    if (out_config == NULL) {
+        return;
+    }
+    material_config_lock_init();
+    qemu_mutex_lock(&g_material_config_lock);
+    *out_config = g_material_config;
+    qemu_mutex_unlock(&g_material_config_lock);
+}
+
+void xemu_texture_packs_set_material_config(
+    const XemuTexturePacksMaterialConfig *config)
+{
+    if (config == NULL) {
+        return;
+    }
+
+    material_config_lock_init();
+    qemu_mutex_lock(&g_material_config_lock);
+    g_material_config = *config;
+    g_material_config.normal_strength =
+        clampf_feature(g_material_config.normal_strength, 0.0f, 8.0f);
+    g_material_config.ambient_strength =
+        clampf_feature(g_material_config.ambient_strength, 0.0f, 4.0f);
+    g_material_config.diffuse_strength =
+        clampf_feature(g_material_config.diffuse_strength, 0.0f, 4.0f);
+    g_material_config.specular_strength =
+        clampf_feature(g_material_config.specular_strength, 0.0f, 4.0f);
+    g_material_config.specular_power =
+        clampf_feature(g_material_config.specular_power, 1.0f, 256.0f);
+    g_material_config.parallax_scale =
+        clampf_feature(g_material_config.parallax_scale, 0.0f, 0.25f);
+    g_material_config.ao_strength =
+        clampf_feature(g_material_config.ao_strength, 0.0f, 1.0f);
+    for (int i = 0; i < 3; i++) {
+        g_material_config.light_dir[i] =
+            clampf_feature(g_material_config.light_dir[i], -1.0f, 1.0f);
+    }
+    if (g_material_config.light_mode !=
+            XEMU_TEXTURE_PACKS_MATERIAL_LIGHT_DIRECTIONAL) {
+        g_material_config.light_mode =
+            XEMU_TEXTURE_PACKS_MATERIAL_LIGHT_HEADLIGHT;
+    }
+    uint64_t revision = qatomic_read(&g_material_config_revision) + 1;
+    if (revision == 0) {
+        revision = 1;
+    }
+    qatomic_set(&g_material_config_revision, revision);
+
+    const bool needs_view =
+        g_material_config.light_mode == XEMU_TEXTURE_PACKS_MATERIAL_LIGHT_HEADLIGHT ||
+        g_material_config.parallax_scale > 0.0f ||
+        g_material_config.specular_strength > 0.0f;
+    /* Publish only after the clamped configuration is complete. */
+    qatomic_set(&g_material_needs_view_hot, needs_view);
+    qatomic_set(&g_material_enabled_hot, g_material_config.enabled);
+    qemu_mutex_unlock(&g_material_config_lock);
+}
+
+uint64_t xemu_texture_packs_material_config_revision(void)
+{
+    return qatomic_read(&g_material_config_revision);
+}
+
+bool xemu_texture_packs_material_enhancement_enabled(void)
+{
+    return qatomic_read(&g_material_enabled_hot) != 0;
+}
+
+bool xemu_texture_packs_material_camera_tracking_needed(void)
+{
+    /* The per-draw tangent-space camera direction is needed not only by the
+     * camera-headlight mode, but also by view-dependent parallax and specular
+     * evaluation. These summaries are publication-only hints; full settings
+     * reads still use the mutex-protected snapshot API. */
+    return xemu_texture_packs_replace_enabled() &&
+           qatomic_read(&g_material_enabled_hot) != 0 &&
+           qatomic_read(&g_material_needs_view_hot) != 0 &&
+           qatomic_read(&g_material_sidecars_hot) != 0;
+}
+
+bool xemu_texture_packs_material_bound_hash(void *pgraph, int stage,
+                                             uint64_t *out_hash)
+{
+    if (out_hash == NULL) {
+        return false;
+    }
+    *out_hash = 0;
+    switch (g_backend) {
+    case XEMU_TEXTURE_PACKS_BACKEND_GL:
+        return xemu_texture_packs_gl_bound_hash(pgraph, stage, out_hash);
+    case XEMU_TEXTURE_PACKS_BACKEND_VK:
+        return xemu_texture_packs_vk_bound_hash(pgraph, stage, out_hash);
+    default:
+        return false;
+    }
+}
+
+static bool material_normalize_light(const float dir[3], float out[3])
+{
+    if (dir == NULL || out == NULL) {
+        return false;
+    }
+
+    float x = dir[0], y = dir[1], z = dir[2];
+    float len2 = x * x + y * y + z * z;
+    if (!(len2 > 1.0e-12f) || !isfinite(len2)) {
+        return false;
+    }
+
+    float inv_len = 1.0f / sqrtf(len2);
+    out[0] = x * inv_len;
+    out[1] = y * inv_len;
+    out[2] = z * inv_len;
+    return true;
+}
+
+static void material_publish_hash_view_light(
+    XemuTexturePacksMaterialLightState *state, const float dir[3])
+{
+    if (state == NULL || dir == NULL) {
+        return;
+    }
+
+    /* The caller normalizes once before lookup/publication. Avoid repeating
+     * the sqrt/divide in this draw-synchronous hot path. */
+
+    /* The geometry observer already area-averages all valid triangles in the
+     * current draw. Publish that draw's direction directly: blending across
+     * draws contaminates one surface orientation with the previous surface
+     * when the same replacement hash is reused on several walls/objects. */
+    float dx = dir[0] - state->dir[0];
+    float dy = dir[1] - state->dir[1];
+    float dz = dir[2] - state->dir[2];
+    if (state->revision != 0 && dx * dx + dy * dy + dz * dz < 2.5e-5f) {
+        return;
+    }
+
+    memcpy(state->dir, dir, sizeof(state->dir));
+    g_material_light_revision++;
+    if (g_material_light_revision == 0) {
+        g_material_light_revision = 1;
+    }
+    state->revision = g_material_light_revision;
+}
+
+void xemu_texture_packs_material_set_hash_view_light(uint64_t hash,
+                                                      const float dir[3])
+{
+    if (hash == 0 || dir == NULL) {
+        return;
+    }
+
+    /* The live geometry observer already publishes a normalized direction.
+     * Validate that cheap invariant first so the normal renderer path does not
+     * pay for a second sqrt/divide. Keep a normalization fallback so this API
+     * remains safe for any future feature caller that supplies a raw vector. */
+    float len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+    const float *published = dir;
+    float normalized[3];
+    if (!isfinite(len2) || !(len2 > 1.0e-12f)) {
+        return;
+    }
+    if (fabsf(len2 - 1.0f) > 1.0e-4f) {
+        if (!material_normalize_light(dir, normalized)) {
+            return;
+        }
+        published = normalized;
+    }
+
+    XemuTexturePacksMaterialLightState *state =
+        material_hash_light_lookup(hash, true);
+    material_publish_hash_view_light(state, published);
+}
+
+uint64_t xemu_texture_packs_material_light_revision(void)
+{
+    return g_material_light_revision;
+}
+
+void xemu_texture_packs_material_set_draw_refresh_callback(
+    XemuTexturePacksMaterialDrawRefreshFn callback)
+{
+    g_material_draw_refresh = callback;
+}
+
+void xemu_texture_packs_material_refresh_draw(void *opaque, int stage,
+                                              uint64_t hash)
+{
+    if (g_material_draw_refresh != NULL) {
+        g_material_draw_refresh(opaque, stage, hash);
+    }
+}
+
+void xemu_texture_packs_material_get_hash_view_light(uint64_t hash,
+                                                      float dir[3],
+                                                      uint64_t *revision)
+{
+    XemuTexturePacksMaterialLightState *state =
+        material_hash_light_lookup(hash, false);
+    if (state == NULL) {
+        if (dir != NULL) {
+            dir[0] = 0.0f;
+            dir[1] = 0.0f;
+            dir[2] = 1.0f;
+        }
+        if (revision != NULL) {
+            *revision = 0;
+        }
+        return;
+    }
+
+    if (dir != NULL) {
+        memcpy(dir, state->dir, sizeof(state->dir));
+    }
+    if (revision != NULL) {
+        *revision = state->revision;
+    }
+}
+
+bool xemu_texture_packs_material_sidecars_present(uint64_t hash)
+{
+    if (hash == 0 || g_material_sidecar_hashes == NULL) {
+        return false;
+    }
+
+    /* The replacement index already established the file's existence. Do not
+     * call stbi_info()/animated decode from this draw-hot membership test. */
+    return g_hash_table_contains(g_material_sidecar_hashes, &hash);
+}
+
+/*
+ * Cheap, high-resolution file identity for live shader editing.
+ *
+ * g_stat().st_mtime is only second-granularity on some hosts, which can miss
+ * two quick saves of an equally-sized shader. POSIX hosts use the native
+ * nanosecond timestamp. Windows uses FILETIME directly, preserving NTFS'
+ * finer write-time resolution. File size is folded into the stamp as an
+ * additional signal without reading shader contents on every poll.
+ */
+bool xemu_texture_packs_get_file_stamp(const char *path,
+                                       XemuTexturePacksFileStamp *stamp)
+{
+    if (path == NULL || stamp == NULL) {
+        return false;
+    }
+
+#ifdef G_OS_WIN32
+    g_autofree gunichar2 *wide_path =
+        g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
+    if (wide_path == NULL) {
+        return false;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    if (!GetFileAttributesExW((LPCWSTR)wide_path, GetFileExInfoStandard,
+                              &info)) {
+        return false;
+    }
+
+    ULARGE_INTEGER write_time;
+    write_time.LowPart = info.ftLastWriteTime.dwLowDateTime;
+    write_time.HighPart = info.ftLastWriteTime.dwHighDateTime;
+
+    ULARGE_INTEGER size;
+    size.LowPart = info.nFileSizeLow;
+    size.HighPart = info.nFileSizeHigh;
+    stamp->write_time = write_time.QuadPart;
+    stamp->size = size.QuadPart;
+#else
+    GStatBuf st;
+    if (g_stat(path, &st) != 0) {
+        return false;
+    }
+
+#ifdef CONFIG_DARWIN
+    uint64_t nsec = (uint64_t)st.st_mtimespec.tv_nsec;
+#else
+    uint64_t nsec = (uint64_t)st.st_mtim.tv_nsec;
+#endif
+    stamp->write_time = (uint64_t)st.st_mtime * 1000000000ULL + nsec;
+    stamp->size = (uint64_t)st.st_size;
+#endif
+    return true;
 }
 
 /*
@@ -499,6 +910,25 @@ static void scan_hashed_pngs(GHashTable *table, bool store_path,
             if (is_hex && (name[16] == '.' || name[16] == '_')) {
                 char *stem = g_ascii_strdown(name, len - ext_len);
 
+                if (store_path && stem[16] == '_') {
+                    const char *variant = stem + 17;
+                    if (strcmp(variant, "n") == 0 ||
+                        strcmp(variant, "s") == 0 ||
+                        strcmp(variant, "d") == 0 ||
+                        strcmp(variant, "ao") == 0) {
+                        g_has_material_sidecars = true;
+                        qatomic_set(&g_material_sidecars_hot, 1);
+                        if (g_material_sidecar_hashes == NULL) {
+                            g_material_sidecar_hashes = g_hash_table_new_full(
+                                g_int64_hash, g_int64_equal, g_free, NULL);
+                        }
+                        uint64_t *material_hash = g_new(uint64_t, 1);
+                        *material_hash = g_ascii_strtoull(stem, NULL, 16);
+                        g_hash_table_add(g_material_sidecar_hashes,
+                                         material_hash);
+                    }
+                }
+
                 if (store_path) {
                     if (priority >= 2) {
                         g_has_dynamic_replacements = true;
@@ -566,13 +996,36 @@ static void rebuild_dump_index_now(void)
 static void rebuild_replacement_index_now(void)
 {
     g_has_dynamic_replacements = false;
+    g_has_material_sidecars = false;
+    qatomic_set(&g_material_sidecars_hot, 0);
+    material_hash_lights_clear();
+    if (g_material_sidecar_hashes != NULL) {
+        g_hash_table_destroy(g_material_sidecar_hashes);
+        g_material_sidecar_hashes = NULL;
+    }
 
     if (g_replace_index != NULL) {
         g_hash_table_destroy(g_replace_index);
         g_replace_index = NULL;
     }
 
+    /* Paths are about to be re-resolved (or have just become invalid), so
+     * every path-derived cache must be dropped before the early return.
+     * Otherwise an old pack's animated frames or shader paths can survive
+     * after a title/path transition. */
+    if (g_anim_cache != NULL) {
+        g_hash_table_destroy(g_anim_cache);
+        g_anim_cache = NULL;
+    }
+
+    if (g_shader_index != NULL) {
+        g_hash_table_destroy(g_shader_index);
+        g_shader_index = NULL;
+    }
+
     if (!g_paths_valid) {
+        /* rebuild_dump_index_now() also clears its old path-derived set. */
+        rebuild_dump_index_now();
         return;
     }
 
@@ -586,19 +1039,6 @@ static void rebuild_replacement_index_now(void)
     if (need_replace_index) {
         g_replace_index = g_hash_table_new_full(g_str_hash, g_str_equal,
                                                 g_free, g_free);
-    }
-
-    /* Paths are about to be re-resolved, so drop any cached decoded frames
-     * for the previous set of files -- otherwise a replaced/removed .gif or
-     * .webp would keep animating from stale in-memory frames. */
-    if (g_anim_cache != NULL) {
-        g_hash_table_destroy(g_anim_cache);
-        g_anim_cache = NULL;
-    }
-
-    if (g_shader_index != NULL) {
-        g_hash_table_destroy(g_shader_index);
-        g_shader_index = NULL;
     }
 
     if (g_replace_index != NULL) {
@@ -1290,5 +1730,9 @@ const uint8_t *xemu_texture_packs_animated_frame_pixels(uint64_t hash,
     *height = a->height;
     return a->frames[frame];
 }
-
+/* Build the freecam and geometry capture cores through this existing
+ * feature-owned PGRAPH translation unit. This keeps custom renderer features
+ * isolated from upstream NV2A Meson/source ownership. */
+#include "xemu-features/freecam/freecam.c"
+#include "xemu-features/geometry-dumper/geometry-dumper.c"
 

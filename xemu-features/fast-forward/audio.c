@@ -97,14 +97,27 @@ bool xemu_fast_forward_audio_submit(SDL_AudioStream *stream,
 
     const bool unlimited = mode == 0;
     const bool preserve_pitch = g_config.general.fast_forward_preserve_pitch;
-    if (preserve_pitch) {
-        set_frequency_ratio(stream, 1.0f);
-        const int divisor = unlimited ? 8 : mode;
-        int16_t pitch_block[256][2];
-        if (pitch_prepare_block(input, divisor, pitch_block)) {
-            SDL_PutAudioStreamData(stream, pitch_block, sizeof(pitch_block));
-        }
-        if (unlimited) {
+
+    if (unlimited) {
+        /*
+         * Do not ask SDL to resample every guest block at the old 100x ratio.
+         * At true turbo rates the guest can produce blocks much faster than a
+         * host device can consume them, creating a pathological stream churn
+         * path.  Thin the source blocks first and keep SDL's ratio bounded.
+         */
+        /*
+         * Unlimited is safely paced at roughly <=16.7x by the timing layer.
+         * Keep host audio proportional to that rate without queueing every
+         * guest block: pitch-preserved mode emits one block per ~16 guest
+         * blocks; raised-pitch mode emits every other block at an 8x ratio.
+         */
+        const int divisor = preserve_pitch ? 16 : 2;
+        set_frequency_ratio(stream, preserve_pitch ? 1.0f : 8.0f);
+        int16_t turbo_block[256][2];
+        if (pitch_prepare_block(input, divisor, turbo_block)) {
+            SDL_PutAudioStreamData(stream, turbo_block, sizeof(turbo_block));
+            /* Discarded guest blocks never enter SDL, so querying the host
+             * stream for them is pure overhead at unlimited speed. */
             int queued = SDL_GetAudioStreamQueued(stream);
             if (queued > queued_bytes_high * 2) {
                 SDL_ClearAudioStream(stream);
@@ -114,15 +127,17 @@ bool xemu_fast_forward_audio_submit(SDL_AudioStream *stream,
         return true;
     }
 
-    pitch_reset();
-    float audio_speed = unlimited ? 100.0f : (float)mode;
-    set_frequency_ratio(stream, audio_speed);
-    if (unlimited) {
-        int queued = SDL_GetAudioStreamQueued(stream);
-        if (queued > queued_bytes_high * 2) {
-            SDL_ClearAudioStream(stream);
+    if (preserve_pitch) {
+        set_frequency_ratio(stream, 1.0f);
+        int16_t pitch_block[256][2];
+        if (pitch_prepare_block(input, mode, pitch_block)) {
+            SDL_PutAudioStreamData(stream, pitch_block, sizeof(pitch_block));
         }
+        return true;
     }
+
+    pitch_reset();
+    set_frequency_ratio(stream, (float)mode);
     SDL_PutAudioStreamData(stream, input, sizeof(int16_t) * 256 * 2);
     return true;
 }

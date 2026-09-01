@@ -20,6 +20,8 @@ Custom disassembler/debugger extension and memory/register/breakpoint UI. Native
 - `debug-api.h`
 - `disassembler.cc`
 - `disassembler.hh`
+- `function-index.cc`
+- `function-index.hh`
 - `frontend.cc`
 - `frontend.hh`
 
@@ -29,6 +31,13 @@ Custom disassembler/debugger extension and memory/register/breakpoint UI. Native
 - `ui/xui/menubar.cc` — custom debug menu items.
 - `ui/xui/meson.build` — conditional UI/disassembler sources.
 - root `meson.build` — conditional `debug-api.c` and shared guest-memory.
+
+
+## Features #5 ASM-cheat workflow refresh
+
+The custom debugger now uses the same reverse-engineering shape as the user's external Xemu Cheat Engine: address/back navigation, a searchable function browser, call/prologue/RTTI discovery, symbol import, direct call-xref navigation, a table-oriented disassembly view, and lower Registers/Breakpoints/Stack/Threads/Locals/Parameters/Globals/Memory panels.
+
+Live patch helpers preserve original bytes for reliable undo, support NOP and arbitrary byte patches, and can copy a tested patch as the existing virtual write code types 8/9/A. **Reserved code Type F is intentionally untouched.** The debugger does not repurpose, execute, or generate Type F.
 
 ## Dependencies
 
@@ -51,3 +60,18 @@ Custom debugger/disassembler/API objects are not linked. Menu/window calls are i
 Copy `xemu-features/debug-tools/` plus shared guest-memory, gate the API/UI sources, and add only the custom menu/window hooks.
 
 The neutral public-header contract should be retained when porting so unrelated core code does not need `#ifdef` forests.
+
+### Direct debugger -> Cheats handoff
+
+When both `xemu_feature_debug_tools` and `xemu_feature_cheats` are enabled, a
+live debugger byte patch can be saved directly as an `[ASM]` cheat. The
+handoff is transactional: Debug Tools first restores its temporary patch,
+Cheats captures the true original bytes while applying the generated 8/9/A
+writes, and Debug Tools re-applies its temporary patch if the handoff fails.
+Disabling the resulting `[ASM]` cheat restores the captured bytes.
+
+The coupling is only through `xemu-features/cheats/debug-bridge.hh`; when
+Cheats is disabled that header exposes a neutral no-op API, preserving the
+independent Debug Tools build gate.
+
+**This does not use or modify reserved Type F.**

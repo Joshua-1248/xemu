@@ -41,13 +41,16 @@ Example all-off configure arguments:
 
 See each feature directory's `README.md` and `EXPORT_MANIFEST.txt` for its exact integration surface.
 
-## Licensing and attribution
+## Development feature: Free Camera
 
-Fork-owned feature source is explicitly SPDX-tagged. Most feature code is
-`GPL-2.0-or-later`; adapter files that contain or are materially derived from
-upstream LGPL MCPX/NV2A implementation code retain `LGPL-2.1-or-later` and the
-relevant upstream attribution. Individual file headers are authoritative.
-
-See `../CREDITS.md`, `../THIRD_PARTY_NOTICES.md`, and
-`../docs/custom-fork/LICENSING_AND_PROVENANCE.md` before moving code across an
-upstream/custom ownership boundary.
+`freecam/` contains the renderer-level free-camera work. Milestone 5 remains
+feature-owned and is wired through the existing Texture Packs/Geometry Dumper
+renderer shim. Its menu item is exposed by the existing `Misc` feature
+aggregator and F10 toggles the camera. Projective compatibility remains intact.
+Reconstructed View now first factors a camera-like pre-projection transform
+directly from perspective `CMAT`, falls back to the Milestone 4 `MMAT0 + CMAT`
+split when useful, and only then uses the old projective compatibility path for
+remaining 3D draws. Obvious 2D/non-perspective fixed-function draws are left
+unchanged in Reconstructed View. Programmable VSH draws retain the validated
+post-VSH compatibility tail. No native/upstream Xemu/QEMU source is owned by
+the feature.

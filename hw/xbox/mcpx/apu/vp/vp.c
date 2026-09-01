@@ -927,8 +927,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     }
 
     if (!stream && xemu_audio_packs_voice_has_replacement(v)) {
-        int count = xemu_audio_packs_voice_get_samples(v, samples,
-                                                     num_samples_requested);
+        int replacement_count = xemu_audio_packs_voice_get_samples(
+            v, samples, num_samples_requested);
         uint32_t replacement_cbo = xemu_audio_packs_voice_guest_cbo(v);
         voice_set_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, replacement_cbo);
@@ -936,7 +936,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         if (finished) {
             voice_off(d, v);
         }
-        return count > 0 ? count : -1;
+        return replacement_count > 0 ? replacement_count : -1;
     }
 
     if (stream) {
@@ -1159,9 +1159,22 @@ static long voice_resample_callback(void *cb_data, float **data)
         if (!active) {
             break;
         }
+        /*
+         * Feature-owned source observation belongs at the actual source-fetch
+         * boundary as well as the outer voice pass. A short SSL segment can be
+         * exhausted and advance to another segment inside one resampler
+         * callback; observing here prevents packetized streams from skipping
+         * segments between 1500-Hz voice service passes.
+         */
+        xemu_audio_packs_apu_prepare_voice_if_needed(d, v);
         int count = voice_get_samples(
             d, v, (float(*)[2]) & filter->resample_buf[2 * sample_count],
             NUM_SAMPLES_PER_FRAME - sample_count);
+        if (count > 0) {
+            xemu_audio_packs_apu_override_stream_samples(
+                v, (float(*)[2]) &filter->resample_buf[2 * sample_count],
+                count);
+        }
         if (count < 0) {
             break;
         }

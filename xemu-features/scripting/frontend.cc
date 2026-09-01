@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// xemu custom fork - isolated scripting tools frontend
+// xemu custom fork - isolated Misc custom-feature frontend aggregator
 //
 // Copyright (C) 2026 Joshua-1248
 //
@@ -12,10 +12,20 @@
 #include "frontend.hh"
 #include "ui/xui/common.hh"
 #include "script-console.hh"
+#include "xemu-features/cheats/frontend.hh"
+#include "xemu-features/freecam/frontend.hh"
 
 void FeatureScriptToolsDrawMenu()
 {
     if (ImGui::BeginMenu("Misc")) {
+        FeatureCodesDrawMiscMenuItem();
+#ifdef CONFIG_XEMU_FEATURE_CHEATS
+        ImGui::Separator();
+#endif
+#ifdef CONFIG_XEMU_FEATURE_DEBUG_TOOLS
+        FeatureFreecamDrawMiscMenuItem();
+        ImGui::Separator();
+#endif
         if (ImGui::MenuItem("Lua Console")) {
             ShowLuaConsole();
         }
@@ -28,10 +38,11 @@ void FeatureScriptToolsDrawMenu()
 
 void FeatureScriptToolsShowWindows()
 {
+    FeatureCodesShowWindows();
     ShowScriptConsoleWindows();
 }
 
 bool FeatureScriptToolsWindowsOpen()
 {
-    return ScriptConsoleWindowsOpen();
+    return FeatureCodesWindowsOpen() || ScriptConsoleWindowsOpen();
 }

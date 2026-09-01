@@ -29,6 +29,7 @@ void xemu_texture_packs_gl_binding_destroy(struct TextureBinding *binding);
 bool xemu_texture_packs_gl_apply_sampler_override(struct TextureBinding *binding);
 void xemu_texture_packs_gl_refresh_binding(struct TextureBinding *binding);
 void xemu_texture_packs_gl_refresh_dynamic(void);
+bool xemu_texture_packs_gl_bound_hash(void *pgraph, int stage, uint64_t *out_hash);
 #else
 static inline bool xemu_texture_packs_gl_try_upload_replacement(uint64_t hash, bool gen_mipmaps)
 { (void)hash; (void)gen_mipmaps; return false; }
@@ -55,5 +56,7 @@ static inline void xemu_texture_packs_gl_binding_destroy(struct TextureBinding *
 static inline bool xemu_texture_packs_gl_apply_sampler_override(struct TextureBinding *binding) { (void)binding; return false; }
 static inline void xemu_texture_packs_gl_refresh_binding(struct TextureBinding *binding) { (void)binding; }
 static inline void xemu_texture_packs_gl_refresh_dynamic(void) {}
+static inline bool xemu_texture_packs_gl_bound_hash(void *pgraph, int stage, uint64_t *out_hash)
+{ (void)pgraph; (void)stage; if (out_hash) *out_hash = 0; return false; }
 #endif
 #endif

@@ -16,6 +16,8 @@
 #include "ui/xui/widgets.hh"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
+#include "xemu-features/audio-packs/frontend.hh"
+#include "xemu-features/tas/tas.h"
 
 extern "C" {
 #include "xemu-features/fast-forward/fast-forward.h"
@@ -61,7 +63,12 @@ extern "C" bool xemu_fast_forward_unlimited(void)
 
 extern "C" bool xemu_fast_forward_can_unblock_main_loop(void)
 {
-    return runstate_is_running() && xemu_fast_forward_mode() == 0;
+    // Unlimited is intentionally unthrottled by the APU, but do not force the
+    // QEMU main loop into a permanent zero-timeout spin. That spin competes
+    // with the vCPU/UI threads and was the unstable path behind Unlimited
+    // crashes. The feature timing layer supplies a tiny bounded VBLANK/timer
+    // cadence instead, which remains effectively unlimited on real hosts.
+    return false;
 }
 
 extern "C" int xemu_fast_forward_multiplier(void)
@@ -73,6 +80,16 @@ extern "C" int xemu_fast_forward_multiplier(void)
 extern "C" void xemu_fast_forward_set_active(bool active)
 {
     const int old_mode = xemu_fast_forward_mode();
+
+    /* Strict TAS determinism owns guest pacing. Do not let a gameplay hotkey,
+     * toggle-mode state, or settings refresh silently re-enable host-paced
+     * Fast Forward while a deterministic movie is active. */
+    if (active && xemu_tas_deterministic_mode()) {
+        if (old_mode != 1) {
+            g_atomic_int_set(&g_fast_forward_mode, 1);
+        }
+        return;
+    }
     const bool old_active = old_mode != 1;
     const int new_mode = normalize_fast_forward_mode(active);
 
@@ -188,6 +205,10 @@ void FeatureFastForwardDrawSettings()
 
 void FeatureFastForwardUpdateHotkey(bool gameplay_has_focus)
 {
+    // Reuse the existing custom-feature hotkey call site for Audio Packs too;
+    // this keeps all new behavior out of native ui/xui/main.cc.
+    FeatureAudioPacksProcessHotkeys(gameplay_has_focus);
+
     int ff_key_value = g_config.general.fast_forward_hotkey;
     bool ff_key_valid =
         ff_key_value >= ImGuiKey_NamedKey_BEGIN &&
