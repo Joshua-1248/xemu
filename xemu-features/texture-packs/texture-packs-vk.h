@@ -8,7 +8,18 @@
 #include "config-host.h"
 #include <stdbool.h>
 #include <stdint.h>
+#ifdef CONFIG_VULKAN
 #include <vulkan/vulkan.h>
+typedef VkFormat XemuTexturePacksVKFormat;
+#else
+/*
+ * Keep the renderer-neutral texture-pack translation unit buildable when
+ * Vulkan is unavailable (notably the macOS CI configuration). Vulkan backend
+ * sources are not compiled in this case, so only a signature-compatible
+ * placeholder is needed for the no-op inline stubs below.
+ */
+typedef uint32_t XemuTexturePacksVKFormat;
+#endif
 typedef struct PGRAPHState PGRAPHState;
 typedef struct TextureBinding TextureBinding;
 typedef struct PGRAPHVkState PGRAPHVkState;
@@ -21,14 +32,14 @@ typedef struct XemuTexturePacksVKPlan {
     uint32_t mip_levels;
     int anim_frame;
 } XemuTexturePacksVKPlan;
-#ifdef CONFIG_XEMU_FEATURE_TEXTURE_PACKS
+#if defined(CONFIG_XEMU_FEATURE_TEXTURE_PACKS) && defined(CONFIG_VULKAN)
 void xemu_texture_packs_vk_plan(XemuTexturePacksVKPlan *plan, uint64_t hash,
                                 int dimensionality, bool cubemap,
                                 uint32_t guest_width, uint32_t guest_height,
                                 bool surface_to_texture);
 bool xemu_texture_packs_vk_binding_created(PGRAPHState *pg, TextureBinding *binding,
                                            const XemuTexturePacksVKPlan *plan,
-                                           VkFormat image_format);
+                                           XemuTexturePacksVKFormat image_format);
 void xemu_texture_packs_vk_binding_destroy(PGRAPHVkState *r, TextureBinding *binding);
 bool xemu_texture_packs_vk_upload_if_replaced(PGRAPHState *pg, TextureBinding *binding);
 int xemu_texture_packs_vk_dump_level_count(int guest_levels);
@@ -59,7 +70,7 @@ static inline void xemu_texture_packs_vk_plan(XemuTexturePacksVKPlan *plan, uint
 }
 static inline bool xemu_texture_packs_vk_binding_created(PGRAPHState *pg, TextureBinding *binding,
                                                          const XemuTexturePacksVKPlan *plan,
-                                                         VkFormat image_format)
+                                                         XemuTexturePacksVKFormat image_format)
 { (void)pg; (void)binding; (void)plan; (void)image_format; return false; }
 static inline void xemu_texture_packs_vk_binding_destroy(PGRAPHVkState *r, TextureBinding *binding)
 { (void)r; (void)binding; }

@@ -1070,13 +1070,13 @@ void DisassemblerWindow::OpenCreateCheatModal(uint32_t addr)
     }
 
     m_create_cheat_addr = addr;
-    std::string near = NearestName(addr);
-    if (near.empty()) {
+    std::string nearest_name = NearestName(addr);
+    if (nearest_name.empty()) {
         snprintf(m_create_cheat_name, sizeof(m_create_cheat_name),
                  "Code patch 0x%08X", addr);
     } else {
         snprintf(m_create_cheat_name, sizeof(m_create_cheat_name),
-                 "%s patch", near.c_str());
+                 "%s patch", nearest_name.c_str());
     }
     snprintf(m_create_cheat_desc, sizeof(m_create_cheat_desc),
              "Generated from the in-Xemu debugger at virtual address 0x%08X.",

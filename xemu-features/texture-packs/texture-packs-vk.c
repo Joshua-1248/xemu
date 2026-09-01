@@ -2024,7 +2024,7 @@ static void refresh_material_stage_for_draw(void *opaque, int stage,
 bool xemu_texture_packs_vk_binding_created(PGRAPHState *pg,
                                            TextureBinding *binding,
                                            const XemuTexturePacksVKPlan *plan,
-                                           VkFormat image_format)
+                                           XemuTexturePacksVKFormat image_format)
 {
     if (plan == NULL || !plan->replaced) {
         return false;
