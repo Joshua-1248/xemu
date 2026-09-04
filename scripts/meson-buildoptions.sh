@@ -107,7 +107,7 @@ meson_options_help() {
   printf "%s\n" '  bzip2           bzip2 support for DMG images'
   printf "%s\n" '  canokey         CanoKey support'
   printf "%s\n" '  cap-ng          cap_ng support'
-  printf "%s\n" '  capstone        Whether and how to find the capstone library'
+  printf "%s\n" '  capstone        Bundled Capstone x86 disassembly support'
   printf "%s\n" '  cloop           cloop image format support'
   printf "%s\n" '  cocoa           Cocoa user interface (macOS only)'
   printf "%s\n" '  colo-proxy      colo-proxy support'

@@ -328,7 +328,7 @@ option('vduse_blk_export', type: 'feature', value: 'auto',
 
 option('webp', type: 'feature', value: 'auto',
        description: 'WebP support for NV2A texture replacement')
-option('capstone', type: 'feature', value: 'auto',
+option('capstone', type: 'feature', value: 'enabled',
        description: 'Bundled Capstone x86 disassembly support')
 option('fdt', type: 'combo', value: 'disabled',
        choices: ['disabled', 'enabled', 'auto', 'system', 'internal'],

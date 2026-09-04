@@ -2017,11 +2017,21 @@ if not gnutls.found()
   endif
 endif
 
+# Bundled Capstone is a first-class dependency of the custom debugger.  QEMU's
+# configure wrapper deliberately sets -Dauto_features=disabled for clean builds,
+# so this option must not rely on Meson's 'auto' state: fresh Windows/Linux/macOS
+# builds would otherwise compile Debug Tools but silently omit the disassembler.
+# Keep the relationship fail-closed so a published build can never reach runtime
+# with the debugger present but CONFIG_CAPSTONE absent.
+if get_option('xemu_feature_debug_tools') and get_option('capstone').disabled()
+  error('xemu_feature_debug_tools requires bundled Capstone. Reconfigure with -Dcapstone=enabled, or disable xemu_feature_debug_tools as well.')
+endif
+
 capstone = not_found
 if not get_option('capstone').disabled()
   capstone_vendor_root = meson.project_source_root() / 'xemu-features/dependencies/capstone/upstream'
   if not fs.exists(capstone_vendor_root / 'cs.c')
-    error('Bundled Capstone source is missing. Run xemu-features/dependencies/vendor-capstone.sh once, then commit xemu-features/dependencies/capstone/upstream/.')
+    error('Bundled Capstone source is missing. The repository should contain xemu-features/dependencies/capstone/upstream/.')
   endif
   subdir('xemu-features/dependencies/capstone')
   capstone = xemu_bundled_capstone_dep

@@ -20,9 +20,36 @@ host operating system. Full x86 instruction support is retained; diet mode and
 `CAPSTONE_X86_REDUCE` are deliberately not used. Both Intel and AT&T printers are
 kept because Xemu/QEMU code can request either syntax.
 
-Normal Xemu builds therefore do not require a system `libcapstone`, a Capstone
-DLL/dylib/so, Homebrew Capstone, or `libcapstone-dev` package. The Meson option
-`-Dcapstone=disabled` remains available as a developer escape hatch.
+Bundled Capstone defaults to **enabled**. This is intentional: QEMU's configure
+wrapper applies `-Dauto_features=disabled` to clean builds, so leaving this
+project option at Meson's `auto` state would silently disable the disassembler in
+fresh builds even though the bundled source is present. This was observed in the
+Windows cross-build path and applies equally to any fresh `build.sh` configure.
+
+The custom `xemu_feature_debug_tools` build gate therefore requires Capstone. A
+configuration that enables Debug Tools while explicitly disabling Capstone is
+rejected at configure time instead of producing a runtime debugger window with
+no disassembler. Developers who intentionally want neither may use both:
+
+```sh
+-Dxemu_feature_debug_tools=false -Dcapstone=disabled
+```
+
+Normal Xemu builds do not require a system `libcapstone`, a Capstone DLL/dylib/so,
+Homebrew Capstone, or `libcapstone-dev` package.
+
+## Windows CI guard
+
+The Windows cross-build explicitly passes `--enable-capstone` and, before
+publishing an artifact, verifies that:
+
+- the committed Capstone source is present;
+- `CONFIG_CAPSTONE` is defined in `build/config-host.h`;
+- `CONFIG_XEMU_FEATURE_DEBUG_TOOLS` is defined; and
+- the private `libxemu-capstone-5.0.9.a` archive was produced.
+
+This turns the previous silent runtime failure into a build/CI failure if the
+configuration ever regresses.
 
 ## Maintenance / recovery vendoring
 
@@ -37,10 +64,10 @@ ever absent during repository maintenance or recovery, the maintainer runs:
 ```
 
 The script downloads only the official 5.0.9 release archive (or accepts that
-exact archive as an argument), verifies the
-published SHA-256 before extraction, validates the expected source layout, and
-then populates `upstream/`. The resulting `upstream/` directory is intended to be
-committed to this fork so ordinary builders and binary users require no download.
+exact archive as an argument), verifies the published SHA-256 before extraction,
+validates the expected source layout, and then populates `upstream/`. The
+resulting `upstream/` directory is intended to be committed to this fork so
+ordinary builders and binary users require no download.
 
 ## Local modifications
 
