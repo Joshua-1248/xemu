@@ -19,6 +19,29 @@ meson_options_help() {
   printf "%s\n" '  --disable-install-blobs  install provided firmware blobs'
   printf "%s\n" '  --disable-qom-cast-debug cast debugging support'
   printf "%s\n" '  --disable-relocatable    toggle relocatable install'
+  printf "%s\n" '  --disable-xemu-feature-audio-packs'
+  printf "%s\n" '                           Build xemu custom source-audio dump/replacement'
+  printf "%s\n" '                           packs'
+  printf "%s\n" '  --disable-xemu-feature-chd'
+  printf "%s\n" '                           Build read-only CHDv5 Xbox DVD image support'
+  printf "%s\n" '  --disable-xemu-feature-cheats'
+  printf "%s\n" '                           Build xemu custom cheats/patches engine and UI'
+  printf "%s\n" '  --disable-xemu-feature-debug-tools'
+  printf "%s\n" '                           Build xemu custom disassembler/debugger extension'
+  printf "%s\n" '  --disable-xemu-feature-disc-modding'
+  printf "%s\n" '                           Build xemu custom Xbox disc browser/extractor and'
+  printf "%s\n" '                           per-title file overrides'
+  printf "%s\n" '  --disable-xemu-feature-fast-forward'
+  printf "%s\n" '                           Build xemu custom fast-forward system'
+  printf "%s\n" '  --disable-xemu-feature-scripting'
+  printf "%s\n" '                           Build xemu custom Lua/Python scripting consoles'
+  printf "%s\n" '  --disable-xemu-feature-tas'
+  printf "%s\n" '                           Build xemu custom TAS/TAStudio tools'
+  printf "%s\n" '  --disable-xemu-feature-texture-packs'
+  printf "%s\n" '                           Build xemu custom texture dump/replacement packs'
+  printf "%s\n" '  --disable-xemu-feature-volume-amplifier'
+  printf "%s\n" '                           Build xemu custom 0-200% host output volume'
+  printf "%s\n" '                           extension'
   printf "%s\n" '  --docdir=VALUE           Base directory for documentation installation'
   printf "%s\n" '                           (can be empty) [share/doc]'
   printf "%s\n" '  --enable-asan            enable address sanitizer'
@@ -59,7 +82,7 @@ meson_options_help() {
   printf "%s\n" '  --enable-ubsan           enable undefined behaviour sanitizer'
   printf "%s\n" '  --firmwarepath=VALUES    search PATH for firmware files [share/qemu-'
   printf "%s\n" '                           firmware]'
-  printf "%s\n" '  --gdb=VALUE              Path to GDB'
+  printf "%s\n" '  --gdb=VALUE              Path to GDB [/usr/bin/gdb]'
   printf "%s\n" '  --iasl=VALUE             Path to ACPI disassembler'
   printf "%s\n" '  --includedir=VALUE       Header file directory [include]'
   printf "%s\n" '  --interp-prefix=VALUE    where to find shared libraries etc., use %M for'
@@ -228,6 +251,7 @@ meson_options_help() {
   printf "%s\n" '  vpc             vpc image format support'
   printf "%s\n" '  vte             vte support for the gtk UI'
   printf "%s\n" '  vvfat           vvfat image format support'
+  printf "%s\n" '  webp            WebP support for NV2A texture replacement'
   printf "%s\n" '  werror          Treat warnings as errors'
   printf "%s\n" '  whpx            WHPX acceleration support'
   printf "%s\n" '  xen             Xen backend support'
@@ -582,11 +606,33 @@ _meson_option_parse() {
     --vtune=*) quote_sh "-Dvtune=$2" ;;
     --enable-vvfat) printf "%s" -Dvvfat=enabled ;;
     --disable-vvfat) printf "%s" -Dvvfat=disabled ;;
+    --enable-webp) printf "%s" -Dwebp=enabled ;;
+    --disable-webp) printf "%s" -Dwebp=disabled ;;
     --enable-werror) printf "%s" -Dwerror=true ;;
     --disable-werror) printf "%s" -Dwerror=false ;;
     --enable-whpx) printf "%s" -Dwhpx=enabled ;;
     --disable-whpx) printf "%s" -Dwhpx=disabled ;;
     --x86-version=*) quote_sh "-Dx86_version=$2" ;;
+    --enable-xemu-feature-audio-packs) printf "%s" -Dxemu_feature_audio_packs=true ;;
+    --disable-xemu-feature-audio-packs) printf "%s" -Dxemu_feature_audio_packs=false ;;
+    --enable-xemu-feature-chd) printf "%s" -Dxemu_feature_chd=true ;;
+    --disable-xemu-feature-chd) printf "%s" -Dxemu_feature_chd=false ;;
+    --enable-xemu-feature-cheats) printf "%s" -Dxemu_feature_cheats=true ;;
+    --disable-xemu-feature-cheats) printf "%s" -Dxemu_feature_cheats=false ;;
+    --enable-xemu-feature-debug-tools) printf "%s" -Dxemu_feature_debug_tools=true ;;
+    --disable-xemu-feature-debug-tools) printf "%s" -Dxemu_feature_debug_tools=false ;;
+    --enable-xemu-feature-disc-modding) printf "%s" -Dxemu_feature_disc_modding=true ;;
+    --disable-xemu-feature-disc-modding) printf "%s" -Dxemu_feature_disc_modding=false ;;
+    --enable-xemu-feature-fast-forward) printf "%s" -Dxemu_feature_fast_forward=true ;;
+    --disable-xemu-feature-fast-forward) printf "%s" -Dxemu_feature_fast_forward=false ;;
+    --enable-xemu-feature-scripting) printf "%s" -Dxemu_feature_scripting=true ;;
+    --disable-xemu-feature-scripting) printf "%s" -Dxemu_feature_scripting=false ;;
+    --enable-xemu-feature-tas) printf "%s" -Dxemu_feature_tas=true ;;
+    --disable-xemu-feature-tas) printf "%s" -Dxemu_feature_tas=false ;;
+    --enable-xemu-feature-texture-packs) printf "%s" -Dxemu_feature_texture_packs=true ;;
+    --disable-xemu-feature-texture-packs) printf "%s" -Dxemu_feature_texture_packs=false ;;
+    --enable-xemu-feature-volume-amplifier) printf "%s" -Dxemu_feature_volume_amplifier=true ;;
+    --disable-xemu-feature-volume-amplifier) printf "%s" -Dxemu_feature_volume_amplifier=false ;;
     --enable-xen) printf "%s" -Dxen=enabled ;;
     --disable-xen) printf "%s" -Dxen=disabled ;;
     --enable-xen-pci-passthrough) printf "%s" -Dxen_pci_passthrough=enabled ;;

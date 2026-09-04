@@ -417,3 +417,5 @@ option('xemu_feature_volume_amplifier', type: 'boolean', value: true,
        description: 'Build xemu custom 0-200% host output volume extension')
 option('xemu_feature_disc_modding', type: 'boolean', value: true,
        description: 'Build xemu custom Xbox disc browser/extractor and per-title file overrides')
+option('xemu_feature_chd', type: 'boolean', value: true,
+       description: 'Build read-only CHDv5 Xbox DVD image support')

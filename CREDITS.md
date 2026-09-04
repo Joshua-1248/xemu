@@ -35,6 +35,7 @@ Bundled custom-feature dependencies include:
 | Library | Used for | License | Pinned version |
 | --- | --- | --- | --- |
 | [Capstone](https://www.capstone-engine.org/) | x86 disassembly | BSD-3-Clause | 5.0.9 |
+| [libchdr](https://github.com/rtissera/libchdr) | CHDv5 DVD decompression | BSD-3-Clause | 0.3.0 |
 
 The following are vendored in-tree and used by this fork's texture code.
 `stb_image.h` ships with upstream xemu; `stb_image_write.h` is added by this
@@ -145,6 +146,9 @@ such as:
 - **Capstone 5.0.9** — bundled x86 disassembly engine under
   `xemu-features/dependencies/capstone/upstream/`; official Capstone source,
   BSD-licensed, with custom build integration kept outside the upstream tree
+- **libchdr 0.3.0** — pinned CHD decoder under
+  `xemu-features/dependencies/libchdr/upstream/`; BSD-licensed upstream source,
+  with the QEMU/Xemu adapter kept in `xemu-features/chd/`
 - **libwebp** — WebP texture replacement/animation support
 - **stb_image / stb_image_write** — image decode/write paths
 - **xxHash / XXH3** — source identities and fingerprints used by asset tooling

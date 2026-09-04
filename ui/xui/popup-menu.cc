@@ -18,6 +18,8 @@
 //
 #include "ui/xemu-notifications.h"
 #include <string>
+#include <algorithm>
+#include <cctype>
 #include <vector>
 #include <filesystem>
 #include <map>
@@ -33,6 +35,7 @@
 #include "../xemu-snapshots.h"
 #include "main-menu.hh"
 #include "xemu-features/volume-amplifier/volume.h"
+#include "xemu-features/chd/chd-path.h"
 
 PopupMenuItemDelegate::~PopupMenuItemDelegate() {}
 void PopupMenuItemDelegate::PushMenu(PopupMenu &menu) {}
@@ -392,11 +395,15 @@ public:
             for (const auto &file :
                  std::filesystem::directory_iterator(directory)) {
                 const auto &file_path = file.path();
-                if (std::filesystem::is_regular_file(file_path) &&
-                    (file_path.extension() == ".iso" ||
-                     file_path.extension() == ".xiso")) {
-                    sorted_file_names.insert(
-                        { file_path.stem().string(), file_path.string() });
+                if (std::filesystem::is_regular_file(file_path) && file_path.has_extension()) {
+                    std::string ext = file_path.extension().string();
+                    std::transform(ext.begin(), ext.end(), ext.begin(),
+                                   [](unsigned char c) { return (char)std::tolower(c); });
+                    if (ext == ".iso" || ext == ".xiso" ||
+                        (xemu_chd_support_enabled() && ext == ".chd")) {
+                        sorted_file_names.insert(
+                            { file_path.stem().string(), file_path.string() });
+                    }
                 }
             }
         }

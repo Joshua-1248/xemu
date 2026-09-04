@@ -5,6 +5,7 @@
 #include "xemu-features/disc-modding/xdvdfs.hh"
 
 #include "ui/xemu-settings.h"
+#include "xemu-features/disc-modding/mounted-disc-bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -56,21 +57,33 @@ struct HostReader {
                 if (error) *error = "cannot open override: " + path.u8string();
                 return false;
             }
+            next_offset = 0;
+            next_offset_valid = true;
         }
         if (offset > uint64_t(std::numeric_limits<std::streamoff>::max())) {
             if (error) *error = "override read offset is too large";
             return false;
         }
         stream.clear();
-        stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-        if (!stream) {
-            if (error) *error = "cannot seek override: " + path.u8string();
-            return false;
+        if (!next_offset_valid || offset != next_offset) {
+            stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+            if (!stream) {
+                next_offset_valid = false;
+                if (error) *error = "cannot seek override: " + path.u8string();
+                return false;
+            }
         }
         stream.read(static_cast<char *>(dst), static_cast<std::streamsize>(len));
         if (!stream.good() && !(stream.eof() && size_t(stream.gcount()) == len)) {
+            next_offset_valid = false;
             if (error) *error = "short/failed override read: " + path.u8string();
             return false;
+        }
+        if (len <= UINT64_MAX - offset) {
+            next_offset = offset + len;
+            next_offset_valid = true;
+        } else {
+            next_offset_valid = false;
         }
         return true;
     }
@@ -79,6 +92,8 @@ struct HostReader {
     fs::path root;
     std::mutex mutex;
     std::ifstream stream;
+    uint64_t next_offset = 0;
+    bool next_offset_valid = false;
 };
 
 struct Patch {
@@ -108,11 +123,66 @@ std::atomic<bool> g_virtual_available{false};
 std::atomic<uint64_t> g_virtual_sector_limit{0};
 uint64_t g_next_virtual_sector = 0; // guarded by g_control_mutex
 std::string g_disc_path;
+XemuMountedDiscBackend *g_disc_reader_backend = nullptr; // read-only pin of the exact mounted BDS
+bool g_backend_refreshing = false; // guarded by g_control_mutex
+uint64_t g_media_generation = 1;
+std::shared_ptr<const Snapshot> g_base_disc_snapshot; // parsed only on QEMU I/O thread
 bool g_settings_loaded = false;
 bool g_overlay_enabled = true;
 std::string g_configured_mod_base;
 std::mutex g_runtime_error_mutex;
 std::string g_runtime_error;
+
+class MountedLogicalDiscReader final : public LogicalDiscReader {
+public:
+    MountedLogicalDiscReader(XemuMountedDiscBackend *blk, uint64_t size)
+        : blk_(blk), size_(size) {}
+
+    uint64_t Size() const override { return size_; }
+
+    bool ReadAt(uint64_t offset, void *dst, size_t len,
+                std::string *error) override
+    {
+        if (!blk_ || offset > size_ || len > size_ - offset ||
+            offset > INT64_MAX || len > INT64_MAX) {
+            if (error) *error = "logical disc read lies outside mounted medium";
+            return false;
+        }
+        int ret = xemu_mounted_disc_pread(blk_, (int64_t)offset,
+                                      (int64_t)len, dst);
+        if (ret < 0) {
+            if (error) *error = "mounted disc read failed: " + std::to_string(ret);
+            return false;
+        }
+        return true;
+    }
+
+private:
+    XemuMountedDiscBackend *blk_;
+    uint64_t size_;
+};
+
+static bool ReadMountedDiscAsync(XemuMountedDiscBackend *backend,
+                                 uint64_t offset, void *dst, size_t len,
+                                 std::string *error)
+{
+    if (!backend || offset > INT64_MAX ||
+        uint64_t(len) > uint64_t(INT64_MAX) ||
+        uint64_t(len) > uint64_t(INT64_MAX) - offset) {
+        if (error) *error = "invalid mounted-disc async read";
+        return false;
+    }
+
+    const int ret = xemu_mounted_disc_pread_worker(
+        backend, static_cast<int64_t>(offset), len, dst);
+    if (ret < 0) {
+        if (error) {
+            *error = "mounted disc read failed: " + std::to_string(ret);
+        }
+        return false;
+    }
+    return true;
+}
 
 static std::shared_ptr<const OverlayState> LoadState()
 {
@@ -376,13 +446,18 @@ static std::shared_ptr<OverlayState> BuildStateLocked(const std::string &path)
         return state;
     }
 
-    std::string parse_error;
-    if (!ParseXdvdfsImage(fs::u8path(path), &snapshot, &parse_error)) {
-        snapshot.parse_error = parse_error;
-        snapshot.overlay_enabled = g_overlay_enabled;
+    if (!g_base_disc_snapshot || g_base_disc_snapshot->source_path != path ||
+        g_base_disc_snapshot->media_generation != g_media_generation) {
+        snapshot.source_path = path;
+        snapshot.media_generation = g_media_generation;
+        snapshot.parse_error = "Mounted disc filesystem is not ready yet.";
         return state;
     }
+    snapshot = *g_base_disc_snapshot;
     snapshot.overlay_enabled = g_overlay_enabled;
+    if (!snapshot.valid) {
+        return state;
+    }
 
     fs::path root = EffectiveRoot(snapshot);
     snapshot.effective_mod_root = root.u8string();
@@ -393,6 +468,8 @@ static std::shared_ptr<OverlayState> BuildStateLocked(const std::string &path)
 
     std::unordered_map<std::string, size_t> disc_by_key;
     std::unordered_set<std::string> ambiguous_disc;
+    disc_by_key.reserve(snapshot.entries.size());
+    ambiguous_disc.reserve(snapshot.entries.size() / 8 + 1);
     for (size_t i = 1; i < snapshot.entries.size(); ++i) {
         Entry &e = snapshot.entries[i];
         if (e.directory) continue;
@@ -463,6 +540,7 @@ static std::shared_ptr<OverlayState> BuildStateLocked(const std::string &path)
 
     struct Match { std::string key; size_t index; fs::path path; uint64_t size; };
     std::vector<Match> matches;
+    matches.reserve(override_by_key.size());
     for (const auto &kv : override_by_key) {
         auto dit = disc_by_key.find(kv.first);
         if (dit == disc_by_key.end()) {
@@ -490,6 +568,11 @@ static std::shared_ptr<OverlayState> BuildStateLocked(const std::string &path)
     }
 
     if (!g_overlay_enabled || matches.empty()) return state;
+
+    state->virtual_files.reserve(matches.size());
+    if (matches.size() <= std::numeric_limits<size_t>::max() / 2) {
+        state->patches_by_sector.reserve(matches.size() * 2);
+    }
 
     // Deterministic virtual sectors: sorted normalized path order, after the
     // real image. This never mutates or aliases original XISO sectors.
@@ -571,19 +654,18 @@ static void PublishRebuildLocked(bool disc_changed)
     SetRuntimeError("");
 }
 
-static const VirtualFile *FindVirtualFile(const OverlayState &state,
-                                          uint64_t sector)
+static size_t FindVirtualFileIndex(const OverlayState &state, uint64_t sector)
 {
     auto it = std::upper_bound(state.virtual_files.begin(), state.virtual_files.end(),
                                sector, [](uint64_t v, const VirtualFile &f) {
                                    return v < f.start_sector;
                                });
-    if (it == state.virtual_files.begin()) return nullptr;
+    if (it == state.virtual_files.begin()) return kNoIndex;
     --it;
     if (sector < it->start_sector || sector - it->start_sector >= it->sector_count) {
-        return nullptr;
+        return kNoIndex;
     }
-    return &*it;
+    return size_t(it - state.virtual_files.begin());
 }
 
 static bool StateCoversVirtualRange(const OverlayState &state, uint64_t lba,
@@ -593,11 +675,17 @@ static bool StateCoversVirtualRange(const OverlayState &state, uint64_t lba,
     if (lba > UINT64_MAX - count) return false;
     uint64_t cur = lba;
     const uint64_t end = lba + count;
+    size_t index = FindVirtualFileIndex(state, cur);
+    if (index == kNoIndex) return false;
     while (cur < end) {
-        const VirtualFile *f = FindVirtualFile(state, cur);
-        if (!f) return false;
-        uint64_t f_end = f->start_sector + f->sector_count;
+        if (index >= state.virtual_files.size()) return false;
+        const VirtualFile &f = state.virtual_files[index];
+        if (cur < f.start_sector || cur - f.start_sector >= f.sector_count) {
+            return false;
+        }
+        uint64_t f_end = f.start_sector + f.sector_count;
         cur = std::min(end, f_end);
+        ++index;
     }
     return true;
 }
@@ -606,29 +694,57 @@ static bool ReadVirtualFromState(const OverlayState &state, uint64_t lba,
                                  uint32_t count, uint8_t *buffer,
                                  std::string *error)
 {
-    if (!StateCoversVirtualRange(state, lba, count)) return false;
+    if (!count) return true;
+    if (lba > UINT64_MAX - count) return false;
+
+    size_t index = FindVirtualFileIndex(state, lba);
+    if (index == kNoIndex) return false;
+    const uint64_t end = lba + count;
+
+    /*
+     * The overwhelmingly common ATAPI case is one request wholly inside one
+     * replacement file (often a single 2048-byte sector).  Avoid a separate
+     * coverage pass/binary search on that hot path.  Only cross-file requests
+     * need the linear coverage validation below.
+     */
+    const VirtualFile &first = state.virtual_files[index];
+    const uint64_t first_end = first.start_sector + first.sector_count;
+    if (end > first_end) {
+        uint64_t check = first_end;
+        size_t check_index = index + 1;
+        while (check < end) {
+            if (check_index >= state.virtual_files.size()) return false;
+            const VirtualFile &f = state.virtual_files[check_index++];
+            if (f.start_sector != check || !f.sector_count) return false;
+            check = std::min(end, f.start_sector + f.sector_count);
+        }
+    }
+
     const uint64_t total_bytes = uint64_t(count) * kSectorSize;
     std::fill(buffer, buffer + total_bytes, uint8_t(0));
     uint64_t cur = lba;
     uint64_t out_off = 0;
-    const uint64_t end = lba + count;
     while (cur < end) {
-        const VirtualFile *f = FindVirtualFile(state, cur);
-        if (!f) return false;
-        const uint64_t f_end = f->start_sector + f->sector_count;
+        if (index >= state.virtual_files.size()) return false;
+        const VirtualFile &f = state.virtual_files[index];
+        if (cur < f.start_sector || cur - f.start_sector >= f.sector_count) {
+            return false;
+        }
+        const uint64_t f_end = f.start_sector + f.sector_count;
         const uint64_t take_sectors = std::min(end, f_end) - cur;
-        const uint64_t file_off = (cur - f->start_sector) * kSectorSize;
+        const uint64_t file_off = (cur - f.start_sector) * kSectorSize;
         const uint64_t requested = take_sectors * kSectorSize;
-        const uint64_t readable = file_off < f->size
-                                      ? std::min(requested, f->size - file_off)
+        const uint64_t readable = file_off < f.size
+                                      ? std::min(requested, f.size - file_off)
                                       : 0;
-        if (readable && !f->reader->Read(file_off, buffer + out_off,
-                                         size_t(readable), error)) {
+        if (readable && !f.reader->Read(file_off, buffer + out_off,
+                                        size_t(readable), error)) {
             std::fill(buffer, buffer + total_bytes, uint8_t(0));
             return true; // handled fail-closed: caller sees only zero bytes
         }
         cur += take_sectors;
         out_off += requested;
+        ++index;
     }
     return true;
 }
@@ -637,13 +753,12 @@ class ExtractionManager {
 public:
     ~ExtractionManager()
     {
-        cancel.store(true, std::memory_order_release);
-        if (worker.joinable()) worker.join();
+        CancelAndWait();
     }
 
     bool Start(std::shared_ptr<const Snapshot> snapshot, size_t entry_index,
                bool entire_disc, fs::path destination, CollisionPolicy policy,
-               bool to_override_root, std::string *error)
+               bool to_override_root, XemuMountedDiscBackend *backend, std::string *error)
     {
         std::lock_guard<std::mutex> lock(mutex);
         if (progress.active) {
@@ -669,11 +784,16 @@ public:
         progress.destination = (to_override_root
                                     ? snapshot->effective_mod_root
                                     : destination.string());
+        active_backend = backend;
+        worker_running.store(true, std::memory_order_release);
         worker = std::thread([this, snapshot = std::move(snapshot), entry_index,
                               entire_disc, destination = std::move(destination),
-                              policy, to_override_root]() mutable {
+                              policy, to_override_root, backend]() mutable {
             Run(snapshot, entry_index, entire_disc, destination, policy,
-                to_override_root);
+                to_override_root, backend);
+            worker_running.store(false, std::memory_order_release);
+            /* Wake a main-loop AIO wait used by CancelAndWait(). */
+            xemu_mounted_disc_wait_kick();
         });
         return true;
     }
@@ -687,6 +807,41 @@ public:
     }
 
     void Cancel() { cancel.store(true, std::memory_order_release); }
+
+    void CancelAndWait()
+    {
+        cancel.store(true, std::memory_order_release);
+        if (!worker.joinable()) {
+            return;
+        }
+
+        XemuMountedDiscBackend *backend = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            backend = active_backend;
+        }
+
+        if (worker_running.load(std::memory_order_acquire) && backend) {
+            /*
+             * The normal frontend path can simply join because qemu_main keeps
+             * servicing AIO concurrently. During shutdown qemu_main_loop() has
+             * returned with the BQL held, so the C bridge pumps the backend's
+             * AioContext until the worker is no longer waiting on a read BH.
+             */
+            xemu_mounted_disc_pump_while_bql(
+                backend,
+                [](void *opaque) -> bool {
+                    auto *running =
+                        static_cast<std::atomic<bool> *>(opaque);
+                    return running->load(std::memory_order_acquire);
+                },
+                &worker_running);
+        }
+
+        worker.join();
+        std::lock_guard<std::mutex> lock(mutex);
+        active_backend = nullptr;
+    }
 
 private:
     struct JobEntry {
@@ -843,7 +998,7 @@ private:
 
     void Run(const std::shared_ptr<const Snapshot> &s, size_t entry_index,
              bool entire_disc, fs::path destination, CollisionPolicy policy,
-             bool to_override_root)
+             bool to_override_root, XemuMountedDiscBackend *backend)
     {
         std::vector<JobEntry> jobs;
         if (entire_disc) {
@@ -897,9 +1052,8 @@ private:
             return;
         }
 
-        std::ifstream source(fs::u8path(s->source_path), std::ios::binary);
-        if (!source) {
-            Finish(false, false, "cannot reopen source XISO for extraction");
+        if (!backend) {
+            Finish(false, false, "mounted logical disc backend is unavailable");
             return;
         }
         std::vector<char> buffer(kExtractChunk);
@@ -1008,20 +1162,6 @@ private:
             }
             uint64_t source_off = uint64_t(e.start_sector) * kSectorSize;
             uint64_t left = e.size;
-            if (source_off > uint64_t(std::numeric_limits<std::streamoff>::max())) {
-                out.close();
-                discard_temp();
-                Finish(false, false, "source offset exceeds host stream range");
-                return;
-            }
-            source.clear();
-            source.seekg(static_cast<std::streamoff>(source_off), std::ios::beg);
-            if (!source) {
-                out.close();
-                discard_temp();
-                Finish(false, false, "cannot seek source XISO");
-                return;
-            }
             while (left) {
                 if (cancel.load(std::memory_order_acquire)) {
                     out.close();
@@ -1030,13 +1170,16 @@ private:
                     return;
                 }
                 const size_t take = size_t(std::min<uint64_t>(left, buffer.size()));
-                source.read(buffer.data(), static_cast<std::streamsize>(take));
-                if (!source.good() && !(source.eof() && size_t(source.gcount()) == take)) {
+                std::string read_error;
+                if (!ReadMountedDiscAsync(backend, source_off, buffer.data(), take,
+                                          &read_error)) {
                     out.close();
                     discard_temp();
-                    Finish(false, false, "short/failed source XISO read while extracting " + e.path);
+                    Finish(false, false, "failed logical-disc read while extracting " +
+                                          e.path + ": " + read_error);
                     return;
                 }
+                source_off += take;
                 out.write(buffer.data(), static_cast<std::streamsize>(take));
                 if (!out) {
                     out.close();
@@ -1085,7 +1228,9 @@ private:
 
     std::mutex mutex;
     std::atomic<bool> cancel{false};
+    std::atomic<bool> worker_running{false};
     std::thread worker;
+    XemuMountedDiscBackend *active_backend = nullptr;
     ExtractProgress progress;
 };
 
@@ -1152,6 +1297,13 @@ void SyncDiscPathFromFrontend(const char *path)
     std::lock_guard<std::mutex> lock(g_control_mutex);
     if (p == g_disc_path && LoadState()) return;
     const bool changed = p != g_disc_path;
+    if (changed) {
+        ++g_media_generation;
+        /* The old read-only backend pin is released on the QEMU I/O thread by
+         * RefreshMountedBackendOnQemuThread(). Keeping it alive until then
+         * makes a concurrent medium replacement harmless to any final read. */
+        g_base_disc_snapshot.reset();
+    }
     g_disc_path = p;
     PublishRebuildLocked(changed);
 }
@@ -1197,8 +1349,23 @@ bool StartExtraction(const std::shared_ptr<const Snapshot> &snapshot,
                      const fs::path &destination, CollisionPolicy policy,
                      bool to_override_root, std::string *error)
 {
+    /*
+     * Register the worker while holding the same control mutex used to begin a
+     * mounted-backend refresh. This closes the otherwise tiny window where a
+     * refresh could cancel "no worker", swap/unref the backend, and only then
+     * have this caller start using the retired pointer. Refresh never holds
+     * g_control_mutex while waiting for a worker, so lock ordering is acyclic.
+     */
+    std::lock_guard<std::mutex> lock(g_control_mutex);
+    if (g_backend_refreshing || !snapshot ||
+        snapshot->media_generation != g_media_generation ||
+        !g_disc_reader_backend) {
+        if (error) *error = "disc changed; refresh the filesystem browser before extracting";
+        return false;
+    }
     return g_extraction.Start(snapshot, entry_index, entire_disc, destination,
-                              policy, to_override_root, error);
+                              policy, to_override_root, g_disc_reader_backend,
+                              error);
 }
 
 ExtractProgress GetExtractionProgress() { return g_extraction.Get(); }
@@ -1210,6 +1377,97 @@ std::string GetRuntimeOverlayError()
     return g_runtime_error;
 }
 
+static void RefreshMountedBackendOnQemuThread()
+{
+    /*
+     * A refresh is the only place g_disc_reader_backend can be replaced or
+     * unreferenced. Mark that transition before cancelling extraction so a new
+     * extraction cannot register itself in the cancel->swap gap.
+     */
+    {
+        std::lock_guard<std::mutex> lock(g_control_mutex);
+        if (g_backend_refreshing) {
+            return;
+        }
+        g_backend_refreshing = true;
+    }
+    g_extraction.CancelAndWait();
+
+    XemuMountedDiscBackend *new_reader = nullptr;
+    int64_t length = -1;
+
+    std::string path;
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(g_control_mutex);
+        path = g_disc_path;
+        generation = g_media_generation;
+    }
+
+    std::shared_ptr<Snapshot> parsed;
+    if (!path.empty()) {
+        char *pin_error = nullptr;
+        new_reader = xemu_mounted_disc_pin("ide0-cd1", &length, &pin_error);
+
+        parsed = std::make_shared<Snapshot>();
+        parsed->source_path = path;
+        parsed->media_generation = generation;
+
+        if (!new_reader) {
+            parsed->parse_error = pin_error
+                ? std::string("cannot pin mounted logical disc: ") + pin_error
+                : "cannot pin mounted logical disc";
+        } else if (length <= 0) {
+            parsed->parse_error = "mounted logical disc has an invalid size";
+        } else {
+            MountedLogicalDiscReader reader(new_reader, (uint64_t)length);
+            std::string parse_error;
+            const bool parsed_ok = ParseXdvdfsReader(reader, path, parsed.get(),
+                                                     &parse_error);
+            parsed->source_path = path;
+            parsed->media_generation = generation;
+            if (!parsed_ok) {
+                parsed->parse_error = parse_error;
+            }
+        }
+        xemu_mounted_disc_free_error(pin_error);
+    }
+
+    XemuMountedDiscBackend *old_reader = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_control_mutex);
+        /* Discard a parse/pin raced by a later load/eject. */
+        if (path == g_disc_path && generation == g_media_generation) {
+            old_reader = g_disc_reader_backend;
+            g_disc_reader_backend = new_reader;
+            new_reader = nullptr;
+            if (path.empty() || !parsed) {
+                g_base_disc_snapshot.reset();
+            } else {
+                /* Preserve a parse/pinning error in the browser snapshot rather
+                 * than turning it into a misleading "not ready" state. */
+                g_base_disc_snapshot = std::move(parsed);
+            }
+            PublishRebuildLocked(false);
+        }
+        g_backend_refreshing = false;
+    }
+
+    /* BlockBackend lifetime changes are kept on the QEMU/global-state thread. */
+    if (old_reader) {
+        xemu_mounted_disc_unref(old_reader);
+    }
+    if (new_reader) {
+        xemu_mounted_disc_unref(new_reader);
+    }
+}
+
+static void RefreshMountedBackendBh(void *opaque)
+{
+    (void)opaque;
+    RefreshMountedBackendOnQemuThread();
+}
+
 } // namespace xemu_disc_modding
 
 extern "C" {
@@ -1217,6 +1475,22 @@ extern "C" {
 void xemu_disc_overlay_notify_disc_path(const char *path)
 {
     xemu_disc_modding::SyncDiscPathFromFrontend(path);
+}
+
+void xemu_disc_overlay_prepare_disc_change(void)
+{
+    xemu_disc_modding::g_extraction.CancelAndWait();
+}
+
+void xemu_disc_overlay_refresh_mounted_backend(void)
+{
+    xemu_disc_modding::RefreshMountedBackendOnQemuThread();
+}
+
+void xemu_disc_overlay_schedule_refresh(void)
+{
+    xemu_mounted_disc_schedule_main_bh(
+        xemu_disc_modding::RefreshMountedBackendBh, NULL);
 }
 
 uint64_t xemu_disc_overlay_total_sectors(uint64_t original_total_sectors)

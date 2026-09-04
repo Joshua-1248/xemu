@@ -8,7 +8,23 @@
 
 namespace xemu_disc_modding {
 
-/* Pure, host-side XDVDFS parser. No QEMU/Xemu runtime dependencies. */
+/*
+ * Logical random-access medium. The XDVDFS parser deliberately consumes this
+ * abstraction rather than a host pathname so raw XISO and decoded CHD media
+ * share exactly the same filesystem interpretation.
+ */
+class LogicalDiscReader {
+public:
+    virtual ~LogicalDiscReader() = default;
+    virtual uint64_t Size() const = 0;
+    virtual bool ReadAt(uint64_t offset, void *dst, size_t len,
+                        std::string *error) = 0;
+};
+
+bool ParseXdvdfsReader(LogicalDiscReader &reader, const std::string &source_name,
+                       Snapshot *snapshot, std::string *error);
+
+/* Pure host-file convenience wrapper retained for tests/tools using raw XISO. */
 bool ParseXdvdfsImage(const std::filesystem::path &image, Snapshot *snapshot,
                       std::string *error);
 

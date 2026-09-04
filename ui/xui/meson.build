@@ -69,6 +69,7 @@ endif
 if get_option('xemu_feature_disc_modding')
   xemu_ss.add(files(
     '../../xemu-features/disc-modding/xdvdfs.cc',
+    '../../xemu-features/disc-modding/mounted-disc-bridge.c',
     '../../xemu-features/disc-modding/core.cc',
     '../../xemu-features/disc-modding/frontend.cc',
   ))

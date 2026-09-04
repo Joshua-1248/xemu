@@ -107,6 +107,26 @@ BSD-licensed and its `upstream/LICENSE.TXT` notice must accompany redistribution
 The repository also retains `licenses/capstone.license.txt` for outbound-license
 generation.
 
+### libchdr
+
+Project: <https://github.com/rtissera/libchdr>
+
+License: **BSD-3-Clause**.
+
+Use: read-only decoding of CHDv5 DVD images. **libchdr 0.3.0 is pinned** under
+`xemu-features/dependencies/libchdr/upstream/` and statically linked when CHD
+support is enabled. The official tag resolves to commit
+`93d8c239ff0d4e8d7722985992649fce12d2463b`. The vendoring helper records and
+verifies the release archive SHA-512 before materializing the source tree.
+
+The upstream source is kept unmodified. Xemu-specific QEMU block integration
+lives in `xemu-features/chd/`, and custom Meson integration remains adjacent to
+the dependency rather than patching libchdr's own build files. The private build
+reuses QEMU's existing zlib and (when present) zstd dependencies to avoid
+duplicate codec implementations; the pinned libchdr LZMA source and its zstd
+fallback remain under the feature dependency tree. See
+`licenses/libchdr.license.txt` and the notices retained inside the upstream tree.
+
 ### `xemu-features/dependencies/` policy
 
 Third-party source vendored specifically for the Joshua-1248 feature layer is
@@ -197,6 +217,7 @@ multi-license terms.
 | stb_image_write | `licenses/stb_image_write.license.txt` | MIT notice / stb dual terms |
 | libwebp | `licenses/libwebp.license.txt` | BSD-3-Clause plus retained WebM patent grant |
 | Capstone | `licenses/capstone.license.txt` | BSD-3-Clause |
+| libchdr | `licenses/libchdr.license.txt` | BSD-3-Clause |
 | Xemu Cheat Engine and Trainer / `xemu_trainer_lib` | `licenses/xemu_trainer_lib.license.txt` | MIT |
 | RenderDoc in-application API | `licenses/renderdoc.license.txt` | MIT |
 | gloffscreen | `licenses/gloffscreen.license.txt` | MIT |

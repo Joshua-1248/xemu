@@ -196,13 +196,20 @@ case "$platform" in # Adjust compilation options based on platform
     Linux)
         echo 'Compiling for Linux...'
         sys_cflags='-Wno-error=redundant-decls'
-        # Only link SPIRV-Tools explicitly when the system actually provides
-        # it. CI builds glslang/SPIRV-Tools as meson subprojects and has no
-        # system libSPIRV-Tools, where these flags fail the link with
-        # "cannot find -lSPIRV-Tools-opt".
-        if ldconfig -p 2>/dev/null | grep -q 'libSPIRV-Tools\.so'; then
+        # System glslang on some Linux distributions is provided as static
+        # archives and leaves its SPIRV-Tools dependencies for the final
+        # consumer to link.  Do not use ldconfig here: it only reports shared
+        # libraries and therefore misses the common static-only SPIRV-Tools
+        # installation.  Probe the linker directly so both static and shared
+        # installations are handled, while CI/subproject builds with no
+        # system SPIRV-Tools remain unchanged.
+        spirv_probe="${TMPDIR:-/tmp}/xemu-spirv-tools-probe-$$"
+        if printf 'int main(void) { return 0; }\n' | \
+                c++ -x c++ - -o "$spirv_probe" \
+                -lSPIRV-Tools-opt -lSPIRV-Tools >/dev/null 2>&1; then
             sys_ldflags='-lSPIRV-Tools-opt -lSPIRV-Tools'
         fi
+        rm -f "$spirv_probe"
         opts="$opts --disable-werror"
         postbuild='package_linux'
         ;;
@@ -261,6 +268,20 @@ case "$platform" in # Adjust compilation options based on platform
         ;;
 esac
 
+# Materialize the exact, hash-verified CHD decoder before Meson sees it.
+# Meson itself intentionally performs no network access, and an explicitly
+# disabled CHD feature has no dependency on libchdr at all.
+chd_feature_enabled=1
+for arg in "$@"; do
+    case "$arg" in
+        -Dxemu_feature_chd=false|-Dxemu_feature_chd=disabled) chd_feature_enabled=0 ;;
+    esac
+done
+if [[ ${chd_feature_enabled} -eq 1 && ! -f "${project_source_dir}/xemu-features/dependencies/libchdr/upstream/src/libchdr_chd.c" ]]; then
+    echo "Preparing pinned libchdr dependency for CHD support..."
+    "${project_source_dir}/xemu-features/dependencies/libchdr/vendor-libchdr.sh"
+fi
+
 # find absolute path (and resolve symlinks) to build out of tree
 configure="${project_source_dir}/configure"
 
@@ -272,6 +293,22 @@ set -x # Print commands from now on
     --target-list=i386-softmmu \
     ${opts} \
     "$@"
+
+# QEMU normally regenerates scripts/meson-buildoptions.sh when meson_options.txt
+# changes.  Newer Meson versions can try to discover optional compilers (notably
+# rustc) when introspecting the source tree directly, even when that language was
+# disabled by the successful configure above.  Generate the helper from the
+# configured build directory instead: this uses the exact compiler/feature state
+# already accepted by Meson and does not invent a Rust toolchain requirement.
+meson_introspect="${project_source_dir}/build/pyvenv/bin/meson"
+meson_python="${project_source_dir}/build/pyvenv/bin/python3"
+meson_buildopts_tmp="${project_source_dir}/scripts/meson-buildoptions.sh.tmp"
+if [[ -x "${meson_introspect}" && -x "${meson_python}" ]]; then
+    "${meson_introspect}" introspect --buildoptions "${project_source_dir}/build" | \
+        "${meson_python}" -B "${project_source_dir}/scripts/meson-buildoptions.py" \
+        > "${meson_buildopts_tmp}"
+    mv "${meson_buildopts_tmp}" "${project_source_dir}/scripts/meson-buildoptions.sh"
+fi
 
 time make -j"${job_count}" ${target} 2>&1 | tee build.log
 

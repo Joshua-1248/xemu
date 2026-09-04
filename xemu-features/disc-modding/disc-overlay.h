@@ -19,6 +19,14 @@ extern "C" {
  */
 void xemu_disc_overlay_notify_disc_path(const char *path);
 
+/* Cancel/join host extraction before replacing or ejecting the medium. */
+void xemu_disc_overlay_prepare_disc_change(void);
+
+/* Refresh the logical reader from ide0-cd1. Direct form runs on QEMU thread;
+ * scheduled form is safe for the UI thread after a QMP medium change. */
+void xemu_disc_overlay_refresh_mounted_backend(void);
+void xemu_disc_overlay_schedule_refresh(void);
+
 /* Return the guest-visible 2048-byte sector count. */
 uint64_t xemu_disc_overlay_total_sectors(uint64_t original_total_sectors);
 
@@ -42,6 +50,9 @@ static inline void xemu_disc_overlay_notify_disc_path(const char *path)
 {
     (void)path;
 }
+static inline void xemu_disc_overlay_prepare_disc_change(void) {}
+static inline void xemu_disc_overlay_refresh_mounted_backend(void) {}
+static inline void xemu_disc_overlay_schedule_refresh(void) {}
 static inline uint64_t xemu_disc_overlay_total_sectors(
     uint64_t original_total_sectors)
 {

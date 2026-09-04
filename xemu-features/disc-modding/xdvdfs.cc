@@ -50,19 +50,55 @@ static bool CheckedMul(uint64_t a, uint64_t b, uint64_t *out)
     return true;
 }
 
-static bool ReadAt(std::ifstream &f, uint64_t offset, void *dst, size_t len)
+static bool ReadAt(LogicalDiscReader &reader, uint64_t offset, void *dst,
+                   size_t len)
 {
-    if (offset > uint64_t(std::numeric_limits<std::streamoff>::max())) {
-        return false;
-    }
-    f.clear();
-    f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!f) {
-        return false;
-    }
-    f.read(static_cast<char *>(dst), static_cast<std::streamsize>(len));
-    return f.good() || (f.eof() && size_t(f.gcount()) == len);
+    return reader.ReadAt(offset, dst, len, nullptr);
 }
+
+class FileLogicalDiscReader final : public LogicalDiscReader {
+public:
+    explicit FileLogicalDiscReader(const fs::path &path, std::string *error)
+    {
+        std::error_code ec;
+        size_ = fs::file_size(path, ec);
+        if (ec) {
+            if (error) *error = "cannot stat disc image: " + ec.message();
+            return;
+        }
+        stream_.open(path, std::ios::binary);
+        if (!stream_ && error) *error = "cannot open disc image";
+    }
+
+    bool Valid() const { return stream_.is_open(); }
+    uint64_t Size() const override { return size_; }
+
+    bool ReadAt(uint64_t offset, void *dst, size_t len,
+                std::string *error) override
+    {
+        if (offset > uint64_t(std::numeric_limits<std::streamoff>::max()) ||
+            offset > size_ || len > size_ - offset) {
+            if (error) *error = "disc read lies outside logical image";
+            return false;
+        }
+        stream_.clear();
+        stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!stream_) {
+            if (error) *error = "cannot seek disc image";
+            return false;
+        }
+        stream_.read(static_cast<char *>(dst), static_cast<std::streamsize>(len));
+        if (!stream_.good() && !(stream_.eof() && size_t(stream_.gcount()) == len)) {
+            if (error) *error = "short/failed disc image read";
+            return false;
+        }
+        return true;
+    }
+
+private:
+    uint64_t size_ = 0;
+    std::ifstream stream_;
+};
 
 static std::string HexByte(uint8_t v)
 {
@@ -189,7 +225,7 @@ struct DirTask {
     unsigned depth;
 };
 
-static bool ParseTitle(std::ifstream &f, Snapshot *snapshot)
+static bool ParseTitle(LogicalDiscReader &f, Snapshot *snapshot)
 {
     size_t default_index = kNoIndex;
     for (size_t idx : snapshot->entries[0].children) {
@@ -372,32 +408,25 @@ bool PathIsWithin(const fs::path &root, const fs::path &candidate)
     return true;
 }
 
-bool ParseXdvdfsImage(const fs::path &image, Snapshot *snapshot,
-                      std::string *error)
+bool ParseXdvdfsReader(LogicalDiscReader &f, const std::string &source_name,
+                       Snapshot *snapshot, std::string *error)
 {
     if (!snapshot) {
         if (error) *error = "null snapshot";
         return false;
     }
     *snapshot = Snapshot{};
-    snapshot->source_path = image.u8string();
+    snapshot->source_path = source_name;
     if (error) error->clear();
 
-    std::error_code ec;
-    const uint64_t file_size = fs::file_size(image, ec);
-    if (ec) {
-        if (error) *error = "cannot stat disc image: " + ec.message();
+    const uint64_t file_size = f.Size();
+    if (!file_size) {
+        if (error) *error = "logical disc image is empty";
         return false;
     }
     snapshot->source_size = file_size;
     snapshot->original_sectors = (file_size + kSectorSize - 1) / kSectorSize;
     snapshot->virtual_sectors = snapshot->original_sectors;
-
-    std::ifstream f(image, std::ios::binary);
-    if (!f) {
-        if (error) *error = "cannot open disc image";
-        return false;
-    }
 
     std::array<uint8_t, kSectorSize> vd{};
     uint64_t base_sector = 0;
@@ -618,6 +647,18 @@ bool ParseXdvdfsImage(const fs::path &image, Snapshot *snapshot,
     ParseTitle(f, snapshot); // Metadata is optional; filesystem validity is not.
     snapshot->valid = true;
     return true;
+}
+
+bool ParseXdvdfsImage(const fs::path &image, Snapshot *snapshot,
+                      std::string *error)
+{
+    std::string open_error;
+    FileLogicalDiscReader reader(image, &open_error);
+    if (!reader.Valid()) {
+        if (error) *error = open_error;
+        return false;
+    }
+    return ParseXdvdfsReader(reader, image.u8string(), snapshot, error);
 }
 
 } // namespace xemu_disc_modding

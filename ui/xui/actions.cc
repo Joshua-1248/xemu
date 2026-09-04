@@ -23,6 +23,7 @@
 #include "../xemu-snapshots.h"
 #include "../xemu-notifications.h"
 #include "snapshot-manager.hh"
+#include "xemu-features/chd/chd-path.h"
 #include <filesystem>
 
 void ActionEjectDisc(void)
@@ -37,10 +38,16 @@ void ActionEjectDisc(void)
 
 void ActionLoadDisc(void)
 {
-    static const SDL_DialogFileFilter filters[] = {
+    static const SDL_DialogFileFilter filters_with_chd[] = {
+        { "Disc Image Files (*.iso, *.xiso, *.chd)", "iso;xiso;chd" },
+        { "All Files", "*" }
+    };
+    static const SDL_DialogFileFilter filters_raw[] = {
         { "Disc Image Files (*.iso, *.xiso)", "iso;xiso" },
         { "All Files", "*" }
     };
+    const SDL_DialogFileFilter *filters =
+        xemu_chd_support_enabled() ? filters_with_chd : filters_raw;
     const char *default_path = g_config.sys.files.dvd_path;
     if (!default_path || !default_path[0]) {
         default_path = g_config.general.games_dir;

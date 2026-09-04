@@ -45,6 +45,7 @@ struct Snapshot {
     std::string parse_error;
     std::string warning;
     uint64_t source_size = 0;
+    uint64_t media_generation = 0;
     uint64_t original_sectors = 0;
     uint64_t virtual_sectors = 0;
     uint32_t volume_base_sector = 0;

@@ -57,6 +57,7 @@
 #include "xemu-features/fast-forward/timing.h"
 #include "xemu-features/tas/tas.h"
 #include "xemu-features/disc-modding/disc-overlay.h"
+#include "xemu-features/chd/chd-path.h"
 
 #include <stb_image.h>
 #include <locale.h>
@@ -1237,6 +1238,9 @@ char **gArgv;
 static void *qemu_main(void *opaque)
 {
     qemu_init(gArgc, gArgv);
+    /* Build Disc Files & Mods from the exact logical medium now that ide0-cd1
+     * exists. This keeps raw XISO and decoded CHD on one reader path. */
+    xemu_disc_overlay_refresh_mounted_backend();
     exit_status = qemu_main_loop();
     qatomic_set(&qemu_exiting, true);
     bql_unlock();
@@ -1244,6 +1248,15 @@ static void *qemu_main(void *opaque)
 
     qemu_sem_wait(&display_shutdown_sem);
     bql_lock();
+    /* Stop any Disc Files & Mods extraction while the block graph/AioContexts
+     * are still alive. CancelAndWait pumps pending logical-disc reads, so this
+     * is safe even after qemu_main_loop() has returned. */
+    xemu_disc_overlay_prepare_disc_change();
+    /* Drop the feature-owned read-only BlockBackend root before QEMU destroys
+     * the block graph. Keeping this explicit also makes leak/lifetime audits
+     * independent of static C++ destructor ordering. */
+    xemu_disc_overlay_notify_disc_path(NULL);
+    xemu_disc_overlay_refresh_mounted_backend();
     qemu_cleanup(exit_status);
     bql_unlock();
 
@@ -1415,12 +1428,17 @@ void xemu_eject_disc(Error **errp)
     Error *error = NULL;
 
     xbox_smc_eject_button();
+    xemu_disc_overlay_prepare_disc_change();
     xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
     xemu_disc_overlay_notify_disc_path(NULL);
     xemu_settings_save();
 
     // Xbox software may request that the drive open, but do it now anyway
     qmp_eject("ide0-cd1", NULL, true, false, &error);
+    /* Release/rebuild the feature-owned logical-medium pin even on an eject
+     * failure. The frontend path has already been cleared above, so retaining
+     * a stale backend here would keep the old BDS alive unnecessarily. */
+    xemu_disc_overlay_schedule_refresh();
     if (error) {
         error_propagate(errp, error);
     }
@@ -1434,10 +1452,12 @@ void xemu_load_disc(const char *path, Error **errp)
 
     // Ensure an eject sequence is always triggered so Xbox software reloads
     xbox_smc_eject_button();
+    xemu_disc_overlay_prepare_disc_change();
     xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
     xemu_disc_overlay_notify_disc_path(NULL);
 
-    qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", false, false,
+    qmp_blockdev_change_medium("ide0-cd1", NULL, path,
+                               xemu_chd_block_format_for_path(path), false, false,
                                false, 0, &error);
     if (error) {
         error_propagate(errp, error);
@@ -1445,6 +1465,9 @@ void xemu_load_disc(const char *path, Error **errp)
         xemu_settings_set_string(&g_config.sys.files.dvd_path, path);
         xemu_disc_overlay_notify_disc_path(path);
     }
+    /* On success this parses/pins the new logical medium. On failure it drops
+     * the old feature-owned backend now that the configured path is empty. */
+    xemu_disc_overlay_schedule_refresh();
     xemu_settings_save();
 
     xbox_smc_update_tray_state();

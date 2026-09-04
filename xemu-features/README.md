@@ -19,6 +19,7 @@ All options default to `true` for the custom fork:
 | Debug Tools | `xemu_feature_debug_tools` | `CONFIG_XEMU_FEATURE_DEBUG_TOOLS` |
 | Fast Forward | `xemu_feature_fast_forward` | `CONFIG_XEMU_FEATURE_FAST_FORWARD` |
 | Disc Files & Mods | `xemu_feature_disc_modding` | `CONFIG_XEMU_FEATURE_DISC_MODDING` |
+| Xbox DVD CHD | `xemu_feature_chd` | `CONFIG_XEMU_FEATURE_CHD` |
 | 0–200% Volume Amplifier | `xemu_feature_volume_amplifier` | `CONFIG_XEMU_FEATURE_VOLUME_AMPLIFIER` |
 
 Example all-off configure arguments:
@@ -32,6 +33,7 @@ Example all-off configure arguments:
 -Dxemu_feature_debug_tools=false
 -Dxemu_feature_fast_forward=false
 -Dxemu_feature_disc_modding=false
+-Dxemu_feature_chd=false
 -Dxemu_feature_volume_amplifier=false
 ```
 
@@ -43,7 +45,7 @@ Example all-off configure arguments:
 - Public headers include `config-host.h` and provide neutral inline behavior when their feature is omitted.
 - Build-disabled feature implementation sources are not added to source sets.
 - Shared guest-memory support is under `shared/` and is linked only when at least one tool that needs it is built.
-- Feature-owned bundled third-party source is isolated under `dependencies/`; it keeps its own upstream license and is not treated as fork-authored code. Capstone 5.0.9 is currently bundled there for x86 disassembly.
+- Feature-owned bundled third-party source is isolated under `dependencies/`; it keeps its own upstream license and is not treated as fork-authored code. Capstone 5.0.9 is currently bundled there for x86 disassembly, and libchdr 0.3.0 is bundled there for Xbox DVD CHD decoding.
 
 See the feature-directory `README.md` files and any accompanying
 `EXPORT_MANIFEST.txt` files for their integration surfaces.

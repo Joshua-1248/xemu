@@ -2037,6 +2037,16 @@ if not get_option('capstone').disabled()
   capstone = xemu_bundled_capstone_dep
 endif
 
+# xemu custom fork: pinned private libchdr dependency. Meson never fetches it.
+xemu_bundled_libchdr_dep = not_found
+if get_option('xemu_feature_chd')
+  libchdr_vendor_root = meson.project_source_root() / 'xemu-features/dependencies/libchdr/upstream'
+  if not fs.exists(libchdr_vendor_root / 'src/libchdr_chd.c')
+    error('Bundled libchdr source is missing. Run xemu-features/dependencies/libchdr/vendor-libchdr.sh once.')
+  endif
+  subdir('xemu-features/dependencies/libchdr')
+endif
+
 gmp = dependency('gmp', required: false, method: 'pkg-config')
 if nettle.found() and gmp.found()
   hogweed = dependency('hogweed', version: '>=3.4',
@@ -2505,6 +2515,7 @@ config_host_data.set('CONFIG_XEMU_FEATURE_DEBUG_TOOLS', get_option('xemu_feature
 config_host_data.set('CONFIG_XEMU_FEATURE_FAST_FORWARD', get_option('xemu_feature_fast_forward'))
 config_host_data.set('CONFIG_XEMU_FEATURE_VOLUME_AMPLIFIER', get_option('xemu_feature_volume_amplifier'))
 config_host_data.set('CONFIG_XEMU_FEATURE_DISC_MODDING', get_option('xemu_feature_disc_modding'))
+config_host_data.set('CONFIG_XEMU_FEATURE_CHD', get_option('xemu_feature_chd'))
 audio_drivers_selected = []
 if have_system
   audio_drivers_available = {
@@ -4063,6 +4074,9 @@ if have_block
   subdir('nbd')
   subdir('scsi')
   subdir('block')
+  if get_option('xemu_feature_chd')
+    block_ss.add(files('xemu-features/chd/chd-block.c'), xemu_bundled_libchdr_dep)
+  endif
 
   blockdev_ss.add(files(
     'blockdev.c',
