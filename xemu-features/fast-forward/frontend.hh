@@ -1,12 +1,17 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 // xemu custom fork - Fast Forward frontend boundary
 #pragma once
 #include "config-host.h"
 
 #ifdef CONFIG_XEMU_FEATURE_FAST_FORWARD
 void FeatureFastForwardDrawSettings();
+void FeatureFastForwardDrawMiscMenuItem();
+void FeatureFastForwardDrawWindow();
+bool FeatureFastForwardWindowOpen();
 #else
 static inline void FeatureFastForwardDrawSettings() {}
+static inline void FeatureFastForwardDrawMiscMenuItem() {}
+static inline void FeatureFastForwardDrawWindow() {}
+static inline bool FeatureFastForwardWindowOpen() { return false; }
 #endif
 
 // ui/xui/main.cc already owns this narrow custom-feature hotkey hook. Audio

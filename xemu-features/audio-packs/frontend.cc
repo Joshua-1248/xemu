@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // xemu custom fork - isolated audio pack frontend
 //
@@ -16,6 +15,7 @@
 #include "ui/xui/widgets.hh"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
+#include "xemu-features/shared/detachable-windows.hh"
 
 extern "C" {
 #include "xemu-features/audio-packs/audio-packs.h"
@@ -45,6 +45,8 @@ struct AudioPackHotkeys {
 };
 
 AudioPackHotkeys g_audio_hotkeys;
+bool g_audio_packs_window_open;
+constexpr const char *kAudioPacksDetachId = "audio-packs.window";
 
 static std::string AudioHotkeyPath()
 {
@@ -203,13 +205,10 @@ static void ReloadReplacements()
 
 namespace {
 
-static bool g_audio_settings_deferred;
-
 static void DrawAudioPacksSettingsBody()
 {
     LoadAudioHotkeys();
 
-    SectionTitle("Audio Packs");
     if (Toggle("Dump source audio", &g_config.audio.dump_enabled,
                "Dump decoded source audio as logical WAV assets; exact loops are collapsed to one traversal with intro/loop/outro metadata")) {
         xemu_audio_packs_refresh_paths();
@@ -277,40 +276,93 @@ static void DrawAudioPacksSettingsBody()
     }
     ImGui::TextDisabled("Audio-pack hotkeys and dump-category choices are stored separately in audio-packs-hotkeys.ini.");
 
-    ImGui::Dummy(ImVec2(0, ImGui::GetStyle().WindowPadding.y));
+}
+
+static void DrawAudioPacksInfo()
+{
     ImGui::TextWrapped(
         "Dumping and replacement cover static hardware voices, software-fed/reused "
         "resident buffers, and packetized SSL streams. Exact whole-buffer and tiered "
-        "stream-prefix matching remain the fast paths. A transport-agnostic consumed-source "
-        "matcher also watches the decoded PCM actually passing through MCPX and can identify "
-        "verified landmarks at arbitrary offsets inside reused/circular buffers. This keeps "
-        "the guest's real CBO/SSL/ring consumption authoritative while substituting aligned "
-        "replacement samples afterward. Replacement WAVs used by passthrough matching are "
-        "pre-normalized to the source rate off the APU worker. Local source dump WAVs are used "
-        "to build the arbitrary-offset landmark index when replacements are reloaded. "
-        "Multipass mixbin voices remain internal processing and are intentionally not treated "
-        "as source assets. Use <hash>.wav for one replacement, or <hash>_1.wav, <hash>_2.wav, "
-        "... for random variants.");
+        "stream-prefix matching remain the fast paths. A transport-agnostic "
+        "consumed-source matcher also watches the decoded PCM actually passing through "
+        "MCPX and can identify verified landmarks at arbitrary offsets inside "
+        "reused/circular buffers.");
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "The guest's real CBO/SSL/ring consumption remains authoritative while aligned "
+        "replacement samples are substituted afterward. Replacement WAVs used by "
+        "passthrough matching are pre-normalized to the source rate off the APU worker. "
+        "Local source dump WAVs build the arbitrary-offset landmark index when "
+        "replacements are reloaded.");
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "Multipass mixbin voices remain internal processing and are intentionally not "
+        "treated as source assets. Use <hash>.wav for one replacement, or "
+        "<hash>_1.wav, <hash>_2.wav, ... for random variants.");
 }
 
 } // namespace
 
 void FeatureAudioPacksDrawSettings()
 {
-    /*
-     * Native Xemu calls this before its Quality section. Defer actual drawing
-     * so the feature-owned Toggle bridge can flush us after "DSP JIT engine".
-     */
-    g_audio_settings_deferred = true;
+    // Audio Packs now lives in a standalone Misc tool window. Keep the native
+    // settings hook as a compatibility no-op.
 }
 
 void FeatureAudioPacksDrawSettingsAfterQuality()
 {
-    if (!g_audio_settings_deferred) {
+    // Compatibility no-op retained for older feature-owned integration code.
+}
+
+void FeatureAudioPacksDrawMiscMenuItem()
+{
+    ImGui::MenuItem("Audio Packs", nullptr, &g_audio_packs_window_open);
+}
+
+void FeatureAudioPacksDrawWindow()
+{
+    xemu_feature_detach::Register(kAudioPacksDetachId, "Audio Packs",
+                                  &g_audio_packs_window_open,
+                                  []() { FeatureAudioPacksDrawWindow(); });
+    xemu_feature_detach::Pump();
+
+    if (!g_audio_packs_window_open ||
+        !xemu_feature_detach::ShouldDraw(kAudioPacksDetachId)) {
         return;
     }
-    g_audio_settings_deferred = false;
-    DrawAudioPacksSettingsBody();
+
+    if (xemu_feature_detach::IsDetachedPass(kAudioPacksDetachId)) {
+        xemu_feature_detach::PrepareWindow(kAudioPacksDetachId);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(640.0f, 690.0f),
+                                 ImGuiCond_FirstUseEver);
+    }
+    const ImGuiWindowFlags flags =
+        xemu_feature_detach::WindowFlags(kAudioPacksDetachId, 0);
+    if (!ImGui::Begin("Audio Packs", &g_audio_packs_window_open, flags)) {
+        ImGui::End();
+        return;
+    }
+    xemu_feature_detach::ObserveCurrentWindow(kAudioPacksDetachId);
+
+    if (ImGui::BeginTabBar("##audio_packs_tabs")) {
+        if (ImGui::BeginTabItem("Settings")) {
+            DrawAudioPacksSettingsBody();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Info")) {
+            DrawAudioPacksInfo();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    ImGui::End();
+}
+
+bool FeatureAudioPacksWindowOpen()
+{
+    return g_audio_packs_window_open;
 }
 
 void FeatureAudioPacksProcessHotkeys(bool gameplay_has_focus)

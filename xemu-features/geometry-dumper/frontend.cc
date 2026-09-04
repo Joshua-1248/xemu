@@ -1,12 +1,15 @@
 // xemu custom fork - NV2A Geometry Dumper UI
+#include "frontend.hh"
 #include "ui/xui/common.hh"
 #include "ui/xui/misc.hh"
 #include "ui/xemu-notifications.h"
 #include "xemu-features/geometry-dumper/geometry-dumper.h"
+#include "xemu-features/shared/detachable-windows.hh"
 
 #include <cstring>
 #include <cmath>
 
+static constexpr const char *kGeometryDetachId = "geometry-dumper.window";
 static bool g_geometry_window_open;
 static char g_geometry_output_root[1024];
 static int g_geometry_frame_count = 1;
@@ -37,25 +40,39 @@ static XemuGeometryCaptureOptions GeometryCurrentOptions()
     return options;
 }
 
-void FeatureGeometryDumperDrawMenuItem()
+static void DrawGeometryInfo()
 {
-    ImGui::MenuItem("Geometry Dumper", nullptr, &g_geometry_window_open);
+    ImGui::TextWrapped(
+        "glTF 2.0 is the primary export. geometry.gltf uses fixed-function "
+        "draw-time placement when enabled (otherwise raw/local positions), "
+        "reconstructed post-vertex-shader UVs, PNG texture references and "
+        "per-draw metadata. With placement enabled, geometry_raw.gltf "
+        "preserves every raw/local draw. OBJ/MTL files remain "
+        "compatibility/debug exports.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "Every capture contains geometry.gltf + geometry.bin as the primary "
+        "glTF 2.0 asset, plus draws.jsonl and vertices.csv. With placed export "
+        "enabled, geometry.gltf contains fixed-function view-space placement "
+        "and geometry_raw.gltf + geometry_raw.bin preserve all raw/local "
+        "draws. glTF materials use the reconstructed post-VSH PROJECT2D "
+        "coordinates and dumped PNGs only where that mapping is safe; "
+        "NV2A-specific draw/primitive details are kept in glTF extras and "
+        "JSON. Legacy OBJ/MTL exports are retained for compatibility. Export "
+        "scale changes glTF/OBJ positions only; CSV/JSON remain "
+        "native/unscaled.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "Multi-frame capture currently writes on the renderer thread and can "
+        "hitch for geometry-heavy scenes. Moving file serialization to an "
+        "asynchronous writer remains a possible optimization without changing "
+        "capture semantics.");
 }
 
-void FeatureGeometryDumperDrawWindow()
+static void DrawGeometryCaptureTab(const XemuGeometryDumperStatus &status)
 {
-    if (!g_geometry_window_open) {
-        return;
-    }
-
-    if (!ImGui::Begin("Geometry Dumper", &g_geometry_window_open)) {
-        ImGui::End();
-        return;
-    }
-
-    XemuGeometryDumperStatus status{};
-    xemu_geometry_dumper_get_status(&status);
-
     ImGui::Text("NV2A hook: %s",
                 status.renderer_hooked ? "Ready" : "Waiting for renderer");
     ImGui::Text("Capture: %s", GeometryCaptureStateText(status.mode));
@@ -66,14 +83,6 @@ void FeatureGeometryDumperDrawWindow()
     }
     ImGui::Separator();
 
-    ImGui::TextWrapped(
-        "glTF 2.0 is the primary export. geometry.gltf uses fixed-function draw-time "
-        "placement when enabled (otherwise raw/local positions), reconstructed "
-        "post-vertex-shader UVs, PNG texture references and per-draw metadata. "
-        "With placement enabled, geometry_raw.gltf preserves every raw/local draw. "
-        "OBJ/MTL files remain compatibility/debug exports.");
-
-    ImGui::Spacing();
     ImGui::TextUnformatted("Dump directory");
     ImGui::SetNextItemWidth(-92.0f);
     ImGui::InputTextWithHint("##geometry_output_root",
@@ -125,10 +134,9 @@ void FeatureGeometryDumperDrawWindow()
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            "Uniformly scales glTF/OBJ vertex positions only. 1.0 is the current/native "
-            "dump size. Any finite positive float is accepted up to 1000.0, so "
-            "scientific notation can be used for extremely small scales. CSV/JSON "
-            "retain native unscaled coordinates.");
+            "Uniformly scales glTF/OBJ vertex positions only. 1.0 is the "
+            "current/native dump size. Any finite positive float is accepted "
+            "up to 1000.0. CSV/JSON retain native unscaled coordinates.");
     }
 
     ImGui::Checkbox("Dump textures + glTF/OBJ materials",
@@ -138,20 +146,17 @@ void FeatureGeometryDumperDrawWindow()
             "Exports active base-level NV2A textures into textures/. glTF and "
             "legacy OBJ materials are restricted to directly representable "
             "PROJECT2D sampling and use reconstructed post-vertex-shader "
-            "coordinates (texgen, texture matrices, Q projection and linear "
-            "texture normalization included). Complex dependent/cube/bump "
-            "stages remain in metadata instead of being mapped incorrectly.");
+            "coordinates. Complex dependent/cube/bump stages remain metadata.");
     }
 
     ImGui::Checkbox("Export original draw placement (fixed-function)",
                     &g_geometry_export_placed_geometry);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            "Makes geometry.gltf the placed fixed-function scene by applying the "
-            "same NV2A model-view/skinning transform used by V4 placed OBJ. A "
-            "geometry_raw.gltf companion preserves every raw/local draw, including "
-            "programmable Xbox vertex-shader draws that do not expose a universal "
-            "world transform. Legacy geometry_placed.obj is still written too.");
+            "Makes geometry.gltf the placed fixed-function scene. A "
+            "geometry_raw.gltf companion preserves every raw/local draw, "
+            "including programmable Xbox vertex-shader draws that do not "
+            "expose a universal world transform.");
     }
 
     ImGui::Checkbox("Disable backface culling while capturing",
@@ -159,10 +164,7 @@ void FeatureGeometryDumperDrawWindow()
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
             "Temporarily disables the NV2A rasterizer cull bit only for draws "
-            "being captured, then restores the exact guest state. Geometry data "
-            "is captured before rasterization regardless; glTF materials are also "
-            "exported double-sided for inspection. This checkbox affects what "
-            "xemu renders during the capture itself.");
+            "being captured, then restores the exact guest state.");
     }
 
     ImGui::Spacing();
@@ -240,23 +242,58 @@ void FeatureGeometryDumperDrawWindow()
         ImGui::Spacing();
         ImGui::TextWrapped("Error: %s", status.last_error);
     }
+}
 
-    ImGui::Spacing();
-    ImGui::TextWrapped(
-        "Every capture now contains geometry.gltf + geometry.bin as the primary "
-        "glTF 2.0 asset, plus draws.jsonl and vertices.csv. With placed export "
-        "enabled, geometry.gltf contains fixed-function view-space placement and "
-        "geometry_raw.gltf + geometry_raw.bin preserve all raw/local draws. glTF "
-        "materials use the reconstructed post-VSH PROJECT2D coordinates and dumped "
-        "PNGs only where that mapping is safe; NV2A-specific draw/primitive details "
-        "are kept in glTF extras and JSON. Legacy OBJ/MTL exports are retained for "
-        "compatibility. Export scale changes glTF/OBJ positions only; CSV/JSON "
-        "remain native/unscaled.");
-    ImGui::TextWrapped(
-        "Multi-frame capture still writes on the renderer thread and can hitch "
-        "for geometry-heavy scenes. The next optimization step can move file "
-        "serialization to an asynchronous writer without changing capture "
-        "semantics.");
+void FeatureGeometryDumperDrawMenuItem()
+{
+    ImGui::MenuItem("Geometry Dumper", nullptr, &g_geometry_window_open);
+}
+
+void FeatureGeometryDumperDrawWindow()
+{
+    xemu_feature_detach::Register(kGeometryDetachId, "Geometry Dumper",
+                                  &g_geometry_window_open,
+                                  []() { FeatureGeometryDumperDrawWindow(); });
+    xemu_feature_detach::Pump();
+
+    if (!g_geometry_window_open ||
+        !xemu_feature_detach::ShouldDraw(kGeometryDetachId)) {
+        return;
+    }
+
+    if (xemu_feature_detach::IsDetachedPass(kGeometryDetachId)) {
+        xemu_feature_detach::PrepareWindow(kGeometryDetachId);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(620.0f, 620.0f),
+                                 ImGuiCond_FirstUseEver);
+    }
+    const ImGuiWindowFlags flags =
+        xemu_feature_detach::WindowFlags(kGeometryDetachId, 0);
+    if (!ImGui::Begin("Geometry Dumper", &g_geometry_window_open, flags)) {
+        ImGui::End();
+        return;
+    }
+    xemu_feature_detach::ObserveCurrentWindow(kGeometryDetachId);
+
+    XemuGeometryDumperStatus status{};
+    xemu_geometry_dumper_get_status(&status);
+
+    if (ImGui::BeginTabBar("##geometry_tabs")) {
+        if (ImGui::BeginTabItem("Capture")) {
+            DrawGeometryCaptureTab(status);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Info")) {
+            DrawGeometryInfo();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 
     ImGui::End();
+}
+
+bool FeatureGeometryDumperWindowOpen()
+{
+    return g_geometry_window_open;
 }

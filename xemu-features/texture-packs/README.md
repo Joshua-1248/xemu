@@ -4,6 +4,13 @@
 
 Texture dumping/replacement for NV2A with GL and Vulkan adapters, animated GIF/WebP replacements, procedural shader replacements, dump color conversion and feature-owned renderer sidecars.
 
+## UI location
+
+`Texture Packs` is managed from the standalone `Misc > Texture Packs` tool window rather
+than the native Settings pages. The window can be detached into its own native
+OS window using the shared custom-feature tear-off behavior.
+
+
 ## Build gate
 
 - Meson: `xemu_feature_texture_packs`

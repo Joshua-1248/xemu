@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // xemu User Interface - Codes (cheats and patches)
 //
@@ -21,6 +20,7 @@
 #include "debug-bridge.hh"
 #include "xemu-features/scripting/frontend.hh"
 #include "xemu-features/shared/detachable-windows.hh"
+#include "xemu-features/shared/misc-menu.hh"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "xemu-xbe.h"
@@ -32,6 +32,8 @@
 #include <cinttypes>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstring>
 
 CodesManager g_codes;
 
@@ -182,6 +184,10 @@ struct NodeEditorState {
     std::string error;
     bool enabled = false;
     bool open_requested = false;
+    /* True only after an attempted tree mutation failed primary persistence.
+     * The edited in-memory tree is intentionally kept so Save can be retried,
+     * but Cancel must then restore the last verified disk-backed tree. */
+    bool failed_save_dirty = false;
 };
 
 struct NodeActionState {
@@ -646,18 +652,26 @@ void DrawCodesEditor()
                 }
             } else {
                 CodesManager::Section *sec = g_codes_editor.section;
-                sec->root = std::move(parsed_root);
-                sec->meta = std::move(parsed_meta);
+                CodesManager::Section candidate;
+                candidate.root = std::move(parsed_root);
+                candidate.meta = std::move(parsed_meta);
 
-                // Save atomically through the existing writer, then reload the
-                // tree. LoadForCurrentGame() also clears interpreter switch
-                // and one-shot state, which is required when node addresses
-                // may have changed.
-                g_codes.Save(*sec);
-                g_codes.LoadForCurrentGame();
-
-                ImGui::CloseCurrentPopup();
-                g_codes_editor = CodesEditorState{};
+                // Persist and verify the candidate before touching the live
+                // tree. If persistence fails, the running tree and editor text
+                // are both left intact and the emergency recovery path is
+                // reported by SaveReplacement().
+                std::string save_error;
+                std::string save_path;
+                if (g_codes.SaveReplacement(*sec, candidate, &save_error,
+                                            &save_path)) {
+                    g_codes.LoadForCurrentGame();
+                    std::string msg = "Code file saved and verified: " + save_path;
+                    xemu_queue_notification(msg.c_str());
+                    ImGui::CloseCurrentPopup();
+                    g_codes_editor = CodesEditorState{};
+                } else {
+                    g_codes_editor.error = save_error;
+                }
             }
         }
     }
@@ -807,9 +821,28 @@ static void DrawNodeEditor()
                     }
 
                     if (changed) {
-                        g_codes.FinishTreeMutation(sec, changed);
-                        ImGui::CloseCurrentPopup();
-                        g_node_editor = NodeEditorState{};
+                        std::string save_error;
+                        std::string save_path;
+                        if (g_codes.FinishTreeMutation(
+                                sec, changed, &save_error, &save_path)) {
+                            std::string msg = "Cheat file saved and verified: " +
+                                              save_path;
+                            xemu_queue_notification(msg.c_str());
+                            ImGui::CloseCurrentPopup();
+                            g_node_editor = NodeEditorState{};
+                        } else {
+                            // The edited node remains in memory so the user's
+                            // work is not destroyed. Rebind the editor to its
+                            // current location so pressing Save again retries
+                            // the same node instead of creating a duplicate.
+                            g_node_editor.error = save_error;
+                            g_node_editor.mode = NodeEditorMode::EditCheat;
+                            g_node_editor.parent = target;
+                            g_node_editor.node = changed;
+                            g_node_editor.group_path =
+                                EditorPathForList(sec, target);
+                            g_node_editor.failed_save_dirty = true;
+                        }
                     }
                 }
             } else {
@@ -818,17 +851,44 @@ static void DrawNodeEditor()
                     g->is_group = true;
                     g->name = name;
                     g->expanded = true;
-                    (g_node_editor.parent ? g_node_editor.parent
-                                          : &g_node_editor.section->root)
-                        ->push_back(std::move(g));
-                    g_codes.FinishTreeMutation(*g_node_editor.section);
-                    ImGui::CloseCurrentPopup();
-                    g_node_editor = NodeEditorState{};
+                    xcheat::Node *created = g.get();
+                    xcheat::NodeList *parent =
+                        g_node_editor.parent ? g_node_editor.parent
+                                             : &g_node_editor.section->root;
+                    parent->push_back(std::move(g));
+                    std::string save_error;
+                    std::string save_path;
+                    if (g_codes.FinishTreeMutation(*g_node_editor.section,
+                                                   created, &save_error,
+                                                   &save_path)) {
+                        std::string msg = "Code file saved and verified: " +
+                                          save_path;
+                        xemu_queue_notification(msg.c_str());
+                        ImGui::CloseCurrentPopup();
+                        g_node_editor = NodeEditorState{};
+                    } else {
+                        g_node_editor.error = save_error;
+                        g_node_editor.mode = NodeEditorMode::EditGroup;
+                        g_node_editor.parent = parent;
+                        g_node_editor.node = created;
+                        g_node_editor.failed_save_dirty = true;
+                    }
                 } else if (g_node_editor.node && g_node_editor.node->is_group) {
                     g_node_editor.node->name = name;
-                    g_codes.FinishTreeMutation(*g_node_editor.section);
-                    ImGui::CloseCurrentPopup();
-                    g_node_editor = NodeEditorState{};
+                    std::string save_error;
+                    std::string save_path;
+                    if (g_codes.FinishTreeMutation(
+                            *g_node_editor.section, g_node_editor.node,
+                            &save_error, &save_path)) {
+                        std::string msg = "Code file saved and verified: " +
+                                          save_path;
+                        xemu_queue_notification(msg.c_str());
+                        ImGui::CloseCurrentPopup();
+                        g_node_editor = NodeEditorState{};
+                    } else {
+                        g_node_editor.error = save_error;
+                        g_node_editor.failed_save_dirty = true;
+                    }
                 }
             }
         }
@@ -836,6 +896,13 @@ static void DrawNodeEditor()
         if (game_changed) ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) {
+            if (g_node_editor.failed_save_dirty) {
+                /* The editor was deliberately holding an unsaved candidate so
+                 * the user could retry. Cancel means abandon that candidate;
+                 * reload the last verified primary instead of letting the
+                 * unsaved tree linger in this session. */
+                g_codes.LoadForCurrentGame();
+            }
             ImGui::CloseCurrentPopup();
             g_node_editor = NodeEditorState{};
         }
@@ -856,9 +923,20 @@ static void ProcessNodeActions()
                 auto clone = CloneEditorNode(**it);
                 clone->name = UniqueEditorSiblingName(
                     *g_node_action.parent, clone->name, !clone->is_group);
-                g_node_action.parent->insert(it + 1, std::move(clone));
-                g_codes.FinishTreeMutation(*g_node_action.section);
-                xemu_queue_notification("Cheat entry duplicated (disabled)");
+                auto inserted = g_node_action.parent->insert(it + 1,
+                                                              std::move(clone));
+                std::string save_error;
+                std::string save_path;
+                if (g_codes.FinishTreeMutation(*g_node_action.section, nullptr,
+                                               &save_error, &save_path)) {
+                    std::string msg = "Cheat entry duplicated and saved: " +
+                                      save_path;
+                    xemu_queue_notification(msg.c_str());
+                } else {
+                    /* Duplicate is not an editor workflow, so roll the failed
+                     * candidate back immediately. */
+                    g_node_action.parent->erase(inserted);
+                }
             }
         }
         g_node_action = NodeActionState{};
@@ -886,9 +964,26 @@ static void ProcessNodeActions()
                     g_node_action.parent->begin(), g_node_action.parent->end(),
                     [&](const auto &p) { return p.get() == g_node_action.node; });
                 if (it != g_node_action.parent->end()) {
+                    size_t restore_index =
+                        (size_t)std::distance(g_node_action.parent->begin(), it);
                     g_codes.PrepareNodeMutation(**it);
+                    std::unique_ptr<xcheat::Node> removed = std::move(*it);
                     g_node_action.parent->erase(it);
-                    g_codes.FinishTreeMutation(*g_node_action.section);
+                    std::string save_error;
+                    std::string save_path;
+                    if (g_codes.FinishTreeMutation(*g_node_action.section,
+                                                   nullptr, &save_error,
+                                                   &save_path)) {
+                        std::string msg = "Code file saved and verified: " +
+                                          save_path;
+                        xemu_queue_notification(msg.c_str());
+                    } else {
+                        auto restore_at = g_node_action.parent->begin() +
+                            std::min(restore_index,
+                                     g_node_action.parent->size());
+                        g_node_action.parent->insert(restore_at,
+                                                     std::move(removed));
+                    }
                 }
             }
             ImGui::CloseCurrentPopup();
@@ -943,8 +1038,22 @@ static void DrawStandaloneSection(CodesManager::Section &sec, bool patches)
     ImGui::Separator();
     ImGui::TextDisabled("Right-click a %s or group to edit, duplicate, delete, or add inside it.",
                         kind);
-    g_codes.DrawSection(sec, patches ? "No patches for this game."
-                                     : "No cheats for this game.");
+    if (!sec.source_path.empty()) {
+        ImGui::TextDisabled("Loaded: %s", sec.source_path.c_str());
+    } else if (!no_game) {
+        ImGui::TextDisabled("No file loaded. Expected filename: %s.txt",
+                            g_codes.Stem().c_str());
+    }
+
+    const char *empty_msg = nullptr;
+    if (sec.source_path.empty()) {
+        empty_msg = patches ? "No patch file found for this game."
+                            : "No cheat file found for this game.";
+    } else {
+        empty_msg = patches ? "Patch file loaded, but it contains no entries."
+                            : "Cheat file loaded, but it contains no entries.";
+    }
+    g_codes.DrawSection(sec, empty_msg);
 
 }
 
@@ -974,6 +1083,20 @@ static void DrawCheatsPatchesWindow()
     }
     xemu_feature_detach::ObserveCurrentWindow(kCodesDetachId);
 
+    // Do not let a stale Dear ImGui gamepad-navigation target keep toggling
+    // cheats after the user has returned focus to the game or another tool.
+    // Keep the normal visual appearance while disabling item interaction.
+    // Clicking the window focuses it; its controls become interactive on the
+    // following frame, while controller input cannot make accidental changes
+    // in an unfocused Cheats/Patches window.
+    const bool codes_window_focused =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        xemu_feature_detach::HasNativeInputFocus(kCodesDetachId);
+    if (!codes_window_focused) {
+        ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha, 1.0f);
+        ImGui::BeginDisabled();
+    }
+
     if (g_codes.Stem().empty()) {
         ImGui::TextDisabled("No game running.");
     } else {
@@ -983,7 +1106,9 @@ static void DrawCheatsPatchesWindow()
     }
 
     ImGui::SameLine();
-    ImGui::Checkbox("Enable codes", &g_config.codes.enable);
+    if (ImGui::Checkbox("Enable codes", &g_config.codes.enable)) {
+        xemu_settings_save();
+    }
 
     int interval = g_config.codes.interval_ms;
     interval = std::clamp(interval, 0, 1000);
@@ -993,19 +1118,35 @@ static void DrawCheatsPatchesWindow()
                          interval == 0 ? "Instant" : "%d ms")) {
         g_config.codes.interval_ms = interval;
     }
+    // Persist once when the drag/edit completes instead of rewriting xemu.toml
+    // for every intermediate slider value.
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        xemu_settings_save();
+    }
 
     ImGui::Separator();
     ImGui::TextUnformatted("Cheat/Patch Files");
     FilePicker("Cheats directory", g_config.codes.cheats_dir, nullptr, 0, true,
                [](const char *path) {
                    xemu_settings_set_string(&g_config.codes.cheats_dir, path);
+                   // Persist the directory choice immediately. Otherwise a
+                   // crash/force-close can leave perfectly good cheat files in
+                   // the custom folder while the next launch silently falls
+                   // back to the default folder and makes them look lost.
+                   xemu_settings_save();
                    g_codes.LoadForCurrentGame();
                });
     FilePicker("Patches directory", g_config.codes.patches_dir, nullptr, 0, true,
                [](const char *path) {
                    xemu_settings_set_string(&g_config.codes.patches_dir, path);
+                   xemu_settings_save();
                    g_codes.LoadForCurrentGame();
                });
+    ImGui::TextDisabled(
+        "Each picker may point directly at its folder, or both may point at "
+        "a database root containing cheats/ and patches/.");
+    ImGui::TextDisabled(
+        "Cheat edits save immediately, are read-back verified, and keep a .bak of the previous file.");
 
     ImGui::Separator();
     if (ImGui::BeginTabBar("##cheats_patches_tabs")) {
@@ -1020,6 +1161,13 @@ static void DrawCheatsPatchesWindow()
         ImGui::EndTabBar();
     }
 
+    if (!codes_window_focused) {
+        ImGui::EndDisabled();
+        ImGui::PopStyleVar();
+    }
+
+    // Editors/modals are intentionally outside the root-window focus gate:
+    // when one of them owns focus, it must remain fully interactive.
     DrawCodesEditor();
     DrawIndividualEditors();
     ImGui::End();
@@ -1029,6 +1177,9 @@ static void DrawCheatsPatchesWindow()
 
 void FeatureCodesOpenWindow()
 {
+    // Populate the tree immediately when opened instead of waiting for the
+    // next periodic runtime poll. This works even with Enable codes unchecked.
+    g_codes.IdentifyGame();
     g_codes_window_open = true;
 }
 
@@ -1036,7 +1187,7 @@ void FeatureCodesDrawMiscMenuItem()
 {
     feature_codes_settings_bridge::HideLegacySettingsTab();
     if (ImGui::MenuItem("Cheats/Patches", nullptr, g_codes_window_open)) {
-        g_codes_window_open = true;
+        FeatureCodesOpenWindow();
     }
 }
 
@@ -1054,12 +1205,13 @@ bool FeatureCodesWindowsOpen()
 #ifndef CONFIG_XEMU_FEATURE_SCRIPTING
 // The native menubar/main loop already calls these three Misc aggregation
 // hooks. When Scripting is compiled out, Cheats supplies the implementation so
-// the Cheats/Patches window remains independently usable without touching any
-// native Xemu file.
+// the rest of the custom tool windows remain independently usable without
+// adding a native Xemu integration point.
 void FeatureScriptToolsDrawMenu()
 {
     if (ImGui::BeginMenu("Misc")) {
         FeatureCodesDrawMiscMenuItem();
+        FeatureCustomToolsDrawMiscMenuItems();
         ImGui::EndMenu();
     }
 }
@@ -1067,11 +1219,12 @@ void FeatureScriptToolsDrawMenu()
 void FeatureScriptToolsShowWindows()
 {
     FeatureCodesShowWindows();
+    FeatureCustomToolsShowWindows();
 }
 
 bool FeatureScriptToolsWindowsOpen()
 {
-    return FeatureCodesWindowsOpen();
+    return FeatureCodesWindowsOpen() || FeatureCustomToolsWindowsOpen();
 }
 #endif
 
@@ -1364,32 +1517,140 @@ char *CodesManager::DirFor(const char *folder)
                             NULL);
 }
 
+static bool CodesRegularFile(const std::string &path)
+{
+    return !path.empty() &&
+           g_file_test(path.c_str(), G_FILE_TEST_IS_REGULAR);
+}
+
+static std::string CodesJoin(const std::string &a, const char *b)
+{
+    char *p = g_build_filename(a.c_str(), b, NULL);
+    std::string out = p ? p : "";
+    g_free(p);
+    return out;
+}
+
+static std::string CodesJoin(const std::string &a, const std::string &b)
+{
+    return CodesJoin(a, b.c_str());
+}
+
+static std::string CodesFindCaseInsensitive(const std::string &dir,
+                                            const std::string &wanted)
+{
+    GError *err = NULL;
+    GDir *d = g_dir_open(dir.c_str(), 0, &err);
+    if (!d) {
+        if (err) g_error_free(err);
+        return "";
+    }
+
+    std::string found;
+    const char *name = NULL;
+    while ((name = g_dir_read_name(d)) != NULL) {
+        if (g_ascii_strcasecmp(name, wanted.c_str()) != 0) {
+            continue;
+        }
+        std::string path = CodesJoin(dir, name);
+        if (CodesRegularFile(path)) {
+            found = std::move(path);
+            break;
+        }
+    }
+    g_dir_close(d);
+    return found;
+}
+
+static std::string CodesPreferredDirectory(const char *configured_dir,
+                                           const char *folder)
+{
+    const std::string root = configured_dir ? configured_dir : "";
+    std::string nested = CodesJoin(root, folder);
+
+    // A selected database root from the standalone trainer has real cheats/
+    // and patches/ children. Prefer that existing child for new files. A
+    // direct per-kind selection has no same-name child and remains unchanged.
+    if (g_file_test(nested.c_str(), G_FILE_TEST_IS_DIR)) {
+        return nested;
+    }
+    return root;
+}
+
+static std::string CodesFindFile(const char *configured_dir,
+                                 const char *folder,
+                                 const std::string &stem)
+{
+    const std::string root = configured_dir ? configured_dir : "";
+    const std::string wanted = stem + ".txt";
+
+    // Accept both supported UI interpretations:
+    //   1) the picker points directly at the cheats/patches directory;
+    //   2) it points at a common parent containing cheats/ and patches/.
+    // The first remains canonical and wins when both exist.
+    std::vector<std::string> dirs;
+    dirs.reserve(2);
+    dirs.push_back(root);
+    std::string nested = CodesJoin(root, folder);
+    if (nested != root) {
+        dirs.push_back(std::move(nested));
+    }
+
+    for (const std::string &dir : dirs) {
+        std::string exact = CodesJoin(dir, wanted);
+        if (CodesRegularFile(exact)) {
+            return exact;
+        }
+    }
+
+    // Linux filesystems are normally case-sensitive; existing trainer packs
+    // created on Windows are not guaranteed to preserve the canonical case.
+    for (const std::string &dir : dirs) {
+        std::string found = CodesFindCaseInsensitive(dir, wanted);
+        if (!found.empty()) {
+            return found;
+        }
+    }
+
+    return "";
+}
+
 void CodesManager::LoadOne(Section &sec, const char *folder)
 {
     sec.root.clear();
     sec.meta = xcheat::Meta();
+    sec.source_path.clear();
     if (m_stem.empty()) return;
 
-    // <basedir>/cheats/<stem>.txt  and  <basedir>/patches/<stem>.txt
-    //
-    // xemu_settings_get_base_path() is the same root texture-io.c builds its
-    // per-title folders from, so codes and texture packs live side by side in
-    // one place the user already knows about.
     char *dir = CodesManager::DirFor(folder);
-    char *fname = g_strdup_printf("%s.txt", m_stem.c_str());
-    char *full = g_build_filename(dir, fname, NULL);
-    g_free(fname);
+    std::string full = CodesFindFile(dir, folder, m_stem);
+
+    if (full.empty()) {
+        char *expected_name = g_strdup_printf("%s.txt", m_stem.c_str());
+        char *expected = g_build_filename(dir, expected_name, NULL);
+        fprintf(stderr,
+                "[codes] no %s file for %s; expected %s "
+                "(or a matching file in %s/)\n",
+                folder, m_stem.c_str(), expected, folder);
+        g_free(expected);
+        g_free(expected_name);
+        g_free(dir);
+        return;
+    }
     g_free(dir);
 
     gchar *contents = NULL;
     gsize len = 0;
-    bool ok = g_file_get_contents(full, &contents, &len, NULL);
-    g_free(full);
+    bool ok = g_file_get_contents(full.c_str(), &contents, &len, NULL);
     if (!ok) {
-        return;                          // no file for this game: not an error
+        fprintf(stderr, "[codes] could not read %s\n", full.c_str());
+        return;
     }
     xcheat::ParseCheatText(std::string(contents, len), &sec.root, &sec.meta);
     g_free(contents);
+    sec.source_path = full;
+
+    fprintf(stderr, "[codes] loaded %s\n", full.c_str());
 
     // Warnings are printed, not swallowed. A hand-edited file with a typo
     // should say so somewhere findable.
@@ -1486,48 +1747,285 @@ void CodesManager::ApplyBlockNow(const CompiledBlock &block)
 // xemu.c installs atexit(xemu_settings_save), which does not run on a crash,
 // a SIGKILL, or a force-close - exactly the cases where losing state is most
 // annoying. Enabled flags live in the cheat files rather than the config, so
-// they are saved here on the same principle: immediately, and atomically.
+// they are saved here on the same principle: immediately and transactionally.
 //
-// Temp file then rename, so an interrupted write cannot truncate a file the
-// user may have spent time on. Same approach as cheatfiles.write_cheat_file.
+// Persistence rules for the custom fork:
+//   1. write the complete new file to <path>.tmp;
+//   2. read it back and byte-verify it before touching the live file;
+//   3. preserve the previous live file as <path>.bak when one exists;
+//   4. replace the live file, with a Windows-compatible rename fallback;
+//   5. read the final live file back and byte-verify it;
+//   6. if the primary destination fails, make a best-effort emergency copy
+//      under <xemu data>/codes/recovery/ and report both paths to the user.
+//
+// Callers receive a real success/failure result. No UI path is allowed to say
+// "saved" merely because the in-memory tree changed.
 
-void CodesManager::SaveOne(Section &sec, const char *folder)
+static bool FileContentsEqual(const char *path, const std::string &expected,
+                              std::string *why)
 {
-    if (m_stem.empty()) return;
-
-    char *dir = CodesManager::DirFor(folder);
-    if (g_mkdir_with_parents(dir, 0755) != 0) {
-        fprintf(stderr, "[codes] could not create %s\n", dir);
-        g_free(dir);
-        return;
+    gchar *contents = nullptr;
+    gsize len = 0;
+    GError *err = nullptr;
+    if (!g_file_get_contents(path, &contents, &len, &err)) {
+        if (why) {
+            *why = std::string("could not read back '") + path + "': " +
+                   (err ? err->message : "unknown error");
+        }
+        if (err) g_error_free(err);
+        return false;
     }
 
-    char *fname = g_strdup_printf("%s.txt", m_stem.c_str());
+    bool same = len == expected.size() &&
+                (len == 0 || std::memcmp(contents, expected.data(), len) == 0);
+    g_free(contents);
+    if (!same && why) {
+        *why = std::string("read-back verification failed for '") + path +
+               "' (file contents differ from the data xemu wrote)";
+    }
+    return same;
+}
+
+static bool WriteRecoveryCopy(const std::string &stem, const char *folder,
+                              const std::string &text,
+                              std::string *recovery_path)
+{
+    char *dir = g_build_filename(xemu_settings_get_base_path(), "codes",
+                                 "recovery", NULL);
+    if (g_mkdir_with_parents(dir, 0755) != 0) {
+        g_free(dir);
+        return false;
+    }
+
+    char *fname = g_strdup_printf("%s.%s.recovery.txt", stem.c_str(), folder);
     char *full = g_build_filename(dir, fname, NULL);
-    char *tmp = g_strdup_printf("%s.tmp", full);
+
     g_free(fname);
     g_free(dir);
+
+    GError *err = nullptr;
+    bool ok = g_file_set_contents(full, text.data(), (gssize)text.size(), &err);
+    if (err) g_error_free(err);
+    if (ok) {
+        std::string verify_error;
+        ok = FileContentsEqual(full, text, &verify_error);
+    }
+    if (ok && recovery_path) *recovery_path = full;
+    g_free(full);
+    return ok;
+}
+
+static bool PreservePreviousSave(const char *full)
+{
+    if (!g_file_test(full, G_FILE_TEST_IS_REGULAR)) {
+        return false;
+    }
+
+    gchar *old_contents = nullptr;
+    gsize old_len = 0;
+    GError *read_err = nullptr;
+    if (!g_file_get_contents(full, &old_contents, &old_len, &read_err)) {
+        fprintf(stderr, "[codes] warning: could not read previous save for "
+                        "backup: %s\n",
+                read_err ? read_err->message : "unknown error");
+        if (read_err) g_error_free(read_err);
+        return false;
+    }
+
+    std::string previous(old_contents, old_len);
+    char *bak = g_strdup_printf("%s.bak", full);
+    GError *write_err = nullptr;
+    bool ok = g_file_set_contents(bak, previous.data(),
+                                  (gssize)previous.size(), &write_err);
+    if (ok) {
+        std::string verify_error;
+        ok = FileContentsEqual(bak, previous, &verify_error);
+        if (!ok) {
+            fprintf(stderr, "[codes] warning: %s\n", verify_error.c_str());
+        }
+    } else {
+        fprintf(stderr, "[codes] warning: could not update backup %s: %s\n",
+                bak, write_err ? write_err->message : "unknown error");
+    }
+    if (write_err) g_error_free(write_err);
+    g_free(old_contents);
+    g_free(bak);
+    return ok;
+}
+
+static bool RestorePreviousSave(const char *full)
+{
+    char *bak = g_strdup_printf("%s.bak", full);
+    gchar *contents = nullptr;
+    gsize len = 0;
+    bool ok = g_file_get_contents(bak, &contents, &len, nullptr);
+    if (ok) {
+        ok = g_file_set_contents(full, contents, (gssize)len, nullptr);
+    }
+    g_free(contents);
+    g_free(bak);
+    return ok;
+}
+
+bool CodesManager::SaveOne(Section &target, const Section &sec,
+                           const char *folder, std::string *error,
+                           std::string *path)
+{
+    if (error) error->clear();
+    if (path) path->clear();
+    if (m_stem.empty()) {
+        const char *msg =
+            "No running Xbox title is identified; code file was not saved.";
+        if (error) *error = msg;
+        xemu_queue_error_message(msg);
+        return false;
+    }
 
     std::string text = xcheat::RenderCheatText(
         sec.meta.game.empty() ? m_title : sec.meta.game,
         sec.meta.serial, sec.meta.titleid, sec.root, m_stem);
 
-    GError *err = NULL;
-    if (!g_file_set_contents(tmp, text.c_str(), (gssize)text.size(), &err)) {
-        fprintf(stderr, "[codes] write failed: %s\n", err ? err->message : "?");
-        if (err) g_error_free(err);
-    } else if (g_rename(tmp, full) != 0) {
-        fprintf(stderr, "[codes] rename failed for %s\n", full);
-        g_unlink(tmp);
+    char *configured_dir = CodesManager::DirFor(folder);
+    std::string full;
+    if (!target.source_path.empty()) {
+        // Preserve the exact file discovered/loaded (including case and a
+        // compatibility nested cheats/patches layout) instead of creating a
+        // second canonical-case copy on Linux.
+        full = target.source_path;
+    } else {
+        std::string save_dir = CodesPreferredDirectory(configured_dir, folder);
+        char *fname = g_strdup_printf("%s.txt", m_stem.c_str());
+        char *canonical = g_build_filename(save_dir.c_str(), fname, NULL);
+        full = canonical ? canonical : "";
+        g_free(canonical);
+        g_free(fname);
+    }
+    g_free(configured_dir);
+
+    if (path) *path = full;
+    char *parent_c = g_path_get_dirname(full.c_str());
+    std::string primary_dir = parent_c ? parent_c : "";
+    g_free(parent_c);
+    if (primary_dir.empty() ||
+        g_mkdir_with_parents(primary_dir.c_str(), 0755) != 0) {
+        int mkdir_errno = errno;
+        std::string recovery;
+        std::string msg = "Could not create code directory '" + primary_dir +
+                          "': " + g_strerror(mkdir_errno) +
+                          "\nPrimary path: " + full;
+        if (WriteRecoveryCopy(m_stem, folder, text, &recovery)) {
+            msg += "\nEmergency recovery copy saved to: " + recovery;
+        } else {
+            msg += "\nEmergency recovery copy could not be written either.";
+        }
+        if (error) *error = msg;
+        fprintf(stderr, "[codes] %s\n", msg.c_str());
+        xemu_queue_error_message(msg.c_str());
+        return false;
     }
 
-    g_free(tmp);
-    g_free(full);
+    const std::string tmp = full + ".tmp";
+
+    auto fail = [&](const std::string &reason) {
+        g_unlink(tmp.c_str());
+        std::string recovery;
+        std::string msg = reason + "\nPrimary path: " + full;
+        if (WriteRecoveryCopy(m_stem, folder, text, &recovery)) {
+            msg += "\nEmergency recovery copy saved to: " + recovery;
+        } else {
+            msg += "\nEmergency recovery copy could not be written either.";
+        }
+        if (error) *error = msg;
+        fprintf(stderr, "[codes] %s\n", msg.c_str());
+        xemu_queue_error_message(msg.c_str());
+        return false;
+    };
+
+    // Clear a stale temp from an interrupted older save. Failure here is not
+    // fatal if it did not exist; g_file_set_contents below reports a real
+    // inability to replace it.
+    g_unlink(tmp.c_str());
+
+    GError *write_err = nullptr;
+    if (!g_file_set_contents(tmp.c_str(), text.data(), (gssize)text.size(),
+                             &write_err)) {
+        std::string why = std::string("Could not write temporary code file: ") +
+                          (write_err ? write_err->message : "unknown error");
+        if (write_err) g_error_free(write_err);
+        return fail(why);
+    }
+    if (write_err) g_error_free(write_err);
+
+    std::string verify_error;
+    if (!FileContentsEqual(tmp.c_str(), text, &verify_error)) {
+        return fail(verify_error);
+    }
+
+    // Keep the previous successful file recoverable. A backup failure is
+    // logged but does not block saving the new primary file; the primary save
+    // remains the user's requested operation.
+    bool have_current_backup = PreservePreviousSave(full.c_str());
+
+    if (g_rename(tmp.c_str(), full.c_str()) != 0) {
+        // POSIX rename replaces an existing destination atomically. Windows
+        // CRT rename does not always do so, therefore fall back to moving the
+        // old destination aside, installing the temp, and rolling back if the
+        // second rename fails.
+        int first_errno = errno;
+        bool replaced = false;
+        if (g_file_test(full.c_str(), G_FILE_TEST_EXISTS)) {
+            std::string old = full + ".replace-old";
+            g_unlink(old.c_str());
+            if (g_rename(full.c_str(), old.c_str()) == 0) {
+                if (g_rename(tmp.c_str(), full.c_str()) == 0) {
+                    replaced = true;
+                    g_unlink(old.c_str());
+                } else {
+                    int install_errno = errno;
+                    if (g_rename(old.c_str(), full.c_str()) != 0) {
+                        fprintf(stderr,
+                                "[codes] CRITICAL: rollback rename failed for %s\n",
+                                full.c_str());
+                    }
+                    return fail(std::string("Could not install new code file: ") +
+                                g_strerror(install_errno));
+                }
+            }
+        }
+        if (!replaced) {
+            return fail(std::string("Could not replace code file: ") +
+                        g_strerror(first_errno));
+        }
+    }
+
+    if (!FileContentsEqual(full.c_str(), text, &verify_error)) {
+        if (have_current_backup && RestorePreviousSave(full.c_str())) {
+            verify_error +=
+                "\nThe previous code file was restored from its .bak copy.";
+        } else {
+            g_unlink(full.c_str());
+            verify_error +=
+                "\nThe unverified primary file was removed; use the reported "
+                "recovery copy.";
+        }
+        return fail(verify_error);
+    }
+
+    target.source_path = full;
+    return true;
 }
 
-void CodesManager::Save(Section &sec)
+bool CodesManager::Save(Section &sec, std::string *error, std::string *path)
 {
-    SaveOne(sec, &sec == &m_patches ? "patches" : "cheats");
+    return SaveOne(sec, sec, &sec == &m_patches ? "patches" : "cheats",
+                   error, path);
+}
+
+bool CodesManager::SaveReplacement(Section &target, const Section &contents,
+                                   std::string *error, std::string *path)
+{
+    return SaveOne(target, contents,
+                   &target == &m_patches ? "patches" : "cheats", error, path);
 }
 
 bool CodesManager::AddGeneratedAsmCheat(const char *name, const char *desc,
@@ -1561,6 +2059,7 @@ bool CodesManager::AddGeneratedAsmCheat(const char *name, const char *desc,
     // Match the convention already used by the user's database:
     //   [[ASM]\Patch name [ASM]]
     xcheat::Node *asm_group = nullptr;
+    bool created_asm_group = false;
     for (auto &node : m_cheats.root) {
         if (node->is_group && node->name == "[ASM]") {
             asm_group = node.get();
@@ -1574,6 +2073,7 @@ bool CodesManager::AddGeneratedAsmCheat(const char *name, const char *desc,
         group->expanded = true;
         asm_group = group.get();
         m_cheats.root.push_back(std::move(group));
+        created_asm_group = true;
     }
 
     // Do not silently create indistinguishable duplicates.
@@ -1608,8 +2108,35 @@ bool CodesManager::AddGeneratedAsmCheat(const char *name, const char *desc,
     xcheat::Node *created = node.get();
     asm_group->children.push_back(std::move(node));
 
-    Save(m_cheats);
+    std::string save_error;
+    std::string save_path;
+    if (!Save(m_cheats, &save_error, &save_path)) {
+        // The debugger handoff is transactional. Do not leave a generated
+        // block in memory and then tell the debugger it was saved when the
+        // primary file was not committed. Save() has already preserved a
+        // best-effort emergency recovery copy of the attempted tree.
+        auto it = std::find_if(asm_group->children.begin(),
+                               asm_group->children.end(),
+                               [created](const auto &p) {
+                                   return p.get() == created;
+                               });
+        if (it != asm_group->children.end()) {
+            asm_group->children.erase(it);
+        }
+        if (created_asm_group && asm_group->children.empty()) {
+            auto group_it = std::find_if(
+                m_cheats.root.begin(), m_cheats.root.end(),
+                [asm_group](const auto &p) { return p.get() == asm_group; });
+            if (group_it != m_cheats.root.end()) {
+                m_cheats.root.erase(group_it);
+            }
+        }
+        return false;
+    }
     RebuildLive();
+
+    std::string saved_msg = "Cheat saved and verified: " + save_path;
+    xemu_queue_notification(saved_msg.c_str());
 
     // If requested, take ownership of the live patch immediately rather than
     // waiting for the normal apply interval. This is what lets the debugger
@@ -1648,14 +2175,32 @@ void CodesManager::PrepareNodeMutation(xcheat::Node &node)
     m_engine.ClearSwitches(bid, false);
 }
 
-void CodesManager::FinishTreeMutation(Section &sec, xcheat::Node *changed)
+bool CodesManager::FinishTreeMutation(Section &sec, xcheat::Node *changed,
+                                      std::string *error, std::string *path)
 {
-    Save(sec);
+    bool saved = Save(sec, error, path);
+    if (!saved) {
+        /* PrepareNodeMutation() may have restored old [ASM] bytes before an
+         * edit/delete. The last successfully compiled m_live still contains
+         * the disk-backed blocks, so put those executable patches back now
+         * and, crucially, do not compile the unsaved candidate tree. */
+        if (g_config.codes.enable) {
+            for (const auto &block : m_live) {
+                if (block.asm_patch) {
+                    ApplyBlockNow(block);
+                }
+            }
+        }
+        return false;
+    }
+
     RebuildLive();
 
     // Match the existing checkbox behavior: an enabled [ASM] edit should take
     // ownership of its new bytes immediately instead of waiting for the next
     // configured codes interval. Ordinary data cheats continue through Tick().
+    // Do not immediately apply a newly edited executable patch when its primary
+    // persistence failed; the error/recovery path must be resolved first.
     if (changed && !changed->is_group && changed->enabled &&
         IsAsmName(changed->name) && g_config.codes.enable) {
         for (const auto &block : m_live) {
@@ -1665,6 +2210,7 @@ void CodesManager::FinishTreeMutation(Section &sec, xcheat::Node *changed)
             }
         }
     }
+    return true;
 }
 
 bool FeatureCodesAddGeneratedAsmCheat(const char *name, const char *desc,
@@ -1693,6 +2239,21 @@ bool FeatureCodesAddGeneratedAsmCheat(const char *name, const char *desc,
 
 void CodesManager::Tick()
 {
+    /*
+     * File discovery is UI state, not cheat-execution state. Keep identifying
+     * the running title even when the master switch is off so Cheats/Patches
+     * never goes blank merely because code execution is disabled.
+     *
+     * The previous `|| m_stem.empty()` also retried the synchronized XBE read
+     * every UI frame while no title was available. A fixed 500 ms cadence is
+     * both sufficient for title changes and much cheaper at the dashboard.
+     */
+    uint32_t now = SDL_GetTicks();
+    if (m_last_identify_ms == 0 || now - m_last_identify_ms >= 500) {
+        m_last_identify_ms = now;
+        IdentifyGame();
+    }
+
     if (!g_config.codes.enable) {
         // [ASM] differs deliberately from an ordinary freeze: when the whole
         // codes feature is switched off, put executable bytes back exactly as
@@ -1706,17 +2267,6 @@ void CodesManager::Tick()
     }
     m_runtime_enabled_last = true;
 
-    /*
-     * Game identification synchronizes CPU state and reads guest XBE fields.
-     * Even the lightweight title-ID helper does not belong on every UI tick.
-     * A game cannot change without a disc swap or reset, so checking a few
-     * times a second preserves responsiveness without continual guest reads.
-     */
-    uint32_t now = SDL_GetTicks();
-    if (now - m_last_identify_ms >= 500 || m_stem.empty()) {
-        m_last_identify_ms = now;
-        IdentifyGame();
-    }
     if (m_stem.empty()) return;
 
     /*
@@ -1791,45 +2341,61 @@ void CodesManager::DrawTree(xcheat::NodeList &nodes, int depth, Section *sec)
                 ImGui::TreePop();
             }
         } else {
-            bool on = n->enabled;
+            bool old_on = n->enabled;
+            bool on = old_on;
             if (ImGui::Checkbox(n->name.c_str(), &on)) {
                 n->enabled = on;
-                // Persist right now rather than at exit -- see SaveOne().
-                if (sec) Save(*sec);
-                if (!on) {
-                    uint32_t bid = (uint32_t)(uintptr_t)n.get();
-                    if (IsAsmName(n->name)) {
-                        // Native port of the external trainer's [ASM] journal:
-                        // disabling an assembly patch restores the original
-                        // executable bytes immediately.
-                        auto r = m_mem.RestoreAsm(bid);
-                        if (r.restored_ranges || r.failed_ranges) {
-                            char msg[192];
-                            snprintf(msg, sizeof(msg),
-                                     "[ASM] restored %zu original range(s)%s",
-                                     r.restored_ranges,
-                                     r.failed_ranges ? "; some ranges failed" : "");
-                            if (r.failed_ranges) xemu_queue_error_message(msg);
-                            else xemu_queue_notification(msg);
-                        }
-                    }
-                    // Clear this cheat's switch and increment state so a
-                    // re-enable re-arms a type 3 rather than being a no-op,
-                    // and a type E switch does not come back on.
-                    m_engine.ClearSwitches(bid, false);
-                }
-                RebuildLive();
 
-                // Assembly patches are expected to be interactive: enabling
-                // one should take effect now, not after the next configured
-                // cheat interval. Applying through the normal compiled block
-                // path also captures its original bytes before the first
-                // write, so disabling it can restore them exactly.
-                if (on && IsAsmName(n->name) && g_config.codes.enable) {
-                    for (const auto &block : m_live) {
-                        if (block.node == n.get()) {
-                            ApplyBlockNow(block);
-                            break;
+                // A checkbox is a disk-backed state change. Do not alter the
+                // running cheat state unless the new enabled flag has actually
+                // reached and passed verification at the primary file path.
+                std::string save_error;
+                std::string save_path;
+                bool saved = !sec || Save(*sec, &save_error, &save_path);
+                if (!saved) {
+                    n->enabled = old_on;
+                    RebuildLive();
+                } else {
+                    if (sec) {
+                        std::string msg = "Cheat state saved and verified: " +
+                                          save_path;
+                        xemu_queue_notification(msg.c_str());
+                    }
+                    if (!on) {
+                        uint32_t bid = (uint32_t)(uintptr_t)n.get();
+                        if (IsAsmName(n->name)) {
+                            // Native port of the external trainer's [ASM] journal:
+                            // disabling an assembly patch restores the original
+                            // executable bytes immediately.
+                            auto r = m_mem.RestoreAsm(bid);
+                            if (r.restored_ranges || r.failed_ranges) {
+                                char msg[192];
+                                snprintf(msg, sizeof(msg),
+                                         "[ASM] restored %zu original range(s)%s",
+                                         r.restored_ranges,
+                                         r.failed_ranges ? "; some ranges failed" : "");
+                                if (r.failed_ranges) xemu_queue_error_message(msg);
+                                else xemu_queue_notification(msg);
+                            }
+                        }
+                        // Clear this cheat's switch and increment state so a
+                        // re-enable re-arms a type 3 rather than being a no-op,
+                        // and a type E switch does not come back on.
+                        m_engine.ClearSwitches(bid, false);
+                    }
+                    RebuildLive();
+
+                    // Assembly patches are expected to be interactive: enabling
+                    // one should take effect now, not after the next configured
+                    // cheat interval. Applying through the normal compiled block
+                    // path also captures its original bytes before the first
+                    // write, so disabling it can restore them exactly.
+                    if (on && IsAsmName(n->name) && g_config.codes.enable) {
+                        for (const auto &block : m_live) {
+                            if (block.node == n.get()) {
+                                ApplyBlockNow(block);
+                                break;
+                            }
                         }
                     }
                 }

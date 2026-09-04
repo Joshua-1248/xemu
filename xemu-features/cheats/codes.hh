@@ -74,6 +74,11 @@ public:
     struct Section {
         xcheat::NodeList root;
         xcheat::Meta meta;
+        // Exact file used for this section. Normally this is the canonical
+        // <SERIAL_TITLEID>.txt path; keeping it lets Linux case-insensitive
+        // compatibility/fallback discovery save back to the file that was
+        // actually loaded instead of creating a duplicate.
+        std::string source_path;
     };
 
     // Re-read the XBE certificate; reload the files if the game changed.
@@ -87,8 +92,18 @@ public:
     void DrawTree(xcheat::NodeList &nodes, int depth, Section *sec);
 
     // Write a section back to disk. Called on every toggle, not at exit:
-    // atexit() does not run on a crash or force-close.
-    void Save(Section &sec);
+    // atexit() does not run on a crash or force-close. The return value is
+    // authoritative: callers must not report an edit as saved unless this
+    // succeeds. Optional outputs expose the exact destination and failure.
+    bool Save(Section &sec, std::string *error = nullptr,
+              std::string *path = nullptr);
+
+    // Persist replacement contents using `target` only to select the correct
+    // cheats/patches destination. This lets the raw text editor validate and
+    // commit a candidate tree without mutating the live tree first.
+    bool SaveReplacement(Section &target, const Section &contents,
+                         std::string *error = nullptr,
+                         std::string *path = nullptr);
 
     const std::string &Stem() const { return m_stem; }
     const std::string &Title() const { return m_title; }
@@ -107,7 +122,9 @@ public:
     // PrepareNodeMutation() must be called before changing/removing a cheat
     // whose currently-active state may need to be unwound (especially [ASM]).
     void PrepareNodeMutation(xcheat::Node &node);
-    void FinishTreeMutation(Section &sec, xcheat::Node *changed = nullptr);
+    bool FinishTreeMutation(Section &sec, xcheat::Node *changed = nullptr,
+                            std::string *error = nullptr,
+                            std::string *path = nullptr);
 
 private:
     // Resolve the directory for one kind. Caller frees.
@@ -121,7 +138,8 @@ private:
     };
 
     void LoadOne(Section &sec, const char *folder);
-    void SaveOne(Section &sec, const char *folder);
+    bool SaveOne(Section &target, const Section &contents,
+                 const char *folder, std::string *error, std::string *path);
     void RebuildLive();
     void RebuildLiveFrom(const xcheat::NodeList &nodes);
     void ApplyBlockNow(const CompiledBlock &block);

@@ -1,13 +1,17 @@
 // xemu custom fork - renderer free camera UI/input frontend
+#include "frontend.hh"
 #include "ui/xui/common.hh"
 #include "ui/xui/xemu-hud.h"
 #include "ui/xemu-notifications.h"
 #include "xemu-features/freecam/freecam.h"
+#include "xemu-features/shared/detachable-windows.hh"
 
 #include <algorithm>
 #include <cmath>
 
+static constexpr const char *kFreecamDetachId = "freecam.window";
 static bool g_freecam_window_open;
+static bool g_freecam_advanced_info;
 static bool g_freecam_relative_owned;
 static bool g_freecam_relative_restore;
 
@@ -44,15 +48,27 @@ static void FreecamSetEnabledFromFrontend(bool enabled)
 static void FeatureFreecamTick()
 {
     ImGuiIO &io = ImGui::GetIO();
-    XemuFreecamStatus status{};
-    xemu_freecam_get_status(&status);
+    bool enabled = xemu_freecam_is_enabled();
 
     if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F10, false)) {
-        FreecamSetEnabledFromFrontend(!status.enabled);
-        xemu_freecam_get_status(&status);
+        enabled = !enabled;
+        FreecamSetEnabledFromFrontend(enabled);
     }
-    if (status.enabled && !io.WantTextInput &&
-        ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
+
+    /* The camera is normally disabled. Avoid collecting ~20 diagnostic
+     * atomics plus taking the settings/pose mutex on every frontend frame just
+     * to rediscover that fact. Relative mouse restoration is only needed if
+     * this frontend previously acquired it. */
+    if (!enabled) {
+        if (g_freecam_relative_owned) {
+            FreecamApplyRelativeMouse(false);
+        }
+        return;
+    }
+
+    XemuFreecamStatus status{};
+    xemu_freecam_get_status(&status);
+    if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
         xemu_freecam_reset_pose();
         xemu_queue_notification("Free Camera: pose reset");
     }
@@ -115,36 +131,9 @@ static void FeatureFreecamTick()
     }
 }
 
-void FeatureFreecamDrawMiscMenuItem()
+static void DrawFreecamAdvancedInfo(const XemuFreecamStatus &status)
 {
-    ImGui::MenuItem("Free Camera", "F10", &g_freecam_window_open);
-}
-
-void FeatureFreecamDrawWindow()
-{
-    FeatureFreecamTick();
-
-    if (!g_freecam_window_open) {
-        return;
-    }
-
-    if (!ImGui::Begin("Free Camera", &g_freecam_window_open)) {
-        ImGui::End();
-        return;
-    }
-
-    XemuFreecamStatus status{};
-    xemu_freecam_get_status(&status);
-    XemuFreecamSettings settings = status.settings;
-
-    bool enabled = settings.enabled;
-    if (ImGui::Checkbox("Enable free camera", &enabled)) {
-        FreecamSetEnabledFromFrontend(enabled);
-        settings.enabled = enabled;
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("F10");
-
+    ImGui::SeparatorText("Renderer diagnostics");
     ImGui::Text("NV2A renderer hook: %s", status.renderer_seen ? "Ready" : "Waiting");
     ImGui::Text("Fixed-function draws seen: %llu",
                 (unsigned long long)status.fixed_function_draws);
@@ -195,14 +184,23 @@ void FeatureFreecamDrawWindow()
         ImGui::Text("Hard transform failures: %llu",
                     (unsigned long long)status.transform_failures);
     }
+}
 
-    if (status.programmable_draws) {
-        ImGui::TextWrapped(
-            "Programmable VSH draws keep the Milestone 3.1 post-VSH "
-            "compatibility transform in both camera modes. Reconstructed "
-            "View currently changes the fixed-function path, where Xemu has "
-            "enough guest MMAT/CMAT state to insert translation before "
-            "projection without guessing a game's VSH constant layout.");
+static void DrawFreecamControls(XemuFreecamStatus &status)
+{
+    XemuFreecamSettings settings = status.settings;
+
+    bool enabled = settings.enabled;
+    if (ImGui::Checkbox("Enable free camera", &enabled)) {
+        FreecamSetEnabledFromFrontend(enabled);
+        settings.enabled = enabled;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("F10");
+
+    ImGui::Checkbox("Show advanced renderer info", &g_freecam_advanced_info);
+    if (g_freecam_advanced_info) {
+        DrawFreecamAdvancedInfo(status);
     }
 
     bool settings_changed = false;
@@ -218,20 +216,6 @@ void FeatureFreecamDrawWindow()
                      IM_ARRAYSIZE(render_modes))) {
         settings.render_mode = (uint32_t)render_mode;
         settings_changed = true;
-    }
-    if (settings.render_mode == XEMU_FREECAM_RENDER_RECONSTRUCTED_VIEW) {
-        ImGui::TextWrapped(
-            "Reconstructed View first factors a camera-like 3D view and "
-            "perspective directly from CMAT, which works even when a title "
-            "keeps PMAT/MMAT0 stale. MMAT0+CMAT recovery remains a secondary "
-            "route. Perspective 3D draws that still cannot be recovered fall "
-            "back to Projective compatibility; obvious 2D/HUD draws are left "
-            "unchanged instead of being warped with the world.");
-    } else {
-        ImGui::TextWrapped(
-            "Projective compatibility preserves the Milestone 3.1 behavior: "
-            "it transforms the already-composed/projected draw. This is the "
-            "broadest compatibility mode and remains available unchanged.");
     }
 
     ImGui::SeparatorText("Movement");
@@ -288,6 +272,34 @@ void FeatureFreecamDrawWindow()
     if (ImGui::Button("Reset Pose (Home)")) {
         xemu_freecam_reset_pose();
     }
+}
+
+static void DrawFreecamInfo(const XemuFreecamStatus &status)
+{
+    if (status.settings.render_mode == XEMU_FREECAM_RENDER_RECONSTRUCTED_VIEW) {
+        ImGui::TextWrapped(
+            "Reconstructed View first factors a camera-like 3D view and "
+            "perspective directly from CMAT, which works even when a title "
+            "keeps PMAT/MMAT0 stale. MMAT0+CMAT recovery remains a secondary "
+            "route. Perspective 3D draws that still cannot be recovered fall "
+            "back to Projective compatibility; obvious 2D/HUD draws are left "
+            "unchanged instead of being warped with the world.");
+    } else {
+        ImGui::TextWrapped(
+            "Projective compatibility preserves the Milestone 3.1 behavior: "
+            "it transforms the already-composed/projected draw. This is the "
+            "broadest compatibility mode and remains available unchanged.");
+    }
+
+    if (status.programmable_draws) {
+        ImGui::Spacing();
+        ImGui::TextWrapped(
+            "Programmable VSH draws keep the Milestone 3.1 post-VSH "
+            "compatibility transform in both camera modes. Reconstructed View "
+            "currently changes the fixed-function path, where Xemu has enough "
+            "guest MMAT/CMAT state to insert translation before projection "
+            "without guessing a game's VSH constant layout.");
+    }
 
     ImGui::Spacing();
     ImGui::TextWrapped(
@@ -298,6 +310,65 @@ void FeatureFreecamDrawWindow()
         "Programmable-VSH draws still use the safe post-VSH tail. CPU-side "
         "portal/frustum/LOD culling is still owned by the game, so geometry the "
         "game never submits cannot be recovered by either renderer mode.");
+}
+
+void FeatureFreecamDrawMiscMenuItem()
+{
+    ImGui::MenuItem("Free Camera", "F10", &g_freecam_window_open);
+}
+
+void FeatureFreecamDrawWindow()
+{
+    // Detached callbacks recurse into this function in a second ImGui
+    // context. Camera input/timing must still be serviced exactly once from
+    // the main frontend context each frame.
+    if (!xemu_feature_detach::IsDetachedPass(kFreecamDetachId)) {
+        FeatureFreecamTick();
+    }
+
+    xemu_feature_detach::Register(kFreecamDetachId, "Free Camera",
+                                  &g_freecam_window_open,
+                                  []() { FeatureFreecamDrawWindow(); });
+    xemu_feature_detach::Pump();
+
+    if (!g_freecam_window_open ||
+        !xemu_feature_detach::ShouldDraw(kFreecamDetachId)) {
+        return;
+    }
+
+    if (xemu_feature_detach::IsDetachedPass(kFreecamDetachId)) {
+        xemu_feature_detach::PrepareWindow(kFreecamDetachId);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(520.0f, 620.0f),
+                                 ImGuiCond_FirstUseEver);
+    }
+    const ImGuiWindowFlags flags =
+        xemu_feature_detach::WindowFlags(kFreecamDetachId, 0);
+    if (!ImGui::Begin("Free Camera", &g_freecam_window_open, flags)) {
+        ImGui::End();
+        return;
+    }
+    xemu_feature_detach::ObserveCurrentWindow(kFreecamDetachId);
+
+    XemuFreecamStatus status{};
+    xemu_freecam_get_status(&status);
+
+    if (ImGui::BeginTabBar("##freecam_tabs")) {
+        if (ImGui::BeginTabItem("Controls")) {
+            DrawFreecamControls(status);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Info")) {
+            DrawFreecamInfo(status);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 
     ImGui::End();
+}
+
+bool FeatureFreecamWindowOpen()
+{
+    return g_freecam_window_open;
 }

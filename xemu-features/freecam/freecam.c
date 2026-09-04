@@ -147,7 +147,7 @@ static void freecam_init_once(void)
         memset(&g_freecam, 0, sizeof(g_freecam));
         qemu_mutex_init(&g_freecam.lock);
         g_freecam.settings.enabled = false;
-        g_freecam.settings.capture_mouse = true;
+        g_freecam.settings.capture_mouse = false;
         g_freecam.settings.invert_mouse_y = false;
         g_freecam.settings.fov_override = false;
         g_freecam.settings.render_mode = XEMU_FREECAM_RENDER_PROJECTIVE;
@@ -191,6 +191,14 @@ static void freecam_basis(const XemuFreecamPose *pose,
         up[i] = base_up[i] * cr - base_right[i] * sr;
         forward[i] = base_forward[i];
     }
+}
+
+bool xemu_freecam_is_enabled(void)
+{
+    /* g_freecam is static-zero initialized, so this remains safe even before
+     * freecam_init_once(). Enabling the camera initializes/publishes settings
+     * before setting this hot flag. */
+    return qatomic_read(&g_freecam.hot_enabled) != 0;
 }
 
 void xemu_freecam_get_settings(XemuFreecamSettings *settings)
@@ -1435,13 +1443,14 @@ static bool freecam_transform_programmable_draw(PGRAPHState *pg)
 
 void xemu_freecam_renderer_draw_begin(NV2AState *d)
 {
-    freecam_init_once();
     if (!d || !qatomic_read(&g_freecam.hot_enabled)) {
-        /* Disabled freecam is deliberately a single hot flag test: no PGRAPH
-         * register reads, snapshot mutex checks, shader parsing, or diagnostic
-         * counter traffic on normal renderer draws. */
+        /* Static-zero initialization makes the disabled path safe before the
+         * one-time state setup. Keep ordinary renderer draws to one hot flag
+         * test: no GLib once check, PGRAPH reads, mutex, shader parsing, or
+         * diagnostic counter traffic. */
         return;
     }
+    freecam_init_once();
     PGRAPHState *pg = &d->pgraph;
     freecam_renderer_refresh_snapshot();
 
@@ -1706,10 +1715,13 @@ void xemu_freecam_renderer_draw_begin(NV2AState *d)
 
 void xemu_freecam_renderer_draw_end(NV2AState *d)
 {
-    if (!d) {
+    /* draw_active is renderer-thread owned. If draw_begin did not modify this
+     * draw there is nothing to restore, so normal/disabled draws avoid even
+     * the once-initialization check. A UI disable in the middle of a modified
+     * draw is still safe because draw_active stays set until restoration. */
+    if (!d || !g_freecam.draw_active) {
         return;
     }
-    freecam_init_once();
     freecam_restore_saved(&d->pgraph);
 }
 

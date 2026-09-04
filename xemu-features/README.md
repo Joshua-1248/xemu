@@ -38,8 +38,37 @@ Example all-off configure arguments:
 - Public headers include `config-host.h` and provide neutral inline behavior when their feature is omitted.
 - Build-disabled feature implementation sources are not added to source sets.
 - Shared guest-memory support is under `shared/` and is linked only when at least one tool that needs it is built.
+- Feature-owned bundled third-party source is isolated under `dependencies/`; it keeps its own upstream license and is not treated as fork-authored code.
 
 See each feature directory's `README.md` and `EXPORT_MANIFEST.txt` for its exact integration surface.
+
+## Custom UI organization
+
+The primary runtime/modding tools are grouped under `Misc` rather than being
+scattered through native Settings pages. With the corresponding features
+enabled, the main block is ordered:
+
+```text
+Cheats/Patches
+Texture Packs
+Audio Packs
+Fast Forward
+---
+Free Camera
+Geometry Dumper
+```
+
+Lua and Python consoles follow below that block. Feature windows that opt into
+`shared/detachable-windows.hh` can be torn into native OS windows; title-bar
+drag tear-off transfers the active drag directly to the native host instead of
+requiring a release/re-grab cycle.
+
+The custom Debugger/Disassembler also includes an in-process **Memory Search**
+tab ported from the standalone Xemu Cheat Engine workflow. It supports typed
+first/next scans, Unknown Value Search, changed/increased/decreased narrowing,
+physical/virtual regions, strings/AOB patterns, paged live results, and direct
+handoff to the Memory viewer, Disassembler, Globals, and watchpoints.
+
 
 ## Development feature: Free Camera
 

@@ -4414,11 +4414,19 @@ static void geometry_call_backend_draw(NV2AState *d,
         return;
     }
 
+    /* Normal gameplay never asks the capture layer to override culling.
+     * Keep that overwhelmingly common path identical to the backend call and
+     * avoid an NV2A register read on every draw just to discover that no
+     * state change is required. */
+    if (!disable_cull_for_render) {
+        callback(d);
+        return;
+    }
+
     PGRAPHState *pg = &d->pgraph;
     uint32_t saved_setup_raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
     const bool cull_was_enabled =
-        disable_cull_for_render &&
-        (saved_setup_raster & NV_PGRAPH_SETUPRASTER_CULLENABLE);
+        saved_setup_raster & NV_PGRAPH_SETUPRASTER_CULLENABLE;
 
     if (cull_was_enabled) {
         pgraph_reg_w(pg, NV_PGRAPH_SETUPRASTER,
@@ -4466,9 +4474,14 @@ static void geometry_capture_flush_draw(NV2AState *d)
 static void geometry_capture_flip_stall(NV2AState *d)
 {
     xemu_freecam_renderer_abort_draw(d);
-    qatomic_set(&g_geometry.flip_stall_seen, 1);
-
     int mode = qatomic_read(&g_geometry.mode);
+
+    /* flip_stall_seen is capture bookkeeping, not general renderer state.
+     * Avoid a cache-line write every displayed frame while the dumper is
+     * idle. */
+    if (mode != XEMU_GEOMETRY_CAPTURE_IDLE) {
+        qatomic_set(&g_geometry.flip_stall_seen, 1);
+    }
 
     /* FLIP_STALL closes the frame that was just rendered. */
     if (mode == XEMU_GEOMETRY_CAPTURE_FRAME_ACTIVE) {

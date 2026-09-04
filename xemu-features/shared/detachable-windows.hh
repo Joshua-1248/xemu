@@ -21,6 +21,7 @@
 #include "data/Roboto-Medium.ttf.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -41,9 +42,16 @@ struct Host {
 
     bool detached = false;
     bool pending_detach = false;
+    bool transfer_drag = false;
     bool moved_after_grace = false;
     uint32_t detached_at_ms = 0;
     uint32_t last_move_ms = 0;
+
+    // When an attached ImGui title-bar drag crosses the main-window boundary,
+    // keep the new native host glued to the same mouse gesture. This avoids
+    // the old release-then-grab-again tear-off behavior.
+    int transfer_drag_offset_x = 0;
+    int transfer_drag_offset_y = 0;
 
     int pending_x = SDL_WINDOWPOS_CENTERED;
     int pending_y = SDL_WINDOWPOS_CENTERED;
@@ -73,6 +81,12 @@ inline std::vector<SDL_Event> g_dispatch_events;
 inline bool g_event_watch_installed = false;
 inline std::string g_rendering_id;
 inline int g_last_pump_frame = -1;
+inline std::atomic_uint g_detached_host_count{0};
+/* Set only while one or more attached ImGui windows are waiting to create a
+ * native host. This lets Pump() avoid even scanning g_hosts in the overwhelmingly
+ * common all-attached/no-drag state. The frontend thread recomputes it after
+ * servicing pending requests, so a bool is sufficient. */
+inline std::atomic_bool g_pending_detach_work{false};
 
 inline SDL_WindowID EventWindowID(const SDL_Event &event)
 {
@@ -104,6 +118,12 @@ inline SDL_WindowID EventWindowID(const SDL_Event &event)
 inline bool SDLCALL EventWatch(void *, SDL_Event *event)
 {
     if (!event) {
+        return true;
+    }
+    // The watch remains installed for process lifetime, but when every custom
+    // tool is attached there is nothing to route. Avoid window-id queries,
+    // mutex traffic and queue growth on the normal Xemu event path.
+    if (g_detached_host_count.load(std::memory_order_relaxed) == 0) {
         return true;
     }
     const SDL_WindowID window_id = EventWindowID(*event);
@@ -179,6 +199,17 @@ inline bool IsDetached(const char *id)
 {
     const Host *host = FindConst(id);
     return host && host->detached;
+}
+
+inline bool HasNativeInputFocus(const char *id)
+{
+    const Host *host = FindConst(id);
+    if (!host || !host->detached || !host->window) {
+        // Attached feature windows share Xemu's main native window; ImGui
+        // focus is the authoritative discriminator in that mode.
+        return true;
+    }
+    return (SDL_GetWindowFlags(host->window) & SDL_WINDOW_INPUT_FOCUS) != 0;
 }
 
 inline ImFont *FixedWidthFont(ImFont *attached_font)
@@ -279,7 +310,19 @@ inline void RequestDetachFromWindow(const char *id, ImGuiWindow *window)
     host->pending_y = main_y + (int)std::lround(window->Pos.y);
     host->pending_w = std::max(420, (int)std::lround(window->Size.x));
     host->pending_h = std::max(260, (int)std::lround(window->Size.y));
+
+    const bool left_drag = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    host->transfer_drag = left_drag;
+    if (left_drag) {
+        float global_x = 0.0f, global_y = 0.0f;
+        SDL_GetGlobalMouseState(&global_x, &global_y);
+        host->transfer_drag_offset_x =
+            (int)std::lround(global_x) - host->pending_x;
+        host->transfer_drag_offset_y =
+            (int)std::lround(global_y) - host->pending_y;
+    }
     host->pending_detach = true;
+    g_pending_detach_work.store(true, std::memory_order_relaxed);
 }
 
 inline void RequestDetach(const char *id)
@@ -385,6 +428,7 @@ inline void BuildHostFonts(Host &host, float logical_font_size,
 inline bool CreateNativeHost(Host &host)
 {
     if (host.window && host.gl && host.imgui) {
+        const bool was_detached = host.detached;
         host.detached = true;
         host.pending_detach = false;
         host.detached_at_ms = SDL_GetTicks();
@@ -394,6 +438,9 @@ inline bool CreateNativeHost(Host &host)
         SDL_SetWindowTitle(host.window, host.title.c_str());
         SDL_ShowWindow(host.window);
         SDL_RaiseWindow(host.window);
+        if (!was_detached) {
+            g_detached_host_count.fetch_add(1, std::memory_order_relaxed);
+        }
         return true;
     }
 
@@ -402,6 +449,7 @@ inline bool CreateNativeHost(Host &host)
     SDL_GLContext main_gl = SDL_GL_GetCurrentContext();
     if (!main_imgui || !main_window || !main_gl) {
         host.pending_detach = false;
+        host.transfer_drag = false;
         return false;
     }
 
@@ -437,6 +485,7 @@ inline bool CreateNativeHost(Host &host)
         SDL_GL_MakeCurrent(main_window, main_gl);
         ImGui::SetCurrentContext(main_imgui);
         host.pending_detach = false;
+        host.transfer_drag = false;
         return false;
     }
 
@@ -476,6 +525,7 @@ inline bool CreateNativeHost(Host &host)
         host.default_font = nullptr;
         host.fixed_font = nullptr;
         host.pending_detach = false;
+        host.transfer_drag = false;
         ImGui::SetCurrentContext(main_imgui);
         return false;
     }
@@ -486,6 +536,7 @@ inline bool CreateNativeHost(Host &host)
     host.detached_at_ms = SDL_GetTicks();
     host.last_move_ms = host.detached_at_ms;
     host.moved_after_grace = false;
+    g_detached_host_count.fetch_add(1, std::memory_order_relaxed);
 
     EnsureEventWatch();
     SDL_ShowWindow(window);
@@ -498,11 +549,16 @@ inline bool CreateNativeHost(Host &host)
 
 inline void Reattach(Host &host)
 {
+    const bool was_detached = host.detached;
     host.detached = false;
     host.pending_detach = false;
+    host.transfer_drag = false;
     host.moved_after_grace = false;
     if (host.window) {
         SDL_HideWindow(host.window);
+    }
+    if (was_detached) {
+        g_detached_host_count.fetch_sub(1, std::memory_order_relaxed);
     }
 }
 
@@ -584,7 +640,8 @@ inline void RenderHost(Host &host, const std::vector<SDL_Event> &events,
 
     // Drag the native tool window back so its center is over Xemu and release:
     // after the OS finishes the move sequence it automatically reattaches.
-    if (host.moved_after_grace && now - host.last_move_ms > 180 &&
+    if (!host.transfer_drag && host.moved_after_grace &&
+        now - host.last_move_ms > 180 &&
         DetachedWindowCenterIsInsideMain(host)) {
         Reattach(host);
         ImGui::SetCurrentContext(main_imgui);
@@ -638,6 +695,14 @@ inline void Pump()
         return;
     }
 
+    // Normal gameplay with every tool attached/closed should make detachable
+    // support almost disappear. Pending detach is a rare UI action, so only
+    // scan the tiny registered-host map when there is no native host alive.
+    if (g_detached_host_count.load(std::memory_order_relaxed) == 0 &&
+        !g_pending_detach_work.load(std::memory_order_relaxed)) {
+        return;
+    }
+
     ImGuiContext *main_imgui = ImGui::GetCurrentContext();
     if (!main_imgui) {
         return;
@@ -657,20 +722,74 @@ inline void Pump()
     for (auto &entry : g_hosts) {
         Host &host = entry.second;
         if (host.pending_detach && host.open && *host.open) {
-            // Do not spawn an OS window while the user is still holding the
-            // title-bar drag.  On platforms where the button-up happened
-            // outside Xemu, synchronize that release back into the main ImGui
-            // context first so it cannot remain stuck in MovingWindow state.
-            const SDL_MouseButtonFlags global_buttons =
-                SDL_GetGlobalMouseState(nullptr, nullptr);
-            if (global_buttons & SDL_BUTTON_LMASK) {
-                continue;
-            }
-            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (host.transfer_drag) {
+                // Tear off immediately while the original title-bar button is
+                // still held. The native host will follow the same global
+                // mouse gesture until release below. Explicitly end ImGui's
+                // attached-window move so the main context cannot stay stuck
+                // after the OS window appears.
+                ImGuiContext &g = *GImGui;
+                g.MovingWindow = nullptr;
+                ImGui::ClearActiveID();
                 ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
-                continue;
+                CreateNativeHost(host);
+            } else {
+                // Context-menu/manual detach: avoid transferring an unrelated
+                // left-button gesture into the new native window.
+                const SDL_MouseButtonFlags global_buttons =
+                    SDL_GetGlobalMouseState(nullptr, nullptr);
+                if (global_buttons & SDL_BUTTON_LMASK) {
+                    continue;
+                }
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+                    continue;
+                }
+                CreateNativeHost(host);
             }
-            CreateNativeHost(host);
+        }
+    }
+
+    /* A request can disappear because its tool closed before host creation, or
+     * can remain pending while a manual detach waits for the mouse button to be
+     * released. Recompute one global hint here; idle Pump() calls then become
+     * two relaxed loads and a return instead of a map walk. */
+    bool still_pending = false;
+    for (auto &entry : g_hosts) {
+        Host &host = entry.second;
+        if (host.pending_detach && (!host.open || !*host.open)) {
+            host.pending_detach = false;
+            host.transfer_drag = false;
+        }
+        still_pending |= host.pending_detach;
+    }
+    g_pending_detach_work.store(still_pending, std::memory_order_relaxed);
+
+    // Continue an attached title-bar drag seamlessly in native-window space.
+    // The mouse-down originated in Xemu, so SDL cannot ask the window manager
+    // to continue that same move on a freshly-created window. Following the
+    // global cursor here reproduces the expected tear-off interaction without
+    // requiring the user to release and grab the title bar again.
+    for (auto &entry : g_hosts) {
+        Host &host = entry.second;
+        if (!host.detached || !host.window || !host.transfer_drag) {
+            continue;
+        }
+
+        float global_x = 0.0f, global_y = 0.0f;
+        const SDL_MouseButtonFlags buttons =
+            SDL_GetGlobalMouseState(&global_x, &global_y);
+        if (buttons & SDL_BUTTON_LMASK) {
+            SDL_SetWindowPosition(
+                host.window,
+                (int)std::lround(global_x) - host.transfer_drag_offset_x,
+                (int)std::lround(global_y) - host.transfer_drag_offset_y);
+        } else {
+            host.transfer_drag = false;
+            host.detached_at_ms = SDL_GetTicks();
+            host.last_move_ms = host.detached_at_ms;
+            host.moved_after_grace = false;
+            SDL_RaiseWindow(host.window);
         }
     }
 

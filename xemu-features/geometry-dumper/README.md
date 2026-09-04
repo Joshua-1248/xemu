@@ -32,9 +32,17 @@ evidence.
 
 To preserve the fork's hard rule against modifying upstream Xemu/QEMU source for
 custom features, `geometry-dumper.c` is compiled through the existing
-feature-owned texture-pack PGRAPH translation unit, and the UI is compiled
-through the existing feature-owned debug-tools frontend translation unit.
+feature-owned texture-pack PGRAPH translation unit, and the UI is compiled through the existing feature-owned debug-tools frontend
+translation unit. Display/menu dispatch is handled by the feature-owned shared
+`Misc` aggregator rather than the native Debug menu.
 
 At renderer initialization, the geometry feature copies the active upstream
 `PGRAPHRenderer` descriptor and wraps only `flush_draw` and `flip_stall` in the
 feature-owned copy. The original callbacks are still invoked unchanged.
+
+## UI organization
+
+Geometry Dumper is exposed under `Misc`, directly below Free Camera. The main
+window separates capture controls/status from an `Info` tab containing the
+long-form glTF/export and serialization notes. The window also participates in
+the shared detachable-window system.

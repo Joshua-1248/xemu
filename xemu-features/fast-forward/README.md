@@ -4,6 +4,13 @@
 
 Unlimited and 2×–5× host pacing, VBLANK/render throttling, guest-clock compensation, hotkey/UI state and optional preserve-pitch host-audio transformation.
 
+## UI location
+
+`Fast Forward` is managed from the standalone `Misc > Fast Forward` tool window rather
+than the native Settings pages. The window can be detached into its own native
+OS window using the shared custom-feature tear-off behavior.
+
+
 ## Build gate
 
 - Meson: `xemu_feature_fast_forward`

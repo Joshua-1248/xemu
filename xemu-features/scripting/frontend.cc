@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // xemu custom fork - isolated Misc custom-feature frontend aggregator
 //
@@ -13,19 +12,17 @@
 #include "ui/xui/common.hh"
 #include "script-console.hh"
 #include "xemu-features/cheats/frontend.hh"
-#include "xemu-features/freecam/frontend.hh"
+#include "xemu-features/shared/misc-menu.hh"
 
 void FeatureScriptToolsDrawMenu()
 {
     if (ImGui::BeginMenu("Misc")) {
+        // Keep the primary runtime/modding tools together in a predictable
+        // top-to-bottom order.
         FeatureCodesDrawMiscMenuItem();
-#ifdef CONFIG_XEMU_FEATURE_CHEATS
+        FeatureCustomToolsDrawMiscMenuItems();
+
         ImGui::Separator();
-#endif
-#ifdef CONFIG_XEMU_FEATURE_DEBUG_TOOLS
-        FeatureFreecamDrawMiscMenuItem();
-        ImGui::Separator();
-#endif
         if (ImGui::MenuItem("Lua Console")) {
             ShowLuaConsole();
         }
@@ -39,10 +36,13 @@ void FeatureScriptToolsDrawMenu()
 void FeatureScriptToolsShowWindows()
 {
     FeatureCodesShowWindows();
+    FeatureCustomToolsShowWindows();
     ShowScriptConsoleWindows();
 }
 
 bool FeatureScriptToolsWindowsOpen()
 {
-    return FeatureCodesWindowsOpen() || ScriptConsoleWindowsOpen();
+    return FeatureCodesWindowsOpen() ||
+           FeatureCustomToolsWindowsOpen() ||
+           ScriptConsoleWindowsOpen();
 }

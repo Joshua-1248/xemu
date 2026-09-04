@@ -30,6 +30,7 @@
 #include "scsi/constants.h"
 #include "ide-internal.h"
 #include "trace.h"
+#include "xemu-features/disc-modding/disc-overlay.h"
 
 #define ATAPI_SECTOR_BITS (2 + BDRV_SECTOR_BITS)
 #define ATAPI_SECTOR_SIZE (1 << ATAPI_SECTOR_BITS)
@@ -71,6 +72,18 @@ static inline int media_is_cd(IDEState *s)
     return (media_present(s) && s->nb_sectors <= CD_MAX_SECTORS);
 }
 
+/* Custom-fork bridge: the backing image size remains authoritative unless the
+ * feature has active virtual replacement extents appended after it. */
+static inline uint64_t atapi_total_sectors(IDEState *s)
+{
+    return xemu_disc_overlay_total_sectors((uint64_t)s->nb_sectors >> 2);
+}
+
+static inline uint64_t atapi_backing_sectors(IDEState *s)
+{
+    return (uint64_t)s->nb_sectors >> 2;
+}
+
 static void cd_data_to_raw(uint8_t *buf, int lba)
 {
     /* sync bytes */
@@ -91,7 +104,8 @@ static void cd_data_to_raw(uint8_t *buf, int lba)
 static int
 cd_read_sector_sync(IDEState *s)
 {
-    int ret;
+    int ret = 0;
+    uint8_t *data;
     block_acct_start(blk_get_stats(s->blk), &s->acct,
                      ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
 
@@ -99,12 +113,24 @@ cd_read_sector_sync(IDEState *s)
 
     switch (s->cd_sector_size) {
     case 2048:
-        ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
-                        ATAPI_SECTOR_SIZE, s->io_buffer, 0);
+        data = s->io_buffer;
+        if (!xemu_disc_overlay_read_virtual(s->lba, 1, data)) {
+            ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
+                            ATAPI_SECTOR_SIZE, data, 0);
+            if (ret >= 0) {
+                xemu_disc_overlay_patch_read(s->lba, 1, data);
+            }
+        }
         break;
     case 2352:
-        ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
-                        ATAPI_SECTOR_SIZE, s->io_buffer + 16, 0);
+        data = s->io_buffer + 16;
+        if (!xemu_disc_overlay_read_virtual(s->lba, 1, data)) {
+            ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
+                            ATAPI_SECTOR_SIZE, data, 0);
+            if (ret >= 0) {
+                xemu_disc_overlay_patch_read(s->lba, 1, data);
+            }
+        }
         if (ret >= 0) {
             cd_data_to_raw(s->io_buffer, s->lba);
         }
@@ -128,6 +154,8 @@ cd_read_sector_sync(IDEState *s)
 static void cd_read_sector_cb(void *opaque, int ret)
 {
     IDEState *s = opaque;
+    uint8_t *data = (s->cd_sector_size == 2352)
+                        ? s->io_buffer + 16 : s->io_buffer;
 
     trace_cd_read_sector_cb(s->lba, ret);
 
@@ -138,6 +166,17 @@ static void cd_read_sector_cb(void *opaque, int ret)
     }
 
     block_acct_done(blk_get_stats(s->blk), &s->acct);
+
+    if (!xemu_disc_overlay_read_virtual(s->lba, 1, data)) {
+        if ((uint64_t)s->lba >= atapi_backing_sectors(s)) {
+            /* A virtual request whose mapping vanished while an async
+             * placeholder read was outstanding must fail closed, never leak
+             * unrelated sector-zero bytes into the guest. */
+            memset(data, 0, ATAPI_SECTOR_SIZE);
+        } else {
+            xemu_disc_overlay_patch_read(s->lba, 1, data);
+        }
+    }
 
     if (s->cd_sector_size == 2352) {
         cd_data_to_raw(s->io_buffer, s->lba);
@@ -167,7 +206,13 @@ static int cd_read_sector(IDEState *s)
     block_acct_start(blk_get_stats(s->blk), &s->acct,
                      ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
 
-    ide_buffered_readv(s, (int64_t)s->lba << 2, &s->qiov, 4,
+    int64_t backend_lba = s->lba;
+    if (xemu_disc_overlay_is_virtual_range(s->lba, 1)) {
+        /* Preserve QEMU's asynchronous PIO state machine. Read a harmless
+         * backing sector, then replace it in cd_read_sector_cb(). */
+        backend_lba = 0;
+    }
+    ide_buffered_readv(s, backend_lba << 2, &s->qiov, 4,
                        cd_read_sector_cb, s);
 
     s->status |= BUSY_STAT;
@@ -324,7 +369,7 @@ static void ide_atapi_cmd_reply(IDEState *s, int size, int max_size)
 static void ide_atapi_cmd_read_pio(IDEState *s, int lba, int nb_sectors,
                                    int sector_size)
 {
-    assert(0 <= lba && lba < (s->nb_sectors >> 2));
+    assert(0 <= lba && (uint64_t)lba < atapi_total_sectors(s));
 
     s->lba = lba;
     s->packet_transfer_size = nb_sectors * sector_size;
@@ -369,11 +414,23 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
          * the reply data.
          */
         if (s->lba != -1) {
+            uint8_t *data;
             if (s->cd_sector_size == 2352) {
                 n = 1;
-                cd_data_to_raw(s->io_buffer, s->lba);
+                data = s->io_buffer + 16;
             } else {
                 n = s->io_buffer_size >> 11;
+                data = s->io_buffer;
+            }
+            if (!xemu_disc_overlay_read_virtual(s->lba, n, data)) {
+                if ((uint64_t)s->lba >= atapi_backing_sectors(s)) {
+                    memset(data, 0, n * ATAPI_SECTOR_SIZE);
+                } else {
+                    xemu_disc_overlay_patch_read(s->lba, n, data);
+                }
+            }
+            if (s->cd_sector_size == 2352) {
+                cd_data_to_raw(s->io_buffer, s->lba);
             }
             s->lba += n;
         }
@@ -401,11 +458,33 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
         s->io_buffer_size = n * 2048;
         data_offset = 0;
     }
+    /* Never let one backing request straddle the physical-image/virtual
+     * boundary. This matters for large DMA reads ending at the image EOF. */
+    uint64_t backing_sectors = atapi_backing_sectors(s);
+    if ((uint64_t)s->lba < backing_sectors &&
+        (uint64_t)s->lba + n > backing_sectors) {
+        n = backing_sectors - s->lba;
+        s->io_buffer_size = n * ATAPI_SECTOR_SIZE;
+    }
+
+    bool virtual_range = xemu_disc_overlay_is_virtual_range(s->lba, n);
+    if (virtual_range && backing_sectors && (uint64_t)n > backing_sectors) {
+        /* Virtual DMA uses a harmless backing read only to preserve QEMU's
+         * async state machine before the callback substitutes host bytes.
+         * Keep that placeholder request within even an unusually small image. */
+        n = (int)backing_sectors;
+        s->io_buffer_size = n * ATAPI_SECTOR_SIZE;
+    }
+
     trace_ide_atapi_cmd_read_dma_cb_aio(s, s->lba, n);
     qemu_iovec_init_buf(&s->bus->dma->qiov, s->io_buffer + data_offset,
                         n * ATAPI_SECTOR_SIZE);
 
-    s->bus->dma->aiocb = ide_buffered_readv(s, (int64_t)s->lba << 2,
+    int64_t backend_lba = s->lba;
+    if (virtual_range) {
+        backend_lba = 0;
+    }
+    s->bus->dma->aiocb = ide_buffered_readv(s, backend_lba << 2,
                                             &s->bus->dma->qiov, n * 4,
                                             ide_atapi_cmd_read_dma_cb, s);
     return;
@@ -424,7 +503,7 @@ eot:
 static void ide_atapi_cmd_read_dma(IDEState *s, int lba, int nb_sectors,
                                    int sector_size)
 {
-    assert(0 <= lba && lba < (s->nb_sectors >> 2));
+    assert(0 <= lba && (uint64_t)lba < atapi_total_sectors(s));
 
     s->lba = lba;
     s->packet_transfer_size = nb_sectors * sector_size;
@@ -491,7 +570,7 @@ static int ide_dvd_read_structure(IDEState *s, int format,
                 if (layer != 0)
                     return -ASC_INV_FIELD_IN_CMD_PACKET;
 
-                total_sectors = s->nb_sectors >> 2;
+                total_sectors = atapi_total_sectors(s);
                 if (total_sectors == 0) {
                     return -ASC_MEDIUM_NOT_PRESENT;
                 }
@@ -982,7 +1061,7 @@ static void cmd_read(IDEState *s, uint8_t* buf)
     unsigned int nb_sectors, lba;
 
     /* Total logical sectors of ATAPI_SECTOR_SIZE(=2048) bytes */
-    uint64_t total_sectors = s->nb_sectors >> 2;
+    uint64_t total_sectors = atapi_total_sectors(s);
 
     if (buf[0] == GPCMD_READ_10) {
         nb_sectors = lduw_be_p(buf + 7);
@@ -1008,7 +1087,7 @@ static void cmd_read_cd(IDEState *s, uint8_t* buf)
     unsigned int nb_sectors, lba, transfer_request;
 
     /* Total logical sectors of ATAPI_SECTOR_SIZE(=2048) bytes */
-    uint64_t total_sectors = s->nb_sectors >> 2;
+    uint64_t total_sectors = atapi_total_sectors(s);
 
     nb_sectors = (buf[6] << 16) | (buf[7] << 8) | buf[8];
     if (nb_sectors == 0) {
@@ -1053,7 +1132,7 @@ static void cmd_read_cd(IDEState *s, uint8_t* buf)
 static void cmd_seek(IDEState *s, uint8_t* buf)
 {
     unsigned int lba;
-    uint64_t total_sectors = s->nb_sectors >> 2;
+    uint64_t total_sectors = atapi_total_sectors(s);
 
     lba = ldl_be_p(buf + 2);
     if (lba >= total_sectors) {
@@ -1112,7 +1191,7 @@ static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
 {
     int format, msf, start_track, len;
     int max_len;
-    uint64_t total_sectors = s->nb_sectors >> 2;
+    uint64_t total_sectors = atapi_total_sectors(s);
 
     max_len = lduw_be_p(buf + 7);
     format = buf[9] >> 6;
@@ -1149,7 +1228,7 @@ static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
 
 static void cmd_read_cdvd_capacity(IDEState *s, uint8_t* buf)
 {
-    uint64_t total_sectors = s->nb_sectors >> 2;
+    uint64_t total_sectors = atapi_total_sectors(s);
 
     /* NOTE: it is really the number of sectors minus 1 */
     stl_be_p(buf, total_sectors - 1);

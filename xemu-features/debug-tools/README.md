@@ -75,3 +75,40 @@ Cheats is disabled that header exposes a neutral no-op API, preserving the
 independent Debug Tools build gate.
 
 **This does not use or modify reserved Type F.**
+
+## Integrated Memory Search
+
+The Disassembler's lower tool area includes a **Memory Search** tab ported from
+the useful scanning workflow of the user's standalone Xemu Cheat Engine. Unlike
+the external tool, this implementation runs in-process and reads Xbox guest
+memory through the feature-owned debugger/guest-memory APIs rather than
+`/proc`, host process handles, or host-address discovery.
+
+Supported value types:
+
+- `int8`, `int16`, `int32` (unsigned little-endian, matching the standalone tool)
+- `float32`, `float64`
+- UTF-8 strings
+- arrays of bytes, including `??` wildcards
+
+Supported narrowing modes include Equal/Not Equal, Less/Greater, Between,
+Increased/Decreased, Increased/Decreased By, Changed, Unchanged, and **Unknown
+Value Search**.
+
+Scans can target physical RAM, common virtual Xbox regions, the detected XBE
+image, or a custom physical/virtual range. The value type, item size, alignment,
+and address space are locked after First Scan so subsequent scans cannot
+silently reinterpret the candidate set.
+
+Large scans are time-sliced on the UI thread instead of issuing unsafe guest
+memory reads from a host worker thread. Candidate membership is stored as a
+bitset, keeping an unknown `int8` scan across 128 MiB to roughly 16 MiB of
+candidate metadata rather than hundreds of megabytes of address objects.
+Two scan snapshots are reused transactionally; cancelling a Next Scan preserves
+the previous baseline and result set.
+
+Results are paged and only visible rows perform live reads. A selected result
+can be copied, opened in the Memory tab, sent to the Disassembler, added as a
+Globals watch, or used to create read/write watchpoints. Physical-to-virtual
+translation is performed only for explicit result actions, never once per row
+per frame.

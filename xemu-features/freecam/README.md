@@ -67,6 +67,16 @@ The Free Camera window reports:
 These counters distinguish an actual pre-projection camera transform from the
 compatibility homography used by earlier builds.
 
+
+### Cleaner window layout
+
+The Free Camera window now separates `Controls` and `Info`. Renderer counters
+from `NV2A renderer hook` through `All draws transformed` are hidden by default
+and can be shown with **Show advanced renderer info**. **Capture mouse while
+enabled** defaults to off so opening/enabling the tool does not immediately
+claim relative mouse input. The window participates in the shared detachable
+window system.
+
 ### Controls
 
 - F10 enable/disable hotkey.

@@ -14,6 +14,17 @@ Custom Lua/Python scripting consoles and related frontend integration.
 
 `frontend.hh` exposes menu/window composition and the open-window query. `script-console.hh` contains console-facing APIs.
 
+## Console UI
+
+- Lua Console and Python Console live under `Misc`.
+- Each console has an optional persistent **Default script directory** under
+  `Settings`; blank keeps the normal xemu data-directory location.
+- Double-clicking a script toggles it between running and stopped. The toggle
+  is bound specifically to click-count 2, so a following third/single click
+  only selects the row and cannot immediately undo the action.
+- Help popups use an explicit wrap width so their explanatory text cannot
+  collapse into a one-character-wide vertical column.
+
 ## Files owned
 
 - `frontend.cc`

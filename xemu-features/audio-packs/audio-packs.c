@@ -1242,10 +1242,6 @@ void xemu_audio_packs_frame_sync(void)
      * simultaneously be reading an AudioAsset/AudioReplacement from that
      * table, producing a real use-after-free and intermittent emulator crash.
      */
-    if (!g_config.audio.dump_enabled && !g_config.audio.replace_enabled) {
-        return;
-    }
-
     uint32_t generation = current_generation();
     if (generation == g_apu_generation) {
         return;
@@ -4100,7 +4096,11 @@ static bool audio_consumed_override_passthrough(AudioVoiceState *vs,
 bool xemu_audio_packs_process_consumed_source(unsigned int voice,
                                               float samples[][2], int count)
 {
-    if (voice >= MCPX_HW_MAX_VOICES || !samples || count <= 0) {
+    /* This hook exists solely for replacement identity/substitution. With
+     * replacement disabled, do not touch per-voice matcher state or atomics
+     * for every consumed native source block. */
+    if (!g_config.audio.replace_enabled ||
+        voice >= MCPX_HW_MAX_VOICES || !samples || count <= 0) {
         return false;
     }
     AudioVoiceState *vs = &g_voices[voice];
@@ -5298,7 +5298,8 @@ bool xemu_audio_packs_voice_has_replacement(unsigned int voice)
     /* Passthrough replacement must never short-circuit voice_get_samples():
      * the guest's real source reader/CBO/SSL machinery remains authoritative
      * and substitution happens only after those samples were consumed. */
-    return voice < MCPX_HW_MAX_VOICES &&
+    return g_config.audio.replace_enabled &&
+           voice < MCPX_HW_MAX_VOICES &&
            g_voices[voice].replacement_active &&
            !g_voices[voice].passthrough_source;
 }
@@ -5487,7 +5488,7 @@ float xemu_audio_packs_voice_rate_scale(unsigned int voice)
      * changes with the first playback of a process, later pitch bends (including
      * slow-motion/bullet-time changes) remain relative to the same anchor.
      */
-    if (voice >= MCPX_HW_MAX_VOICES) {
+    if (!g_config.audio.replace_enabled || voice >= MCPX_HW_MAX_VOICES) {
         return 1.0f;
     }
     AudioVoiceState *vs = &g_voices[voice];

@@ -4,6 +4,13 @@
 
 Source-level MCPX/APU audio dumping and WAV replacement before guest voice processing. Dumping and replacement cover resident/static DirectSound voices, software-fed/reused or circular resident buffers, and packetized streaming SSL voices (commonly music, dialogue, ambience, and other long-form audio). Normal dumping is loop-aware: proven repeated traversals are compacted to one canonical loop while unique intros and outros are retained, with loop points written both to JSON and to a standard RIFF `smpl` chunk. Exact whole-buffer and stream-prefix matching remain fast paths; a transport-agnostic consumed-source-window matcher additionally identifies source audio from the decoded PCM actually passing through MCPX, so replacement does not depend on a logical sound beginning at buffer/packet frame 0. Replacement preserves guest-controlled pitch, volume, envelopes and filters, native CBO/SSL/ring consumption and notifier timing, and preloaded randomized replacement variants. Replacement pitch anchoring prefers the source dump/pack JSON `sample_rate`, so a title entering slow motion or another pitch-modified state does not redefine the asset's normal reference rate on the next run.
 
+## UI location
+
+`Audio Packs` is managed from the standalone `Misc > Audio Packs` tool window rather
+than the native Settings pages. The window can be detached into its own native
+OS window using the shared custom-feature tear-off behavior.
+
+
 ## Build gate
 
 - Meson: `xemu_feature_audio_packs`

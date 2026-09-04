@@ -551,6 +551,7 @@ public:
         : m_language(language)
     {
         memset(m_interpreter, 0, sizeof(m_interpreter));
+        memset(m_script_directory, 0, sizeof(m_script_directory));
         memset(m_command, 0, sizeof(m_command));
     }
 
@@ -563,6 +564,7 @@ public:
     {
         m_open = true;
         EnsureInterpreter();
+        EnsureScriptDirectory();
     }
 
     bool IsOpen() const
@@ -769,7 +771,7 @@ private:
         SDL_strlcpy(m_interpreter, executable.c_str(), sizeof(m_interpreter));
     }
 
-    std::string DefaultScriptDirectory() const
+    std::string BuiltinScriptDirectory() const
     {
         std::filesystem::path p(xemu_settings_get_base_path());
         p /= "scripts";
@@ -777,6 +779,53 @@ private:
         std::error_code ec;
         std::filesystem::create_directories(p, ec);
         return p.string();
+    }
+
+    std::string ScriptDirectorySettingsPath() const
+    {
+        std::filesystem::path p(xemu_settings_get_base_path());
+        p /= IsLua() ? "lua-console.ini" : "python-console.ini";
+        return p.string();
+    }
+
+    void EnsureScriptDirectory()
+    {
+        if (m_script_directory_initialized) {
+            return;
+        }
+        m_script_directory_initialized = true;
+
+        std::ifstream in(ScriptDirectorySettingsPath());
+        std::string line;
+        while (std::getline(in, line)) {
+            constexpr const char prefix[] = "script_directory=";
+            if (line.rfind(prefix, 0) == 0) {
+                const std::string value = line.substr(sizeof(prefix) - 1);
+                SDL_strlcpy(m_script_directory, value.c_str(),
+                            sizeof(m_script_directory));
+                break;
+            }
+        }
+    }
+
+    void SaveScriptDirectory()
+    {
+        EnsureScriptDirectory();
+        std::ofstream out(ScriptDirectorySettingsPath(), std::ios::trunc);
+        if (!out) {
+            AppendOutput("[console] could not save script directory setting\n");
+            return;
+        }
+        out << "script_directory=" << m_script_directory << '\n';
+    }
+
+    std::string DefaultScriptDirectory()
+    {
+        EnsureScriptDirectory();
+        if (m_script_directory[0]) {
+            return m_script_directory;
+        }
+        return BuiltinScriptDirectory();
     }
 
     std::string ApiDirectory() const
@@ -1235,21 +1284,70 @@ return M
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Settings")) {
+            EnsureScriptDirectory();
+
             ImGui::TextUnformatted("Interpreter executable");
-            ImGui::SetNextItemWidth(360.0f);
+            ImGui::SetNextItemWidth(420.0f);
             ImGui::InputText("##interpreter", m_interpreter,
                              sizeof(m_interpreter));
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Default script directory");
+            ImGui::SetNextItemWidth(420.0f);
+            ImGui::InputTextWithHint(
+                "##script_directory", "blank = xemu data/scripts/<language>",
+                m_script_directory, sizeof(m_script_directory));
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                SaveScriptDirectory();
+            }
+            if (ImGui::Button("Browse...##script_directory")) {
+                const std::string start = DefaultScriptDirectory();
+                ShowOpenFolderDialog(start.c_str(), [this](const char *path) {
+                    if (!path || !*path) {
+                        return;
+                    }
+                    SDL_strlcpy(m_script_directory, path,
+                                sizeof(m_script_directory));
+                    SaveScriptDirectory();
+                });
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Use Default##script_directory")) {
+                m_script_directory[0] = '\0';
+                SaveScriptDirectory();
+            }
+            ImGui::TextDisabled("Current: %s", DefaultScriptDirectory().c_str());
+
+            ImGui::Separator();
             ImGui::Checkbox("Auto-scroll output", &m_auto_scroll);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
-            ImGui::TextWrapped(
-                "%s scripts run asynchronously in a child interpreter so "
+            // A wrapped TextWrapped() item inside an auto-sized menu can begin
+            // life at effectively zero content width, producing the tall
+            // one-character column seen in the old Lua/Python Help popup.
+            // Give the popup a deterministic wrap width and render ordinary
+            // unformatted text through that boundary instead.
+            constexpr float kHelpWrapWidth = 460.0f;
+            const float wrap_pos = ImGui::GetCursorPosX() + kHelpWrapWidth;
+            ImGui::PushTextWrapPos(wrap_pos);
+            const std::string intro =
+                std::string(LanguageName()) +
+                " scripts run asynchronously in a child interpreter so "
                 "emulation is never blocked. stdout/stderr and an interactive "
-                "stdin console are connected live.", LanguageName());
+                "stdin console are connected live.";
+            ImGui::TextUnformatted(intro.c_str());
             ImGui::Separator();
-            ImGui::TextWrapped(
-                "Emulator API bridge is active. Python: import xemu. Lua: local xemu = require('xemu'). APIs include virtual/physical memory, HUD drawing and images, memory-bound watches, controller visualization, event callbacks, TAS/snapshots, and optional debugger/disassembler control.");
+            ImGui::TextUnformatted(
+                "Emulator API bridge is active. Python: import xemu. Lua: "
+                "local xemu = require('xemu'). APIs include virtual/physical "
+                "memory, HUD drawing and images, memory-bound watches, "
+                "controller visualization, event callbacks, TAS/snapshots, "
+                "and optional debugger/disassembler control.");
+            ImGui::PopTextWrapPos();
+            // Ensure the popup's auto-fit width never collapses back to the
+            // width of the Help label on the first hover frame.
+            ImGui::Dummy(ImVec2(kHelpWrapWidth, 0.0f));
             ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
@@ -1318,6 +1416,19 @@ return M
                 if (ImGui::Selectable(label.c_str(), m_selected == i,
                                       ImGuiSelectableFlags_SpanAllColumns)) {
                     m_selected = i;
+                }
+
+                // Toggle only on the exact second click of a double-click
+                // sequence. A third/ordinary click therefore just selects the
+                // row and cannot immediately undo the requested run/stop.
+                if (ImGui::IsItemHovered() &&
+                    ImGui::GetMouseClickedCount(ImGuiMouseButton_Left) == 2) {
+                    m_selected = i;
+                    if (entry.running) {
+                        StopScript(i, false);
+                    } else {
+                        RunScript(i);
+                    }
                 }
                 ImGui::TableSetColumnIndex(1);
                 if (entry.running) {
@@ -2668,6 +2779,7 @@ private:
     bool m_auto_scroll = true;
     bool m_scroll_to_bottom = false;
     bool m_interpreter_initialized = false;
+    bool m_script_directory_initialized = false;
     int m_selected = -1;
     int m_running_count = 0;
     size_t m_overlay_count = 0;
@@ -2684,6 +2796,7 @@ private:
     int m_external_canvas_height = 360;
     std::string m_external_title;
     char m_interpreter[1024];
+    char m_script_directory[1024];
     char m_command[2048];
     std::vector<ScriptEntry> m_scripts;
     std::string m_output;

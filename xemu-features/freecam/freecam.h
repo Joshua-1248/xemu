@@ -71,6 +71,9 @@ typedef struct XemuFreecamStatus {
 } XemuFreecamStatus;
 
 /* UI/control thread API. */
+/* Lock-free hot-state query for frontend/renderer paths that only need to
+ * know whether the feature is active. */
+bool xemu_freecam_is_enabled(void);
 void xemu_freecam_get_status(XemuFreecamStatus *status);
 void xemu_freecam_get_settings(XemuFreecamSettings *settings);
 void xemu_freecam_set_settings(const XemuFreecamSettings *settings);

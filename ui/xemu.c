@@ -56,6 +56,7 @@
 #include "ui/xemu-notifications.h"
 #include "xemu-features/fast-forward/timing.h"
 #include "xemu-features/tas/tas.h"
+#include "xemu-features/disc-modding/disc-overlay.h"
 
 #include <stb_image.h>
 #include <locale.h>
@@ -1415,6 +1416,7 @@ void xemu_eject_disc(Error **errp)
 
     xbox_smc_eject_button();
     xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
+    xemu_disc_overlay_notify_disc_path(NULL);
     xemu_settings_save();
 
     // Xbox software may request that the drive open, but do it now anyway
@@ -1433,6 +1435,7 @@ void xemu_load_disc(const char *path, Error **errp)
     // Ensure an eject sequence is always triggered so Xbox software reloads
     xbox_smc_eject_button();
     xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
+    xemu_disc_overlay_notify_disc_path(NULL);
 
     qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", false, false,
                                false, 0, &error);
@@ -1440,6 +1443,7 @@ void xemu_load_disc(const char *path, Error **errp)
         error_propagate(errp, error);
     } else {
         xemu_settings_set_string(&g_config.sys.files.dvd_path, path);
+        xemu_disc_overlay_notify_disc_path(path);
     }
     xemu_settings_save();
 

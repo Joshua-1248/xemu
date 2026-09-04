@@ -24,7 +24,8 @@ restores Xemu's original window/GL/ImGui context after each tool render.
 Supported interaction:
 
 - drag an opted-in ImGui tool's title bar outside the main Xemu window to
-  detach it;
+  detach it; the native window takes over the same held drag gesture without
+  requiring a release/re-grab cycle;
 - right-click the title bar and choose **Detach to native window** as a
   compositor-safe fallback;
 - drag the native tool window back so its center is over Xemu to reattach it;
@@ -33,3 +34,10 @@ Supported interaction:
 
 The host is header-only so the Phase-4 feature isolation remains intact and no
 new native Meson integration hook is required.
+
+## Misc menu aggregation
+
+`misc-menu.hh` is the header-only feature-owned dispatcher for standalone
+custom tools that belong under `Misc`. It keeps Texture Packs, Audio Packs,
+Fast Forward, Free Camera and Geometry Dumper reachable through the existing
+custom menu/window hooks even when Scripting or Cheats is compiled out.

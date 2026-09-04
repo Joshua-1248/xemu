@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // xemu custom fork - isolated fast-forward frontend
 //
@@ -18,6 +17,7 @@
 #include "ui/xemu-settings.h"
 #include "xemu-features/audio-packs/frontend.hh"
 #include "xemu-features/tas/tas.h"
+#include "xemu-features/shared/detachable-windows.hh"
 
 extern "C" {
 #include "xemu-features/fast-forward/fast-forward.h"
@@ -33,6 +33,8 @@ extern "C" {
  * implementation details.
  */
 static gint g_fast_forward_mode = 1;
+static bool g_fast_forward_window_open;
+static constexpr const char *kFastForwardDetachId = "fast-forward.window";
 
 static int normalize_fast_forward_mode(bool active)
 {
@@ -158,10 +160,8 @@ static void HotkeyBinder(const char *label, int *key_value)
     ImGui::PopID();
 }
 
-void FeatureFastForwardDrawSettings()
+static void DrawFastForwardSettingsBody()
 {
-    SectionTitle("Fast Forward");
-
     int ff_speed = g_config.general.fast_forward_multiplier;
     int ff_speed_index;
 
@@ -201,6 +201,51 @@ void FeatureFastForwardDrawSettings()
     ImGui::TextWrapped(
         "Fast-forward audio remains enabled. Preserve audio pitch uses "
         "experimental granular time-compression.");
+}
+
+void FeatureFastForwardDrawSettings()
+{
+    // Fast Forward now lives in a standalone Misc tool window. Keep the
+    // settings hook as a compatibility no-op.
+}
+
+void FeatureFastForwardDrawMiscMenuItem()
+{
+    ImGui::MenuItem("Fast Forward", nullptr, &g_fast_forward_window_open);
+}
+
+void FeatureFastForwardDrawWindow()
+{
+    xemu_feature_detach::Register(kFastForwardDetachId, "Fast Forward",
+                                  &g_fast_forward_window_open,
+                                  []() { FeatureFastForwardDrawWindow(); });
+    xemu_feature_detach::Pump();
+
+    if (!g_fast_forward_window_open ||
+        !xemu_feature_detach::ShouldDraw(kFastForwardDetachId)) {
+        return;
+    }
+
+    if (xemu_feature_detach::IsDetachedPass(kFastForwardDetachId)) {
+        xemu_feature_detach::PrepareWindow(kFastForwardDetachId);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(520.0f, 360.0f),
+                                 ImGuiCond_FirstUseEver);
+    }
+    const ImGuiWindowFlags flags =
+        xemu_feature_detach::WindowFlags(kFastForwardDetachId, 0);
+    if (!ImGui::Begin("Fast Forward", &g_fast_forward_window_open, flags)) {
+        ImGui::End();
+        return;
+    }
+    xemu_feature_detach::ObserveCurrentWindow(kFastForwardDetachId);
+    DrawFastForwardSettingsBody();
+    ImGui::End();
+}
+
+bool FeatureFastForwardWindowOpen()
+{
+    return g_fast_forward_window_open;
 }
 
 void FeatureFastForwardUpdateHotkey(bool gameplay_has_focus)

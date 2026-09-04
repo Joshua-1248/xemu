@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // xemu custom fork - isolated texture pack frontend
 //
@@ -16,6 +15,7 @@
 #include "ui/xui/widgets.hh"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
+#include "xemu-features/shared/detachable-windows.hh"
 
 extern "C" {
 #include "xemu-features/texture-packs/texture-packs.h"
@@ -26,6 +26,8 @@ extern "C" {
 /* Owned entirely by this feature. The generic HUD renderer only calls the
  * narrow commit hook after drawing. */
 static bool g_reload_pending;
+static bool g_texture_packs_window_open;
+static constexpr const char *kTexturePacksDetachId = "texture-packs.window";
 
 static void HotkeyBinder(const char *label, int *key_value)
 {
@@ -69,9 +71,8 @@ static void HotkeyBinder(const char *label, int *key_value)
     ImGui::PopID();
 }
 
-void FeatureTexturePacksDrawSettings()
+static void DrawTexturePacksSettingsBody()
 {
-    SectionTitle("Texture Packs");
     if (Toggle("Dump textures", &g_config.general.texture_dump_enabled,
                "Write decoded textures to the dump directory as they are used")) {
         if (g_config.general.texture_dump_enabled) {
@@ -219,6 +220,52 @@ void FeatureTexturePacksDrawSettings()
                  &g_config.general.texture_replace_toggle_key);
     HotkeyBinder("Reload replacements",
                  &g_config.general.texture_replace_reload_key);
+}
+
+void FeatureTexturePacksDrawSettings()
+{
+    // Texture Packs now lives in a standalone Misc tool window. Keep the
+    // native settings hook as a compatibility no-op so no upstream UI source
+    // needs to change.
+}
+
+void FeatureTexturePacksDrawMiscMenuItem()
+{
+    ImGui::MenuItem("Texture Packs", nullptr, &g_texture_packs_window_open);
+}
+
+void FeatureTexturePacksDrawWindow()
+{
+    xemu_feature_detach::Register(kTexturePacksDetachId, "Texture Packs",
+                                  &g_texture_packs_window_open,
+                                  []() { FeatureTexturePacksDrawWindow(); });
+    xemu_feature_detach::Pump();
+
+    if (!g_texture_packs_window_open ||
+        !xemu_feature_detach::ShouldDraw(kTexturePacksDetachId)) {
+        return;
+    }
+
+    if (xemu_feature_detach::IsDetachedPass(kTexturePacksDetachId)) {
+        xemu_feature_detach::PrepareWindow(kTexturePacksDetachId);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(620.0f, 700.0f),
+                                 ImGuiCond_FirstUseEver);
+    }
+    const ImGuiWindowFlags flags =
+        xemu_feature_detach::WindowFlags(kTexturePacksDetachId, 0);
+    if (!ImGui::Begin("Texture Packs", &g_texture_packs_window_open, flags)) {
+        ImGui::End();
+        return;
+    }
+    xemu_feature_detach::ObserveCurrentWindow(kTexturePacksDetachId);
+    DrawTexturePacksSettingsBody();
+    ImGui::End();
+}
+
+bool FeatureTexturePacksWindowOpen()
+{
+    return g_texture_packs_window_open;
 }
 
 void FeatureTexturePacksFrameSync()

@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -55,6 +57,20 @@ private:
         std::string source;
     };
 
+    struct SavedAddress {
+        uint64_t id = 0;
+        uint64_t parent_id = 0;
+        bool is_group = false;
+        bool expanded = true;
+        std::string description;
+        uint32_t addr = 0;
+        bool virt = true;
+        int value_type = 2; // int32; same numbering as Memory Search
+        uint32_t byte_size = 4;
+        bool frozen = false;
+        std::vector<uint8_t> frozen_bytes;
+    };
+
     void DrawNavigationBar();
     void DrawDebugBar();
     void DrawFunctionBrowser(float width);
@@ -62,6 +78,9 @@ private:
     void DrawRegisters();
     void DrawBreakpoints();
     void DrawMemory();
+    void DrawMemorySearch();
+    void DrawSavedAddresses();
+    void DrawUpperLeftPane();
     void DrawBottomPanels();
     void DrawStack();
     void DrawFrameSlots(bool parameters);
@@ -122,11 +141,70 @@ private:
 
     void AddGlobalsFromCurrentFunction();
 
+    // Integrated memory scanner. This is a native/in-process port of the
+    // useful value-scanning workflow from the user's standalone Xemu Cheat
+    // Engine, but it reads guest memory through Xemu's feature-owned APIs.
+    enum class MemScanPhase : uint8_t {
+        Idle,
+        ReadFirst,
+        EvalFirst,
+        ReadNext,
+        EvalNext,
+    };
+
+    void TickMemorySearch();
+    void ResetMemorySearch();
+    void CancelMemorySearch();
+    bool StartMemoryFirstScan();
+    bool StartMemoryNextScan();
+    bool ConfigureMemoryScanRange(std::string *error);
+    bool ParseMemoryScanTarget(bool first_scan, std::string *error);
+    void PrepareMemoryNextReadPlan();
+    bool MemoryScanCandidateValid(const std::vector<uint8_t> &valid_pages,
+                                  uint32_t addr, size_t len) const;
+    bool MemoryScanFirstMatch(uint32_t addr) const;
+    bool MemoryScanNextMatch(uint32_t addr) const;
+    bool MemoryScanBit(uint64_t slot) const;
+    void SetMemoryScanBit(uint64_t slot, bool value);
+    void RebuildMemoryScanPage();
+    void RefreshMemoryScanLiveValues(size_t begin, size_t end);
+    std::string FormatMemoryScanRawValue(const uint8_t *raw) const;
+    std::string FormatMemoryScanSnapshotValue(const std::vector<uint8_t> &snapshot,
+                                              uint32_t addr) const;
+    std::string FormatMemoryScanLiveValue(uint32_t addr) const;
+    bool MemoryScanAddressToVirtual(uint32_t addr, uint32_t *va) const;
+
+    // Cheat Engine-style saved-address table, implemented natively in C++.
+    void TickSavedAddresses();
+    void EnsureSavedAddressesLoaded();
+    void InvalidateSavedAddressIndex();
+    void EnsureSavedAddressIndex();
+    bool SaveSavedAddresses(std::string *error = nullptr);
+    bool LoadSavedAddresses(std::string *error = nullptr);
+    void DrawSavedAddressChildren(uint64_t parent_id, int depth);
+    void OpenSavedAddressEditor(uint64_t id, uint64_t parent_id, bool group);
+    void DrawSavedAddressEditor();
+    void DrawSavedValueEditor();
+    void DeleteSavedAddressSubtree(uint64_t id);
+    void SetSavedAddressFrozen(uint64_t id, bool frozen, bool recurse);
+    void AddScanResultToSavedAddresses(uint32_t addr, bool virt, int value_type,
+                                       uint32_t byte_size);
+    std::string FormatSavedAddressValue(const SavedAddress &entry) const;
+    SavedAddress *FindSavedAddress(uint64_t id);
+    const SavedAddress *FindSavedAddress(uint64_t id) const;
+    bool SavedAddressSelected(uint64_t id) const;
+    void SelectSavedAddress(uint64_t id, bool toggle);
+    uint32_t DefaultSavedAddressSizeForType(int value_type) const;
+
     uint32_t m_base = 0x00010000;
     uint32_t m_selected = 0;
     uint32_t m_selection_anchor = 0;
     std::vector<uint32_t> m_selected_instructions;
     bool m_follow_eip = true;
+    uint32_t m_last_follow_eip = 0;
+    bool m_last_follow_eip_valid = false;
+    bool m_last_debug_running = true;
+    float m_disasm_wheel_accum = 0.0f;
     bool m_have_selection = false;
     char m_goto_buf[16] = "00010000";
 
@@ -153,9 +231,14 @@ private:
     int      m_mem_region = 0;
     int      m_mem_bytes_per_row = 16;
     uint32_t m_mem_sel = 0;
+    uint32_t m_mem_sel_anchor = 0;
     bool     m_mem_have_sel = false;
     bool     m_mem_edit_text = false;
     bool     m_mem_keyboard_active = false;
+    bool     m_mem_input_focused = false;
+    bool     m_mem_text_focus_pending = false;
+    bool     m_mem_drag_selecting = false;
+    bool     m_mem_drag_text = false;
     int      m_mem_nibble = 0; // 0 = high nibble next, 1 = low nibble next
     char     m_mem_input_sink[64] = "";
     // Sized to match the standalone Xemu Cheat Engine viewer: the
@@ -168,6 +251,86 @@ private:
     int      m_mem_cache_rows = 0;
     bool     m_mem_cache_virtual = true;
     bool     m_mem_cache_valid = false;
+    bool     m_open_memory_tab_requested = false;
+    float    m_mem_wheel_accum = 0.0f;
+    // Selected-value interpretation used by the Memory context menu/details.
+    // 0=u8, 1=u16, 2=u32, 3=u64, 4=float32, 5=float64.
+    int      m_mem_value_view = 2;
+
+    // Memory search / Cheat Engine style scanner. Candidate membership is a
+    // compact bitset indexed by aligned scan slots, so an unknown int8 scan
+    // across 128 MiB stays bounded instead of allocating one integer object
+    // per byte. Two snapshots are enough: baseline + work/previous-display.
+    int      m_scan_value_type = 2; // int32
+    int      m_scan_compare = 0;    // Equal To
+    int      m_scan_region = 0;     // All physical RAM
+    bool     m_scan_hex = false;
+    bool     m_scan_custom_virtual = false;
+    char     m_scan_value[160] = "";
+    char     m_scan_value_max[160] = "";
+    char     m_scan_custom_lo[16] = "00000000";
+    char     m_scan_custom_hi[16] = "08000000";
+
+    MemScanPhase m_scan_phase = MemScanPhase::Idle;
+    bool     m_scan_baseline_ready = false;
+    bool     m_scan_baseline_all_valid = false;
+    bool     m_scan_work_all_valid = false;
+    bool     m_scan_have_previous_display = false;
+    bool     m_scan_operation_unknown = false;
+    int      m_scan_operation_compare = 0;
+    int      m_scan_locked_type = 2;
+    bool     m_scan_virtual = false;
+    uint32_t m_scan_range_lo = 0;
+    uint32_t m_scan_range_hi = 0; // exclusive
+    uint32_t m_scan_first_addr = 0;
+    uint32_t m_scan_item_size = 4;
+    uint32_t m_scan_step = 4;
+    uint64_t m_scan_candidate_slots = 0;
+    uint64_t m_scan_candidate_count = 0;
+    uint64_t m_scan_work_candidate_count = 0;
+    uint64_t m_scan_eval_slot = 0;
+    size_t   m_scan_eval_word_cursor = 0;
+    uint64_t m_scan_io_cursor = 0;
+    size_t   m_scan_io_page_index = 0;
+    uint64_t m_scan_io_pages_done = 0;
+    uint64_t m_scan_io_pages_total = 0;
+    uint32_t m_scan_valid_first_page = 0;
+    bool     m_scan_sparse_read = false;
+
+    uint64_t m_scan_target_u64 = 0;
+    uint64_t m_scan_target2_u64 = 0;
+    double   m_scan_target_f64 = 0.0;
+    double   m_scan_target2_f64 = 0.0;
+    std::vector<uint8_t> m_scan_target_bytes;
+    std::vector<uint8_t> m_scan_target_mask;
+    int      m_scan_aob_anchor = -1;
+    uint8_t  m_scan_aob_anchor_byte = 0;
+    int      m_scan_search_anchor = -1;
+    uint8_t  m_scan_search_anchor_byte = 0;
+
+    std::vector<uint8_t> m_scan_baseline;
+    std::vector<uint8_t> m_scan_work;
+    std::vector<uint8_t> m_scan_baseline_valid_pages;
+    std::vector<uint8_t> m_scan_work_valid_pages;
+    std::vector<uint8_t> m_scan_needed_pages;
+    std::vector<uint64_t> m_scan_candidate_bits;
+    std::vector<uint64_t> m_scan_work_candidate_bits;
+    // When candidates are sparse, retain the exact non-empty bitset-word
+    // indices. This turns later scans into O(survivors) traversal instead of
+    // walking the full 16 MiB int8 candidate bitset just to skip zero words.
+    std::vector<uint32_t> m_scan_candidate_words;
+    std::vector<uint32_t> m_scan_work_candidate_words;
+    bool     m_scan_candidate_words_valid = true;
+    bool     m_scan_work_candidate_words_valid = true;
+
+    uint64_t m_scan_generation = 1;
+    uint64_t m_scan_page_generation = 0;
+    uint64_t m_scan_page_index = 0;
+    std::vector<uint32_t> m_scan_page_addresses;
+    std::vector<std::string> m_scan_live_values;
+    bool     m_scan_have_selected = false;
+    uint32_t m_scan_selected_addr = 0;
+    std::string m_scan_status = "Ready for a new scan";
 
     // Debugger state
     std::string m_status;
@@ -189,6 +352,41 @@ private:
     // User-adjustable vertical split between the disassembly workspace and
     // the lower register/memory/debugger panels.
     float m_code_split_ratio = 0.62f;
+    float m_left_pane_ratio = 0.30f;
+
+    // Saved Addresses
+    std::vector<SavedAddress> m_saved_addresses;
+    std::vector<uint64_t> m_saved_selected;
+    std::unordered_set<uint64_t> m_saved_selected_set;
+    // Retained tree/freeze index. Saved-address structure changes only on
+    // explicit UI mutations or title loads, so rebuilding hierarchy/frozen
+    // ancestry every ImGui frame is pure overhead.
+    bool m_saved_index_dirty = true;
+    std::unordered_map<uint64_t, size_t> m_saved_index;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> m_saved_children;
+    std::unordered_set<uint64_t> m_saved_groups_with_frozen_descendants;
+    std::vector<size_t> m_saved_frozen_indices;
+    // Per-depth child snapshots keep draw iteration mutation-safe without
+    // allocating a fresh std::vector for every open group every frame.
+    std::vector<std::vector<uint64_t>> m_saved_draw_children_scratch;
+    uint64_t m_saved_next_id = 1;
+    uint32_t m_saved_title_id = 0;
+    bool m_saved_loaded = false;
+    uint32_t m_saved_last_title_poll_ms = 0;
+    uint32_t m_saved_last_freeze_ms = 0;
+    bool m_saved_editor_open_requested = false;
+    bool m_saved_editor_is_group = false;
+    uint64_t m_saved_editor_id = 0;
+    uint64_t m_saved_editor_parent_id = 0;
+    char m_saved_editor_desc[192] = "";
+    char m_saved_editor_addr[16] = "00000000";
+    int m_saved_editor_type = 2;
+    int m_saved_editor_size = 4;
+    bool m_saved_editor_virtual = true;
+    std::string m_saved_editor_error;
+    bool m_saved_value_open_requested = false;
+    char m_saved_value_buf[256] = "";
+    std::string m_saved_value_error;
 
     // Live code patches / ASM-cheat authoring helpers.  These deliberately
     // generate ordinary existing write codes; reserved Type F is untouched.

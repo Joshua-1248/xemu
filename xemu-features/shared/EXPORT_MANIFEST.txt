@@ -5,8 +5,9 @@ FILES:
   xemu-features/shared/guest-memory.c
   xemu-features/shared/guest-memory.h
   xemu-features/shared/detachable-windows.hh
+  xemu-features/shared/misc-menu.hh
 BUILD INTEGRATION:
   guest-memory: root meson.build conditional specific_ss source inclusion.
-  detachable-windows: header-only; compiled only by feature translation units
+  detachable-windows / misc-menu: header-only; compiled only by feature translation units
   that opt into native detachable-window hosting. No native Xemu/QEMU source
   or Meson change is required.
