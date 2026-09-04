@@ -19,7 +19,7 @@ OS window using the shared custom-feature tear-off behavior.
 
 ## Public API
 
-`fast-forward.h` is the global mode/query API. `timing.h` owns VBLANK/timer/thread/guest-clock policy. `audio.h` owns completed-host-block transformation. `frontend.hh` owns settings/hotkey UI.
+`fast-forward.h` is the global mode/query API. `timing.h` owns VBLANK/timer/thread/guest-clock policy. `audio.h` owns completed-host-block transformation. `frontend.hh` owns the standalone Misc tool-window and hotkey UI.
 
 ## Files owned
 
@@ -37,7 +37,8 @@ OS window using the shared custom-feature tear-off behavior.
 - `util/main-loop.c` — main-loop unblock query (weak false fallback only while the feature is built, for standalone QEMU utility binaries).
 - `hw/xbox/mcpx/apu/monitor.c` — one completed-block audio transform/reset boundary.
 - `hw/xbox/mcpx/apu/apu.c` — APU pacing query.
-- `ui/xui/main.cc` / `ui/xui/main-menu.cc` — hotkey and settings hooks.
+- `ui/xui/main.cc` — existing custom-feature hotkey/window dispatch.
+- the retained settings callback is a compatibility no-op; Fast Forward settings live in the standalone Misc tool window.
 - `ui/xui/meson.build` and `hw/xbox/mcpx/apu/meson.build` — conditional source inclusion.
 
 ## Dependencies

@@ -39,5 +39,6 @@ new native Meson integration hook is required.
 
 `misc-menu.hh` is the header-only feature-owned dispatcher for standalone
 custom tools that belong under `Misc`. It keeps Texture Packs, Audio Packs,
-Fast Forward, Free Camera and Geometry Dumper reachable through the existing
-custom menu/window hooks even when Scripting or Cheats is compiled out.
+Fast Forward, Disc Files & Mods, Free Camera, and Geometry Dumper reachable
+through the existing custom menu/window hooks even when Scripting or Cheats is
+compiled out.

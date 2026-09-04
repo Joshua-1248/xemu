@@ -1,6 +1,6 @@
 Shared optional-tool services
 
-COPY WHEN NEEDED BY: cheats, TAS, scripting, or debug-tools.
+COPY WHEN NEEDED BY: cheats, TAS, scripting, debug-tools, texture/audio/fast-forward tool windows, freecam/geometry, or disc-modding.
 FILES:
   xemu-features/shared/guest-memory.c
   xemu-features/shared/guest-memory.h

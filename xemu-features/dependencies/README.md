@@ -32,6 +32,8 @@ xemu-features/dependencies/
         └── <unmodified official Capstone 5.0.9 release source>
 ```
 
-Capstone 5.0.9 is pinned for the integrated x86 disassembler. The repository
-maintainer populates `upstream/` once with `vendor-capstone.sh` and commits the
-verified source so ordinary builders do not need Capstone installed separately.
+Capstone 5.0.9 is pinned for the integrated x86 disassembler, and the verified
+official `upstream/` source is now committed to this repository. Ordinary
+builders do not run `vendor-capstone.sh` and do not need Capstone installed
+separately; the script remains a maintainer/recovery tool for repopulating the
+exact pinned release if the vendored tree ever needs to be reconstructed.

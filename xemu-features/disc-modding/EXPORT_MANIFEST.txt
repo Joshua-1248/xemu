@@ -1,0 +1,27 @@
+Disc Files & Mods / XDVDFS browser
+
+FILES:
+  xemu-features/disc-modding/core.cc
+  xemu-features/disc-modding/core.hh
+  xemu-features/disc-modding/disc-overlay.h
+  xemu-features/disc-modding/frontend.cc
+  xemu-features/disc-modding/frontend.hh
+  xemu-features/disc-modding/xdvdfs.cc
+  xemu-features/disc-modding/xdvdfs.hh
+  xemu-features/disc-modding/README.md
+  xemu-features/disc-modding/EXPORT_MANIFEST.txt
+
+FEATURE-OWNED COMPANION:
+  xemu-features/shared/misc-menu.hh
+
+MINIMAL NATIVE INTEGRATION:
+  hw/ide/atapi.c
+  system/vl.c
+  ui/xemu.c
+  ui/xui/meson.build
+  meson.build
+  meson_options.txt
+
+BUILD GATE:
+  xemu_feature_disc_modding
+  CONFIG_XEMU_FEATURE_DISC_MODDING

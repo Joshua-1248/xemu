@@ -19,7 +19,7 @@ OS window using the shared custom-feature tear-off behavior.
 
 ## Public API
 
-`texture-packs.h` is renderer-neutral. `texture-packs-gl.h` and `texture-packs-vk.h` expose backend lifecycle/upload/dump/sidecar hooks. `frontend.hh` owns settings, hotkeys and render/frame synchronization.
+`texture-packs.h` is renderer-neutral. `texture-packs-gl.h` and `texture-packs-vk.h` expose backend lifecycle/upload/dump/sidecar hooks. `frontend.hh` owns the standalone Misc tool-window, hotkeys, and render/frame synchronization.
 
 ## Files owned
 
@@ -36,7 +36,8 @@ OS window using the shared custom-feature tear-off behavior.
 
 - `hw/xbox/nv2a/pgraph/gl/texture.c` — binding lifecycle, sampler override, replacement upload, dumps, dynamic refresh and backend sync.
 - `hw/xbox/nv2a/pgraph/vk/texture.c` — creation plan, binding lifecycle, replacement upload, dumps, dynamic refresh and backend sync.
-- `ui/xui/main.cc` / `ui/xui/main-menu.cc` — frame/hotkey/render-commit and settings hooks.
+- `ui/xui/main.cc` — frame/hotkey/render-commit and custom-tool dispatch.
+- the retained native settings callback is a compatibility no-op; Texture Packs settings live in the standalone Misc tool window.
 - `hw/xbox/nv2a/pgraph/{meson.build,gl/meson.build,vk/meson.build}` and `ui/xui/meson.build` — conditional source inclusion.
 
 ## Dependencies

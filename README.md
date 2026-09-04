@@ -35,7 +35,7 @@ Files live under:
 ~/.local/share/xemu/xemu/textures/<TITLEID>/replacements/
 ```
 
-Both directories can be pointed elsewhere in **Settings → General**. Subfolders
+Both directories can be pointed elsewhere from **Misc → Texture Packs**. Subfolders
 inside the replacement directory are scanned, so a pack can be organised however
 you like.
 
@@ -85,8 +85,9 @@ the result without restarting.
 
 ### Cheats and patches
 
-**Settings → Codes.** Codes are grouped into cheats (toggled while playing) and
-patches (applied once), both in a plain-text format you can edit by hand.
+**Misc → Cheats/Patches.** Codes are grouped into cheats (toggled while playing) and
+patches (applied once), both in a plain-text format you can edit by hand. The old
+custom Settings → Codes page is intentionally hidden by the feature layer.
 
 ```
 ~/.local/share/xemu/xemu/codes/cheats/<SERIAL_TITLEID>.txt
@@ -101,6 +102,35 @@ against it differentially: 250 fuzz seeds, 39 directed edge cases, all 736
 games in the reference database, and all 1,472 parser files, clean under
 AddressSanitizer and UndefinedBehaviorSanitizer.
 
+### Disc Files & Mods
+
+**Misc → Disc Files & Mods.** Browse the mounted Xbox disc's XDVDFS filesystem
+directly without extracting the XISO first. The browser shows directories,
+files, sizes, type, sector/LBA information, and whether a per-title override is
+present or active.
+
+Files, directories, or the entire disc can be extracted to a chosen host
+directory. Extraction runs in the background with progress/cancel support and
+offers skip, overwrite, or auto-rename collision handling.
+
+Per-title disc-file overrides mirror the original Xbox disc path under:
+
+```text
+<xemu data>/mods/<TITLEID>/disc/...
+```
+
+A custom mod-library root can be selected in the tool. The original XISO is
+never rewritten or repacked: replacement data is exposed to the guest through
+feature-owned virtual sectors while XDVDFS metadata is adjusted in memory.
+Unsafe traversal/symlink escapes, ambiguous case collisions, and invalid
+replacement files are rejected rather than guessed.
+
+Changing replacement files requires **Reload Disc / Overrides**. Restarting the
+title after a replacement change is safest because games may cache filesystem
+metadata.
+
+See [`xemu-features/disc-modding/README.md`](xemu-features/disc-modding/README.md).
+
 ### Disassembler and debugger
 
 **Debug → Disassembler.** x86 disassembly of guest code with registers,
@@ -113,10 +143,9 @@ as feature-owned third-party source under
 library on Linux, Windows, and macOS, so a normal build no longer requires a
 separately installed Capstone package or runtime library.
 
-> The memory viewer and the Step Over / Step Out / Run-to-cursor buttons are
-> lightly tested. Step Out reads the return address from `[ebp+4]`, so it will
-> report an error on code compiled without a frame pointer — that is expected
-> rather than a fault.
+> Step Out uses the conventional `[ebp+4]` return-address path when a frame
+> pointer is available. Code compiled without a frame pointer may not support
+> that operation reliably; the other debugger and memory tools remain usable.
 
 ### Fixes
 
@@ -186,6 +215,10 @@ Beyond the UI, these keys are available in the config file:
 
 The three hotkeys are configurable as `general.texture_*_key`, using ImGui key
 codes.
+
+Disc-file override settings are kept by the feature in
+`<xemu data>/disc-modding/settings.txt`. The default per-title mod tree is
+`<xemu data>/mods/<TITLEID>/disc/`.
 
 ---
 
@@ -327,6 +360,20 @@ debugging layer.
 
 See [`xemu-features/cheats/README.md`](xemu-features/cheats/README.md).
 
+### Disc Files & Mods
+
+The fork includes an XDVDFS filesystem browser/extractor and a per-title
+disc-file override layer under
+[`xemu-features/disc-modding/`](xemu-features/disc-modding/). It can inspect a
+mounted XISO, extract one file/directory or the entire disc, and mirror
+replacement files into a per-title mod tree without modifying the source image.
+
+Overrides are resolved as Xbox-style case-insensitive paths and are exposed to
+the guest through virtual sectors. Path traversal, symlink escapes, ambiguous
+case collisions, non-regular files, and other unsafe mappings are rejected.
+
+See [`xemu-features/disc-modding/README.md`](xemu-features/disc-modding/README.md).
+
 ### TAS / TAStudio
 
 The fork includes tool-assisted-play functionality under
@@ -369,9 +416,13 @@ See [`xemu-features/freecam/README.md`](xemu-features/freecam/README.md).
 ### Fast Forward and presentation controls
 
 The fork extends Fast Forward with an unlimited mode and optional
-pitch-preserving audio behavior. Additional custom UI/hotkey work includes
-faster notifications, volume amplification controls, detachable tool-window
-infrastructure, and related quality-of-life improvements.
+pitch-preserving audio behavior. The separate Volume Amplifier feature extends
+host output from the normal 0–100% range up to 200%. Additional custom UI/hotkey
+work includes faster notifications, detachable tool-window infrastructure, and
+related quality-of-life improvements.
+
+See [`xemu-features/fast-forward/README.md`](xemu-features/fast-forward/README.md)
+and [`xemu-features/volume-amplifier/README.md`](xemu-features/volume-amplifier/README.md).
 
 ### Custom feature layout
 
@@ -383,13 +434,15 @@ xemu-features/
 ├── cheats/
 ├── debug-tools/
 ├── dependencies/      feature-owned third-party dependencies
+├── disc-modding/
 ├── fast-forward/
 ├── freecam/
 ├── geometry-dumper/
 ├── scripting/
 ├── shared/
 ├── tas/
-└── texture-packs/
+├── texture-packs/
+└── volume-amplifier/
 ```
 
 ### Bundled dependency policy

@@ -4,6 +4,12 @@
 
 Cheat/patch database parsing, UI and optimized runtime execution, including the custom Type-6 pointer format with 1–255 offsets.
 
+## UI location
+
+`Cheats/Patches` is a standalone detachable tool under **Misc → Cheats/Patches**.
+The earlier custom Settings → Codes sidebar entry is hidden by the feature
+layer; editing and runtime controls live in the standalone tool window.
+
 ## Build gate
 
 - Meson: `xemu_feature_cheats`

@@ -19,7 +19,7 @@ OS window using the shared custom-feature tear-off behavior.
 
 ## Public API
 
-`audio-packs.h` owns lifecycle, path/index, replacement/dump and per-voice state APIs. `audio-packs-apu.h` is the narrow APU preparation bridge. `frontend.hh` owns Settings UI.
+`audio-packs.h` owns lifecycle, path/index, replacement/dump and per-voice state APIs. `audio-packs-apu.h` is the narrow APU preparation bridge. `frontend.hh` owns the standalone Misc tool-window UI and hotkey boundary.
 
 ## Files owned
 
@@ -36,7 +36,8 @@ OS window using the shared custom-feature tear-off behavior.
 
 - `hw/xbox/mcpx/apu/apu.c` — init/reset/finalize lifecycle.
 - `hw/xbox/mcpx/apu/vp/vp.c` — voice reset/reuse, guest CBO writes, replacement sample/rate/end queries, frame-boundary synchronization, plus the minimal source-fetch observation/substitution bridge used by packetized stream replacement.
-- `ui/xui/main-menu.cc` — one settings-panel hook.
+- `xemu-features/shared/misc-menu.hh` — standalone Misc menu/window aggregation.
+- the retained native settings callback is a compatibility no-op; Audio Packs settings live in the standalone tool window.
 - `hw/xbox/mcpx/apu/meson.build` and `ui/xui/meson.build` — conditional source inclusion.
 
 ## Dependencies

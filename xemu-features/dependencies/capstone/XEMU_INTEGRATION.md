@@ -24,9 +24,11 @@ Normal Xemu builds therefore do not require a system `libcapstone`, a Capstone
 DLL/dylib/so, Homebrew Capstone, or `libcapstone-dev` package. The Meson option
 `-Dcapstone=disabled` remains available as a developer escape hatch.
 
-## One-time repository vendoring
+## Maintenance / recovery vendoring
 
-If `upstream/` is absent, the repository maintainer runs:
+The current repository already contains the verified `upstream/` tree, so
+ordinary builders do not run a download/bootstrap step. If that directory is
+ever absent during repository maintenance or recovery, the maintainer runs:
 
 ```sh
 ./xemu-features/dependencies/vendor-capstone.sh

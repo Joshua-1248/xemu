@@ -6,3 +6,4 @@ xemu-features/geometry-dumper/README.md
 xemu-features/geometry-dumper/EXPORT_MANIFEST.txt
 xemu-features/texture-packs/texture-packs.c
 xemu-features/debug-tools/frontend.cc
+xemu-features/shared/misc-menu.hh
