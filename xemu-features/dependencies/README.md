@@ -18,17 +18,20 @@ for the Joshua-1248 custom feature layer.
 - Do not move inherited upstream xemu/QEMU dependencies here solely for
   organizational consistency.
 
-## Planned layout
+## Current bundled dependency
 
 ```text
 xemu-features/dependencies/
 ├── README.md
+├── vendor-capstone.sh
 └── capstone/
-    ├── <official pinned Capstone source>
-    ├── LICENSES/
-    └── XEMU_INTEGRATION.md
+    ├── meson.build
+    ├── UPSTREAM_VERSION.txt
+    ├── XEMU_INTEGRATION.md
+    └── upstream/
+        └── <unmodified official Capstone 5.0.9 release source>
 ```
 
-Capstone is **not yet bundled merely because this policy directory exists**.
-Until the pinned source and build integration are committed, the repository's
-existing system-detected Capstone behavior remains authoritative.
+Capstone 5.0.9 is pinned for the integrated x86 disassembler. The repository
+maintainer populates `upstream/` once with `vendor-capstone.sh` and commits the
+verified source so ordinary builders do not need Capstone installed separately.

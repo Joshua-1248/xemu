@@ -2018,22 +2018,13 @@ if not gnutls.found()
 endif
 
 capstone = not_found
-if not get_option('capstone').auto() or have_system or have_user
-  capstone = dependency('capstone', version: '>=3.0.5',
-                        method: 'pkg-config',
-                        required: get_option('capstone'))
-
-  # Some versions of capstone have broken pkg-config file
-  # that reports a wrong -I path, causing the #include to
-  # fail later. If the system has such a broken version
-  # do not use it.
-  if capstone.found() and not cc.compiles('#include <capstone.h>',
-                                          dependencies: [capstone])
-    capstone = not_found
-    if get_option('capstone').enabled()
-      error('capstone requested, but it does not appear to work')
-    endif
+if not get_option('capstone').disabled()
+  capstone_vendor_root = meson.project_source_root() / 'xemu-features/dependencies/capstone/upstream'
+  if not fs.exists(capstone_vendor_root / 'cs.c')
+    error('Bundled Capstone source is missing. Run xemu-features/dependencies/vendor-capstone.sh once, then commit xemu-features/dependencies/capstone/upstream/.')
   endif
+  subdir('xemu-features/dependencies/capstone')
+  capstone = xemu_bundled_capstone_dep
 endif
 
 gmp = dependency('gmp', required: false, method: 'pkg-config')
@@ -2503,6 +2494,7 @@ config_host_data.set('CONFIG_XEMU_FEATURE_SCRIPTING', get_option('xemu_feature_s
 config_host_data.set('CONFIG_XEMU_FEATURE_DEBUG_TOOLS', get_option('xemu_feature_debug_tools'))
 config_host_data.set('CONFIG_XEMU_FEATURE_FAST_FORWARD', get_option('xemu_feature_fast_forward'))
 config_host_data.set('CONFIG_XEMU_FEATURE_VOLUME_AMPLIFIER', get_option('xemu_feature_volume_amplifier'))
+config_host_data.set('CONFIG_XEMU_FEATURE_DISC_MODDING', get_option('xemu_feature_disc_modding'))
 audio_drivers_selected = []
 if have_system
   audio_drivers_available = {

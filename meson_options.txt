@@ -329,7 +329,7 @@ option('vduse_blk_export', type: 'feature', value: 'auto',
 option('webp', type: 'feature', value: 'auto',
        description: 'WebP support for NV2A texture replacement')
 option('capstone', type: 'feature', value: 'auto',
-       description: 'Whether and how to find the capstone library')
+       description: 'Bundled Capstone x86 disassembly support')
 option('fdt', type: 'combo', value: 'disabled',
        choices: ['disabled', 'enabled', 'auto', 'system', 'internal'],
        description: 'Whether and how to find the libfdt library')
@@ -415,3 +415,5 @@ option('xemu_feature_fast_forward', type: 'boolean', value: true,
        description: 'Build xemu custom fast-forward system')
 option('xemu_feature_volume_amplifier', type: 'boolean', value: true,
        description: 'Build xemu custom 0-200% host output volume extension')
+option('xemu_feature_disc_modding', type: 'boolean', value: true,
+       description: 'Build xemu custom Xbox disc browser/extractor and per-title file overrides')

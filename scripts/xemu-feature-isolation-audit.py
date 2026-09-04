@@ -53,6 +53,7 @@ for sr in scan_roots:
     files=[p] if p.is_file() else [x for x in p.rglob('*') if x.suffix in {'.c','.cc','.h','.hh','.build'}]
     for f in files:
         if '.before-' in f.name: continue
+        if 'xemu-features' in f.parts and 'dependencies' in f.parts: continue
         text=f.read_text(errors='replace')
         for pat in stale_patterns:
             if pat in text:

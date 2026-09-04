@@ -1,0 +1,8 @@
+Capstone Engine 5.0.9
+Official repository: https://github.com/capstone-engine/capstone
+Official tag: 5.0.9
+Official tag commit: 022575848782a4801fd150fdbc927effcbca0864
+Official release archive: capstone-5.0.9.tar.xz
+Official archive SHA-256: 1b70351879f6998998ebcbe09bd5f3c5e27127e985af14722cbe52c11c35178e
+Vendored source location: xemu-features/dependencies/capstone/upstream/
+Local modifications to upstream source: none
