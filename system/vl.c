@@ -70,6 +70,7 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "system/system.h"
+#include "xemu-features/disc-modding/disc-overlay.h"
 #include "system/numa.h"
 #include "system/hostmem.h"
 #include "exec/gdbstub.h"
@@ -3085,6 +3086,10 @@ void qemu_init(int argc, char **argv)
             break;
         }
     }
+
+    // Initialize the feature-owned disc browser/overlay before the guest can
+    // issue its first DVD read. Empty path means no mounted media.
+    xemu_disc_overlay_notify_disc_path(dvd_path);
 
     // Always populate DVD drive. If disc path is the empty string, drive is
     // connected but no media present.

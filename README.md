@@ -107,11 +107,11 @@ AddressSanitizer and UndefinedBehaviorSanitizer.
 breakpoints, watchpoints, single-stepping, and a memory viewer that can be
 addressed in either the virtual or physical address space.
 
-Capstone provides the x86 decoder used by the disassembler. The current tree can
-use a system-provided Capstone at build time. The fork reserves
-`xemu-features/dependencies/` for feature-owned bundled dependencies so custom
-dependencies can be kept together without scattering third-party source through
-upstream xemu/QEMU directories.
+Capstone 5.0.9 provides the x86 decoder used by the disassembler and is bundled
+as feature-owned third-party source under
+`xemu-features/dependencies/capstone/`. It is built as a private static x86-only
+library on Linux, Windows, and macOS, so a normal build no longer requires a
+separately installed Capstone package or runtime library.
 
 > The memory viewer and the Step Over / Step Out / Run-to-cursor buttons are
 > lightly tested. Step Out reads the return address from `[ebp+4]`, so it will
@@ -141,17 +141,17 @@ Same as upstream — see the
 [xemu build docs](https://xemu.app/docs/download/#building) — with optional
 feature dependencies where applicable.
 
-At present, libwebp and Capstone may be provided by the host build environment:
+Capstone is bundled and does **not** need to be installed separately. libwebp
+remains an optional host dependency for WebP texture replacement:
 
 ```sh
-sudo apt install libwebp-dev libcapstone-dev   # Debian/Ubuntu/Mint
-brew install webp capstone                     # macOS
+sudo apt install libwebp-dev   # Debian/Ubuntu/Mint
+brew install webp              # macOS
 ```
 
-The custom-fork policy is to place feature-owned bundled dependencies under
-`xemu-features/dependencies/` rather than scattering them through upstream-owned
-source directories. A bundled dependency keeps its own upstream license and
-provenance; bundling does not change the license of that third-party component.
+Feature-owned bundled dependencies live under `xemu-features/dependencies/`.
+Each keeps its own upstream license and provenance; bundling does not change the
+license or authorship of a third-party component.
 
 ```sh
 ./build.sh

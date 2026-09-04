@@ -94,16 +94,18 @@ Project: <https://www.capstone-engine.org/>
 
 License: **BSD-3-Clause**.
 
-Use: guest x86 disassembly. The current repository can link to a system-provided
-copy. The custom-fork dependency policy reserves
-`xemu-features/dependencies/capstone/` for a pinned bundled copy when that
-integration is committed. A bundled or statically linked Capstone remains
-BSD-3-Clause software and must retain/accompany its upstream notice. A retained
-BSD notice is provided as `licenses/capstone.license.txt`.
+Use: guest x86 disassembly. **Capstone 5.0.9 is bundled** under
+`xemu-features/dependencies/capstone/upstream/` and statically linked on supported
+Xemu hosts. The vendored tree comes from the official Capstone 5.0.9 release,
+tag commit `022575848782a4801fd150fdbc927effcbca0864`; the official release
+archive SHA-256 is
+`1b70351879f6998998ebcbe09bd5f3c5e27127e985af14722cbe52c11c35178e`.
 
-Do not copy an arbitrary Capstone tree from another emulator fork. The preferred
-provenance path is an official Capstone release/commit, recorded alongside the
-vendored source with its original license and any local integration notes.
+Only Capstone's x86 backend is compiled into Xemu. The official vendored source
+is kept unmodified; custom build integration is adjacent to it. Capstone remains
+BSD-licensed and its `upstream/LICENSE.TXT` notice must accompany redistribution.
+The repository also retains `licenses/capstone.license.txt` for outbound-license
+generation.
 
 ### `xemu-features/dependencies/` policy
 

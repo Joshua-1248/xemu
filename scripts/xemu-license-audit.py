@@ -61,10 +61,27 @@ else:
         if p.suffix not in {".c", ".cc", ".h", ".hh"}:
             continue
         rel = p.relative_to(feature_root).as_posix()
+        if rel.startswith("dependencies/"):
+            continue
         src = p.read_text(encoding="utf-8", errors="replace")
         expected = "LGPL-2.1-or-later" if rel in lgpl else "GPL-2.0-or-later"
         if f"SPDX-License-Identifier: {expected}" not in src[:2048]:
             fail(f"{p.relative_to(ROOT)}: expected SPDX {expected}")
+
+# Vendored feature dependencies keep their own licenses and provenance.
+capstone_meta = text("xemu-features/dependencies/capstone/UPSTREAM_VERSION.txt")
+if capstone_meta:
+    for required in [
+        "Capstone Engine 5.0.9",
+        "022575848782a4801fd150fdbc927effcbca0864",
+        "1b70351879f6998998ebcbe09bd5f3c5e27127e985af14722cbe52c11c35178e",
+        "Local modifications to upstream source: none",
+    ]:
+        if required not in capstone_meta:
+            fail(f"Capstone provenance metadata missing: {required}")
+    vendor_license = ROOT / "xemu-features/dependencies/capstone/upstream/LICENSE.TXT"
+    if (ROOT / "xemu-features/dependencies/capstone/upstream").is_dir() and not vendor_license.is_file():
+        fail("bundled Capstone source is missing upstream/LICENSE.TXT")
 
 # Human-readable lineage should stay beside the machine-readable LGPL markers
 # for bridge files derived from upstream renderer/APU code.
