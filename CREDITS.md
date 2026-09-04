@@ -20,8 +20,11 @@ See `LICENSE` and `COPYING` for the licensing of the base project.
 
 ## Third-party libraries
 
-Features in this fork depend on the following libraries, which are **not**
-bundled and must be installed to build:
+Some features in this fork can use host-provided libraries. Feature-owned
+bundled dependencies, when introduced, are kept under
+`xemu-features/dependencies/` and retain their own upstream licenses and notices.
+
+Host-provided optional libraries currently include:
 
 | Library | Used for | License |
 | --- | --- | --- |
@@ -93,6 +96,8 @@ The expanded custom feature work includes areas such as:
 - experimental Free Camera functionality
 - custom hotkey/notification/UI improvements
 - feature-wide optimization and correctness work
+- XDVDFS/disc-file modding and filesystem-browser development
+- feature-owned third-party dependency integration and portability work
 
 ### Development assistance
 
@@ -131,7 +136,9 @@ infrastructure, or other upstream work.
 Custom features use or interface with existing in-tree or optional components
 such as:
 
-- **Capstone** — x86 disassembly
+- **Capstone** — x86 disassembly; currently host-detected, with the custom-fork
+  dependency policy reserving `xemu-features/dependencies/capstone/` for a
+  pinned bundled copy when that integration is committed
 - **libwebp** — WebP texture replacement/animation support
 - **stb_image / stb_image_write** — image decode/write paths
 - **xxHash / XXH3** — source identities and fingerprints used by asset tooling

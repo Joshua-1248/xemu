@@ -35,6 +35,15 @@ Small integration changes can exist outside `xemu-features/` when access to a
 native emulator, renderer, APU, or UI path is necessary. Such modifications do
 not change the ownership or license of the upstream files in which they appear.
 
+### Feature-owned dependencies
+
+When this fork vendors a third-party library specifically for custom features,
+its source belongs under `xemu-features/dependencies/` where practical. Vendored
+code remains third-party code: its original copyright, license, disclaimer,
+provenance, and any required redistribution notices must be preserved. The
+location of a dependency inside `xemu-features/` does not make it fork-authored
+or relicense it under the fork's default custom-source terms.
+
 ## Licensing
 
 This repository contains code under multiple licenses.

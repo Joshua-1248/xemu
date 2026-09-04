@@ -1,8 +1,9 @@
 # xemu — Joshua-1248 fork
 
-A fork of [xemu](https://github.com/xemu-project/xemu), the Original Xbox
-emulator, adding texture replacement, procedural texture shaders, a cheat and
-patch engine, and an in-emulator disassembler.
+A feature-focused fork of [xemu](https://github.com/xemu-project/xemu), the Original Xbox
+emulator, adding integrated modding, asset-replacement, debugging, memory,
+cheat/patch, TAS, scripting, geometry/audio tooling, presentation controls, and
+other development-oriented features while retaining upstream xemu as the base.
 
 For the emulator itself — what it is, how to set up a BIOS and hard disk image,
 compatibility — see **[xemu.app](https://xemu.app)**. This README covers only
@@ -106,8 +107,11 @@ AddressSanitizer and UndefinedBehaviorSanitizer.
 breakpoints, watchpoints, single-stepping, and a memory viewer that can be
 addressed in either the virtual or physical address space.
 
-Requires capstone at build time. Without it the emulator still builds and runs;
-the window reports that disassembly is unavailable.
+Capstone provides the x86 decoder used by the disassembler. The current tree can
+use a system-provided Capstone at build time. The fork reserves
+`xemu-features/dependencies/` for feature-owned bundled dependencies so custom
+dependencies can be kept together without scattering third-party source through
+upstream xemu/QEMU directories.
 
 > The memory viewer and the Step Over / Step Out / Run-to-cursor buttons are
 > lightly tested. Step Out reads the return address from `[ebp+4]`, so it will
@@ -134,18 +138,20 @@ the window reports that disassembly is unavailable.
 ## Building
 
 Same as upstream — see the
-[xemu build docs](https://xemu.app/docs/download/#building) — with two optional
-extra packages.
+[xemu build docs](https://xemu.app/docs/download/#building) — with optional
+feature dependencies where applicable.
+
+At present, libwebp and Capstone may be provided by the host build environment:
 
 ```sh
 sudo apt install libwebp-dev libcapstone-dev   # Debian/Ubuntu/Mint
 brew install webp capstone                     # macOS
 ```
 
-Both are optional. Without libwebp, `.webp` replacements are skipped. Without
-capstone, the disassembler window reports no disassembly. Everything else works
-either way, and the tree builds on Linux, macOS and Windows with neither
-installed.
+The custom-fork policy is to place feature-owned bundled dependencies under
+`xemu-features/dependencies/` rather than scattering them through upstream-owned
+source directories. A bundled dependency keeps its own upstream license and
+provenance; bundling does not change the license of that third-party component.
 
 ```sh
 ./build.sh
@@ -191,28 +197,22 @@ based on [QEMU](https://www.qemu.org/): the emulator as a whole is under the
 `COPYING.LIB` in this repository.
 
 Each source file carries its own licensing information. Files added by this
-fork are GPL-2.0-or-later. Modifications to existing files keep the licence of
-the file they are made in — the NV2A renderer files this fork extends are
-LGPL-2.1-or-later.
+fork are GPL-2.0-or-later unless a more specific file notice applies.
+Modifications to existing files keep the licence of the file they are made in —
+for example, inherited renderer/APU code may remain LGPL-2.1-or-later.
 
-Third-party code:
+Third-party code retains its own license and copyright notices regardless of
+where it is located in this repository. A dependency placed under
+`xemu-features/dependencies/` does **not** become fork-authored or GPL merely by
+being stored there.
 
-| Component | Use | Licence |
-| --- | --- | --- |
-| [stb_image](https://github.com/nothings/stb) | Decoding PNG and GIF replacements | MIT or Public Domain |
-| [stb_image_write](https://github.com/nothings/stb) | Writing dumped textures as PNG | MIT or Public Domain |
-| [libwebp](https://developers.google.com/speed/webp) | Decoding WebP replacements | BSD-3-Clause |
-| [capstone](https://www.capstone-engine.org/) | x86 disassembly | BSD-3-Clause |
+See `THIRD_PARTY_NOTICES.md`, `NOTICE.md`, `CREDITS.md`, `licenses/`, and the
+individual source/component notices for attribution and redistribution terms.
 
-`stb_image.h` ships with upstream xemu; `stb_image_write.h` is added by this
-fork and keeps its own licence notice in the file. libwebp and capstone are not
-bundled — they are linked from the system if present.
-
-Texture packs, replacement images and `.shader` files are user-authored data
-and are not covered by this project's licence. Their authors keep their own
-rights in them.
-
-See `CREDITS.md` for attribution.
+Texture packs, replacement images, audio packs, scripts, dumps, and `.shader`
+files are user-authored data and are not automatically covered by this project's
+license. Their authors keep their own rights and remain responsible for the
+rights to any third-party material they use.
 
 ---
 
@@ -382,6 +382,7 @@ xemu-features/
 ├── audio-packs/
 ├── cheats/
 ├── debug-tools/
+├── dependencies/      feature-owned third-party dependencies
 ├── fast-forward/
 ├── freecam/
 ├── geometry-dumper/
@@ -390,6 +391,18 @@ xemu-features/
 ├── tas/
 └── texture-packs/
 ```
+
+### Bundled dependency policy
+
+Custom-fork dependencies that need to be shipped in-tree belong under
+[`xemu-features/dependencies/`](xemu-features/dependencies/). Each bundled
+component must retain its original license/copyright notices, record its exact
+upstream project and version/commit, document any local changes, and be included
+in the repository's third-party notices and outbound binary-license bundle when
+required.
+
+This directory is a containment rule for custom-fork dependencies; it does not
+move, rename, or relicense dependencies inherited from upstream xemu/QEMU.
 
 ### Builds and support
 
@@ -429,6 +442,7 @@ The authoritative licensing information remains in:
 - individual source-file copyright/license headers
 - [`CREDITS.md`](CREDITS.md)
 - [`NOTICE.md`](NOTICE.md)
+- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
 
 Modified upstream files retain their applicable upstream license terms.
 Third-party components retain their own licenses and notices.

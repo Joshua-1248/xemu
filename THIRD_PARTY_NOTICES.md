@@ -94,9 +94,25 @@ Project: <https://www.capstone-engine.org/>
 
 License: **BSD-3-Clause**.
 
-Use: guest x86 disassembly. The fork normally links to a system-provided copy.
-If a distributor ships or statically links Capstone, its notice must accompany
-that build. A retained BSD notice is provided as `licenses/capstone.license.txt`.
+Use: guest x86 disassembly. The current repository can link to a system-provided
+copy. The custom-fork dependency policy reserves
+`xemu-features/dependencies/capstone/` for a pinned bundled copy when that
+integration is committed. A bundled or statically linked Capstone remains
+BSD-3-Clause software and must retain/accompany its upstream notice. A retained
+BSD notice is provided as `licenses/capstone.license.txt`.
+
+Do not copy an arbitrary Capstone tree from another emulator fork. The preferred
+provenance path is an official Capstone release/commit, recorded alongside the
+vendored source with its original license and any local integration notes.
+
+### `xemu-features/dependencies/` policy
+
+Third-party source vendored specifically for the Joshua-1248 feature layer is
+kept under `xemu-features/dependencies/` where practical. Each dependency should
+record its official upstream project, pinned version or commit, license, local
+patches (if any), and build/linkage purpose. Original notices must remain
+intact. This organizational rule does not alter the dependency's license and
+does not apply retroactively to dependencies inherited from upstream xemu/QEMU.
 
 ### Upstream-derived feature adapters
 
