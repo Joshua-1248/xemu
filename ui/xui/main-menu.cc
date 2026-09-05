@@ -856,7 +856,7 @@ void MainMenuAudioView::Draw()
     char buf[96];
     if (volume_max > 1.0f) {
         snprintf(buf, sizeof(buf),
-                 "0%%  —  100%%  —  200%%   (Current: %d%%)",
+                 "0%%  —  100%%  —  200%%  —  300%%   (Current: %d%%)",
                  (int)(g_config.audio.volume_limit * 100.0f + 0.5f));
     } else {
         snprintf(buf, sizeof(buf), "Current: %d%%",

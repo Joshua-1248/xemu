@@ -24,6 +24,9 @@
 #include "hw/xbox/nv2a/pgraph/s3tc.h"
 #include "hw/xbox/nv2a/pgraph/vsh_regs.h"
 #include "hw/xbox/nv2a/pgraph/psh_regs.h"
+#ifdef CONFIG_OPENGL
+#include "hw/xbox/nv2a/pgraph/gl/renderer.h"
+#endif
 #include "nv2a_vsh_emulator.h"
 #include "qemu/fast-hash.h"
 #include "ui/xemu-settings.h"
@@ -35,6 +38,12 @@
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <math.h>
+
+/* Late programmable-freecam classification happens after the backend's
+ * draw_begin. OpenGL has already selected its shader by then, so a draw that
+ * is classified as 3D and transformed late needs one feature-owned rebind.
+ * The GL header is included only when that backend is built; Vulkan selects its
+ * pipeline/shader later in the pre-draw path and needs no equivalent refresh. */
 
 #define GEOM_PATH_CAP 1024
 #define GEOM_ERROR_CAP 512
@@ -1657,6 +1666,148 @@ static bool geometry_evaluate_post_vsh_texcoords(PGRAPHState *pg,
 {
     return geometry_evaluate_post_vsh_texcoords_masked(
         pg, vertices, (1u << NV2A_MAX_TEXTURES) - 1u, NULL);
+}
+
+static bool geometry_freecam_current_vertex_count(PGRAPHState *pg,
+                                                  uint32_t *count)
+{
+    if (!pg || !count) {
+        return false;
+    }
+    if (pg->draw_arrays_length) {
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < pg->draw_arrays_length; ++i) {
+            const int32_t draw_count = pg->draw_arrays_count[i];
+            if (draw_count < 0) {
+                return false;
+            }
+            total += (uint32_t)draw_count;
+            if (total > UINT32_MAX) {
+                return false;
+            }
+        }
+        *count = (uint32_t)total;
+        return true;
+    }
+    if (pg->inline_elements_length) {
+        *count = pg->inline_elements_length;
+        return true;
+    }
+    if (pg->inline_buffer_length) {
+        *count = pg->inline_buffer_length;
+        return true;
+    }
+    if (pg->inline_array_length) {
+        uint32_t offsets[NV2A_VERTEXSHADER_ATTRIBUTES];
+        uint32_t vertex_size = 0;
+        if (!geometry_inline_array_layout(pg, offsets, &vertex_size) ||
+            vertex_size == 0) {
+            return false;
+        }
+        const uint64_t total_bytes = (uint64_t)pg->inline_array_length * 4u;
+        const uint64_t total = total_bytes / vertex_size;
+        if (total == 0 || total > UINT32_MAX) {
+            return false;
+        }
+        *count = (uint32_t)total;
+        return true;
+    }
+    return false;
+}
+
+static bool geometry_freecam_three_vertex_triangle_primitive(PGRAPHState *pg)
+{
+    switch (pg->primitive_mode) {
+    case PRIM_TYPE_TRIANGLES:
+    case PRIM_TYPE_TRIANGLE_STRIP:
+    case PRIM_TYPE_TRIANGLE_FAN:
+    case PRIM_TYPE_POLYGON:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void geometry_freecam_refresh_gl_shader_if_late(
+    PGRAPHState *pg, bool transformed)
+{
+#ifdef CONFIG_OPENGL
+    if (transformed && g_geometry_original_draw_begin == pgraph_gl_draw_begin) {
+        pgraph_gl_bind_shaders(pg);
+    }
+#else
+    (void)pg;
+    (void)transformed;
+#endif
+}
+
+/* Resolve only the programmable signatures that freecam deliberately left
+ * pending at draw_begin. Definitely non-three-vertex signatures are cached and
+ * return to the immediate hot path; exact three-vertex candidates are rechecked
+ * each time so shared shader/state cannot inherit a stale screen decision. For
+ * those candidates, run the original guest VSH for exactly three vertices and
+ * hand original oPos to freecam's strict oversized-fullscreen-triangle test. */
+static void geometry_freecam_resolve_pending_programmable(NV2AState *d)
+{
+    if (!d || !xemu_freecam_renderer_programmable_classification_pending()) {
+        return;
+    }
+
+    PGRAPHState *pg = &d->pgraph;
+    uint32_t vertex_count = 0;
+    if (!geometry_freecam_current_vertex_count(pg, &vertex_count)) {
+        const bool transformed =
+            xemu_freecam_renderer_resolve_programmable_draw(d, false, NULL);
+        geometry_freecam_refresh_gl_shader_if_late(pg, transformed);
+        return;
+    }
+
+    if (vertex_count != 3 ||
+        !geometry_freecam_three_vertex_triangle_primitive(pg)) {
+        const bool transformed =
+            xemu_freecam_renderer_resolve_programmable_draw(d, true, NULL);
+        geometry_freecam_refresh_gl_shader_if_late(pg, transformed);
+        return;
+    }
+
+    GeometryVshEvalContext eval_ctx;
+    if (!geometry_vsh_eval_context_init(pg, 0, &eval_ctx) ||
+        eval_ctx.transform_mode != 2 || !eval_ctx.cached ||
+        !eval_ctx.cached->program_ready) {
+        const bool transformed =
+            xemu_freecam_renderer_resolve_programmable_draw(d, false, NULL);
+        geometry_freecam_refresh_gl_shader_if_late(pg, transformed);
+        return;
+    }
+
+    g_autoptr(GArray) vertices =
+        g_array_sized_new(FALSE, FALSE, sizeof(GeometryVertex), 3);
+    g_autoptr(GArray) segments =
+        g_array_sized_new(FALSE, FALSE, sizeof(GeometrySegment), 1);
+    GeometrySourceKind source = GEOM_SOURCE_NONE;
+    const uint16_t input_mask = eval_ctx.cached->input_mask;
+    bool valid = geometry_collect_vertices_masked(
+        d, vertices, segments, &source, input_mask);
+    valid = valid && vertices->len == 3 && segments->len == 1 &&
+            g_array_index(segments, GeometrySegment, 0).vertex_count == 3;
+
+    float positions[3][4];
+    if (valid) {
+        for (guint i = 0; i < 3; ++i) {
+            GeometryVertex *v = &g_array_index(vertices, GeometryVertex, i);
+            if (!geometry_eval_programmable_texcoords(pg, &eval_ctx, v, 0) ||
+                !v->post_vsh_position_valid) {
+                valid = false;
+                break;
+            }
+            memcpy(positions[i], v->post_vsh_position, sizeof(positions[i]));
+        }
+    }
+    geometry_vsh_eval_context_destroy(&eval_ctx);
+
+    const bool transformed = xemu_freecam_renderer_resolve_programmable_draw(
+        d, valid, valid ? positions : NULL);
+    geometry_freecam_refresh_gl_shader_if_late(pg, transformed);
 }
 
 
@@ -4458,6 +4609,7 @@ static void geometry_capture_draw_begin(NV2AState *d)
  * emitted by pgraph_expand_draw_arrays() before END. */
 static void geometry_capture_draw_end(NV2AState *d)
 {
+    geometry_freecam_resolve_pending_programmable(d);
     geometry_material_update_camera_headlight(d);
     const bool disable_cull = geometry_capture_before_backend_draw(d);
     geometry_call_backend_draw(d, g_geometry_original_draw_end, disable_cull);
@@ -4466,6 +4618,7 @@ static void geometry_capture_draw_end(NV2AState *d)
 
 static void geometry_capture_flush_draw(NV2AState *d)
 {
+    geometry_freecam_resolve_pending_programmable(d);
     geometry_material_update_camera_headlight(d);
     const bool disable_cull = geometry_capture_before_backend_draw(d);
     geometry_call_backend_draw(d, g_geometry_original_flush_draw, disable_cull);

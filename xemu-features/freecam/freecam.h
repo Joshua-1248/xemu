@@ -29,6 +29,7 @@ typedef struct XemuFreecamSettings {
     bool capture_mouse;
     bool invert_mouse_y;
     bool fov_override;
+    bool protect_screen_space;
     uint32_t render_mode;
     float move_speed;
     float boost_multiplier;
@@ -56,14 +57,26 @@ typedef struct XemuFreecamStatus {
     uint64_t fixed_composite_inference_rejected;
     uint64_t fixed_composite_inferred_transformed_draws;
     uint64_t fixed_mmat_reconstructed_transformed_draws;
+    uint64_t fixed_pmat_inference_attempts;
+    uint64_t fixed_pmat_inference_rejected;
+    uint64_t fixed_pmat_reconstructed_transformed_draws;
+    uint64_t fixed_affine_inference_attempts;
+    uint64_t fixed_affine_inference_rejected;
+    uint64_t fixed_affine_inferred_transformed_draws;
     uint64_t fixed_reconstructed_fallback_draws;
     uint64_t fixed_nonperspective_passthrough_draws;
+    uint64_t fixed_nonperspective_depth_eligible_draws;
+    uint64_t fixed_nonperspective_depth_transformed_draws;
+    uint64_t fixed_validated_world_flat_guard_bypasses;
     uint64_t programmable_draws;
     uint64_t programmable_tail_eligible_draws;
     uint64_t programmable_transformed_draws;
     uint64_t programmable_no_room_draws;
     uint64_t programmable_no_constants_draws;
     uint64_t programmable_relative_constant_draws;
+    uint64_t programmable_classification_deferred_draws;
+    uint64_t programmable_screen_space_detected_draws;
+    uint64_t programmable_screen_space_passthrough_draws;
     uint64_t transformed_draws;
     uint64_t transform_failures;
     XemuFreecamSettings settings;
@@ -85,6 +98,19 @@ void xemu_freecam_rotate(float yaw_degrees, float pitch_degrees,
 
 /* Renderer-thread hooks consumed by the feature-owned PGRAPH wrapper. */
 void xemu_freecam_renderer_draw_begin(struct NV2AState *d);
+/* Programmable draws whose screen-space role is not known yet are deferred
+ * until the feature-owned geometry wrapper has the complete draw.  The
+ * resolver returns true only when it applied the programmable transform late;
+ * OpenGL callers then refresh the already-bound shader before drawing.
+ *
+ * `positions` is either NULL for a definitely non-triangle/world draw, or
+ * exactly three original guest-VSH oPos vectors.  `classification_valid=false`
+ * means observation failed; old freecam behavior is retained without caching
+ * a guess. */
+bool xemu_freecam_renderer_programmable_classification_pending(void);
+bool xemu_freecam_renderer_resolve_programmable_draw(
+    struct NV2AState *d, bool classification_valid,
+    const float positions[3][4]);
 void xemu_freecam_renderer_draw_end(struct NV2AState *d);
 void xemu_freecam_renderer_abort_draw(struct NV2AState *d);
 

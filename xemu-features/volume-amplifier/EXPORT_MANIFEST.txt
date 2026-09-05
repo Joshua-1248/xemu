@@ -1,4 +1,4 @@
-0–200% Volume Amplifier — Phase 4 independent export manifest
+0–300% Volume Amplifier + Mute Hotkey — independent export manifest
 
 COPY DIRECTORY:
   xemu-features/volume-amplifier/
@@ -9,8 +9,16 @@ BUILD OPTION:
 CONFIG MACRO:
   CONFIG_XEMU_FEATURE_VOLUME_AMPLIFIER
 
+FEATURE BEHAVIOR:
+- Output-volume extension: 0–300% / 0.0x–3.0x.
+- Default mute toggle hotkey: M.
+- Mute is runtime-only and does not overwrite the configured volume.
+- SDL event watcher changes only atomic mute state; audio gain is changed from
+  the existing monitor/audio path.
+
 CORE/FRONTEND INTEGRATION SITES:
-- hw/xbox/mcpx/apu/monitor.c — one gain-application/reset boundary, with the native 0–100% fallback retained in core.
+- hw/xbox/mcpx/apu/monitor.c — one gain-application/reset boundary, with the
+  native 0–100% fallback retained in core.
 - ui/xui/main-menu.cc and ui/xui/popup-menu.cc — slider maximum query.
 - hw/xbox/mcpx/apu/meson.build — conditional source inclusion.
 

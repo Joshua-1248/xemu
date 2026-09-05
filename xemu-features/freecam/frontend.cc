@@ -150,6 +150,20 @@ static void DrawFreecamAdvancedInfo(const XemuFreecamStatus &status)
     }
     ImGui::Text("    MMAT-assisted true-view: %llu",
                 (unsigned long long)status.fixed_mmat_reconstructed_transformed_draws);
+    ImGui::Text("    Validated PMAT view: %llu",
+                (unsigned long long)status.fixed_pmat_reconstructed_transformed_draws);
+    if (status.fixed_pmat_inference_attempts) {
+        ImGui::Text("      PMAT split attempts: %llu  rejected: %llu",
+                    (unsigned long long)status.fixed_pmat_inference_attempts,
+                    (unsigned long long)status.fixed_pmat_inference_rejected);
+    }
+    ImGui::Text("    General affine CMAT view: %llu",
+                (unsigned long long)status.fixed_affine_inferred_transformed_draws);
+    if (status.fixed_affine_inference_attempts) {
+        ImGui::Text("      Affine perspective attempts: %llu  rejected: %llu",
+                    (unsigned long long)status.fixed_affine_inference_attempts,
+                    (unsigned long long)status.fixed_affine_inference_rejected);
+    }
     ImGui::Text("  Projective transforms/fallbacks: %llu",
                 (unsigned long long)status.fixed_projective_transformed_draws);
     if (status.fixed_reconstructed_fallback_draws) {
@@ -157,8 +171,21 @@ static void DrawFreecamAdvancedInfo(const XemuFreecamStatus &status)
                     (unsigned long long)status.fixed_reconstructed_fallback_draws);
     }
     if (status.fixed_nonperspective_passthrough_draws) {
-        ImGui::Text("  2D/non-perspective draws left unchanged: %llu",
+        ImGui::Text("  Flat no-depth screen draws left unchanged: %llu",
                     (unsigned long long)status.fixed_nonperspective_passthrough_draws);
+    }
+    if (status.fixed_nonperspective_depth_eligible_draws) {
+        ImGui::Text("  Flat depth-active draws allowed through: %llu",
+                    (unsigned long long)
+                        status.fixed_nonperspective_depth_eligible_draws);
+        ImGui::Text("    ...successfully transformed: %llu",
+                    (unsigned long long)
+                        status.fixed_nonperspective_depth_transformed_draws);
+    }
+    if (status.fixed_validated_world_flat_guard_bypasses) {
+        ImGui::Text("  Validated 3D draws bypassing flat-screen guard: %llu",
+                    (unsigned long long)
+                        status.fixed_validated_world_flat_guard_bypasses);
     }
     ImGui::Text("Programmable VSH draws seen: %llu",
                 (unsigned long long)status.programmable_draws);
@@ -166,6 +193,21 @@ static void DrawFreecamAdvancedInfo(const XemuFreecamStatus &status)
                 (unsigned long long)status.programmable_tail_eligible_draws);
     ImGui::Text("  Programmable draws transformed: %llu",
                 (unsigned long long)status.programmable_transformed_draws);
+    if (status.programmable_classification_deferred_draws) {
+        ImGui::Text("  Screen-space classification deferred: %llu",
+                    (unsigned long long)
+                        status.programmable_classification_deferred_draws);
+    }
+    if (status.programmable_screen_space_detected_draws) {
+        ImGui::Text("  Fullscreen triangles detected: %llu",
+                    (unsigned long long)
+                        status.programmable_screen_space_detected_draws);
+    }
+    if (status.programmable_screen_space_passthrough_draws) {
+        ImGui::Text("  Screen-space draws left unchanged: %llu",
+                    (unsigned long long)
+                        status.programmable_screen_space_passthrough_draws);
+    }
     if (status.programmable_relative_constant_draws) {
         ImGui::Text("  Skipped: relative c[A0+n] reads: %llu",
                     (unsigned long long)status.programmable_relative_constant_draws);
@@ -216,6 +258,16 @@ static void DrawFreecamControls(XemuFreecamStatus &status)
                      IM_ARRAYSIZE(render_modes))) {
         settings.render_mode = (uint32_t)render_mode;
         settings_changed = true;
+    }
+    settings_changed |= ImGui::Checkbox(
+        "Protect fullscreen / screen-space passes",
+        &settings.protect_screen_space);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Leave recognized fullscreen programmable triangles and "
+            "high-confidence flat/no-depth fixed-function presentation passes "
+            "anchored to the guest screen. Depth-active fixed-function geometry "
+            "is allowed through even when its CMAT has no perspective-W.");
     }
 
     ImGui::SeparatorText("Movement");
@@ -278,12 +330,12 @@ static void DrawFreecamInfo(const XemuFreecamStatus &status)
 {
     if (status.settings.render_mode == XEMU_FREECAM_RENDER_RECONSTRUCTED_VIEW) {
         ImGui::TextWrapped(
-            "Reconstructed View first factors a camera-like 3D view and "
-            "perspective directly from CMAT, which works even when a title "
-            "keeps PMAT/MMAT0 stale. MMAT0+CMAT recovery remains a secondary "
-            "route. Perspective 3D draws that still cannot be recovered fall "
-            "back to Projective compatibility; obvious 2D/HUD draws are left "
-            "unchanged instead of being warped with the world.");
+            "Reconstructed View keeps camera motion before the perspective "
+            "divide. It validates several fixed-function routes: camera-like "
+            "CMAT recovery, MMAT-assisted recovery, a guest-PMAT split, then "
+            "the general affine CMAT reconstruction. Only perspective draws "
+            "that fail all validated routes fall back to Projective "
+            "compatibility; obvious 2D/HUD draws stay in screen space.");
     } else {
         ImGui::TextWrapped(
             "Projective compatibility preserves the Milestone 3.1 behavior: "
@@ -295,10 +347,11 @@ static void DrawFreecamInfo(const XemuFreecamStatus &status)
         ImGui::Spacing();
         ImGui::TextWrapped(
             "Programmable VSH draws keep the Milestone 3.1 post-VSH "
-            "compatibility transform in both camera modes. Reconstructed View "
-            "currently changes the fixed-function path, where Xemu has enough "
-            "guest MMAT/CMAT state to insert translation before projection "
-            "without guessing a game's VSH constant layout.");
+            "compatibility transform in both camera modes, but screen-space "
+            "protection now recognizes the oversized right-triangle pattern "
+            "commonly used for fullscreen post-processing/compositing. Those "
+            "passes stay anchored to the guest screen while ordinary 3D VSH "
+            "draws continue through the free-camera transform.");
     }
 
     ImGui::Spacing();
@@ -307,7 +360,8 @@ static void DrawFreecamInfo(const XemuFreecamStatus &status)
         "camera. Projective compatibility keeps the original M3.1 renderer "
         "reprojection. Reconstructed View moves supported fixed-function "
         "geometry in recovered view space and falls back per draw when needed. "
-        "Programmable-VSH draws still use the safe post-VSH tail. CPU-side "
+        "Programmable-VSH 3D draws still use the safe post-VSH tail while "
+        "recognized fullscreen passes remain untouched. CPU-side "
         "portal/frustum/LOD culling is still owned by the game, so geometry the "
         "game never submits cannot be recovered by either renderer mode.");
 }
