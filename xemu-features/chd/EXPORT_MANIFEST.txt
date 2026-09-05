@@ -1,0 +1,41 @@
+Xbox DVD CHD — independent export manifest
+
+COPY DIRECTORY:
+  xemu-features/chd/
+
+DEPENDENCY DIRECTORY:
+  xemu-features/dependencies/libchdr/
+
+BUILD OPTION:
+  xemu_feature_chd
+
+CONFIG MACRO:
+  CONFIG_XEMU_FEATURE_CHD
+
+FEATURE BEHAVIOR:
+- Read-only CHDv5 DVD/XISO support through the standard Load Disc workflow.
+- Canonical input is a standalone `chdman createdvd` image.
+- The block driver exposes only the exact logical DVD byte stream.
+- Decoded hunks use a bounded adaptive 16 MiB / 4-way cache with graceful
+  fallback to a single hunk under memory pressure.
+- Parent/delta CHDs are rejected in V1.
+
+CORE/FRONTEND INTEGRATION SITES:
+- meson.build / meson_options.txt / build.sh — feature gate and pinned libchdr
+  materialization/build integration.
+- system/vl.c — startup disc selects `format=chd` only for CHD paths.
+- ui/xemu.c — Load Disc format selection, mounted-medium refresh, extraction
+  barrier, and shutdown cancellation before block teardown.
+- ui/xui/actions.cc / ui/xui/popup-menu.cc — CHD picker/games-list exposure
+  only when the feature is enabled.
+- xemu-features/disc-modding/xdvdfs.hh/.cc — logical-reader abstraction shared
+  by raw XISO and decoded CHD.
+- xemu-features/disc-modding/core.cc/.hh and disc-overlay.h — mounted logical-
+  medium parsing/extraction and safe media-change synchronization.
+- xemu-features/disc-modding/mounted-disc-bridge.c/.h — narrow C boundary for
+  QEMU BlockBackend/AioContext APIs so the C++ browser never includes C-only
+  QEMU headers.
+- scripts/gen-license.py / licenses/libchdr.license.txt / THIRD_PARTY_NOTICES.md
+  / CREDITS.md — dependency attribution and outbound license generation.
+
+See README.md for the media contract and user workflow.

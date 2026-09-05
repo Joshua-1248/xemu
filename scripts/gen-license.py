@@ -500,6 +500,14 @@ LIBS = [
         version="5.0.9",
     ),
     Lib(
+        "libchdr",
+        "https://github.com/rtissera/libchdr",
+        bsd_3clause,
+        license_path="licenses/libchdr.license.txt",
+        ships_static=all_platforms,
+        version="0.3.0",
+    ),
+    Lib(
         "glib-2.0",
         "https://gitlab.gnome.org/GNOME/glib",
         lgplv2_1,

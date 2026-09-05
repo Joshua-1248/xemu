@@ -71,6 +71,7 @@
 #include "ui/input.h"
 #include "system/system.h"
 #include "xemu-features/disc-modding/disc-overlay.h"
+#include "xemu-features/chd/chd-path.h"
 #include "system/numa.h"
 #include "system/hostmem.h"
 #include "exec/gdbstub.h"
@@ -3095,8 +3096,9 @@ void qemu_init(int argc, char **argv)
     // connected but no media present.
     fake_argv[fake_argc++] = strdup("-drive");
     char *escaped_dvd_path = strdup_double_commas(dvd_path);
-    fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
-        escaped_dvd_path);
+    fake_argv[fake_argc++] = xemu_chd_path_is_chd(dvd_path)
+        ? g_strdup_printf("index=1,media=cdrom,file=%s,format=chd", escaped_dvd_path)
+        : g_strdup_printf("index=1,media=cdrom,file=%s", escaped_dvd_path);
     free(escaped_dvd_path);
 
     fake_argv[fake_argc++] = strdup("-display");
