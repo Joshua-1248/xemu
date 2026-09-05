@@ -104,8 +104,8 @@ AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Disc Files & Mods
 
-**Misc → Disc Files & Mods.** Browse the mounted Xbox disc's XDVDFS filesystem
-directly without extracting the XISO first. The browser shows directories,
+**Misc → Disc Files & Mods.** Browse the mounted Xbox disc's XDVDFS filesystem directly from ISO/XISO or
+CHD media without extracting or repacking the image first. The browser shows directories,
 files, sizes, type, sector/LBA information, and whether a per-title override is
 present or active.
 
@@ -130,6 +130,26 @@ title after a replacement change is safest because games may cache filesystem
 metadata.
 
 See [`xemu-features/disc-modding/README.md`](xemu-features/disc-modding/README.md).
+
+### Xbox DVD CHD images
+
+The fork supports standard **CHDv5 Xbox DVD images** created with `chdman
+createdvd`. CHDs are loaded through the normal **Machine → Load Disc…** path
+alongside ISO/XISO images; there is no separate CHD mount workflow.
+
+The CHD layer is read-only and exposes the exact logical 2048-byte-sector DVD
+stream to Xemu's existing IDE/ATAPI path. It does not extract a temporary ISO,
+rewrite the CHD, or add CD-style track/pregap behavior.
+
+Because **Disc Files & Mods** reads the mounted logical medium, filesystem
+browsing, individual/whole-disc extraction, and per-title file overrides work
+with CHD-backed games as well as raw ISO/XISO images.
+
+The implementation uses bundled **libchdr 0.3.0** and an adaptive decompressed
+hunk cache. Parent/delta CHDs are intentionally rejected by the current
+implementation.
+
+See [`xemu-features/chd/README.md`](xemu-features/chd/README.md).
 
 ### Disassembler and debugger
 
@@ -170,7 +190,7 @@ Same as upstream — see the
 [xemu build docs](https://xemu.app/docs/download/#building) — with optional
 feature dependencies where applicable.
 
-Capstone is bundled and does **not** need to be installed separately. libwebp
+Capstone and libchdr are bundled and do **not** need to be installed separately. libwebp
 remains an optional host dependency for WebP texture replacement:
 
 ```sh
@@ -365,14 +385,28 @@ See [`xemu-features/cheats/README.md`](xemu-features/cheats/README.md).
 The fork includes an XDVDFS filesystem browser/extractor and a per-title
 disc-file override layer under
 [`xemu-features/disc-modding/`](xemu-features/disc-modding/). It can inspect a
-mounted XISO, extract one file/directory or the entire disc, and mirror
-replacement files into a per-title mod tree without modifying the source image.
+mounted ISO/XISO or CHD, extract one file/directory or the entire disc, and
+mirror replacement files into a per-title mod tree without modifying the source
+image.
 
 Overrides are resolved as Xbox-style case-insensitive paths and are exposed to
 the guest through virtual sectors. Path traversal, symlink escapes, ambiguous
 case collisions, non-regular files, and other unsafe mappings are rejected.
 
 See [`xemu-features/disc-modding/README.md`](xemu-features/disc-modding/README.md).
+
+### Xbox DVD CHD support
+
+Standard CHDv5 Xbox DVD images are supported through the normal disc-loading
+path. The feature-owned CHD block layer is read-only, uses bundled libchdr
+0.3.0, and exposes the logical DVD byte stream to the existing Xemu IDE/ATAPI
+stack.
+
+Disc Files & Mods operates on that logical mounted medium, so browsing,
+extraction, and file overrides work with CHD-backed titles without unpacking
+the image.
+
+See [`xemu-features/chd/README.md`](xemu-features/chd/README.md).
 
 ### TAS / TAStudio
 

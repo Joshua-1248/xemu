@@ -20,7 +20,7 @@ All options default to `true` for the custom fork:
 | Fast Forward | `xemu_feature_fast_forward` | `CONFIG_XEMU_FEATURE_FAST_FORWARD` |
 | Disc Files & Mods | `xemu_feature_disc_modding` | `CONFIG_XEMU_FEATURE_DISC_MODDING` |
 | Xbox DVD CHD | `xemu_feature_chd` | `CONFIG_XEMU_FEATURE_CHD` |
-| 0–200% Volume Amplifier | `xemu_feature_volume_amplifier` | `CONFIG_XEMU_FEATURE_VOLUME_AMPLIFIER` |
+| 0–300% Volume Amplifier | `xemu_feature_volume_amplifier` | `CONFIG_XEMU_FEATURE_VOLUME_AMPLIFIER` |
 
 Example all-off configure arguments:
 
@@ -79,9 +79,27 @@ physical/virtual regions, strings/AOB patterns, paged live results, and direct
 handoff to the Memory viewer, Disassembler, Globals, and watchpoints.
 
 
+## Xbox DVD CHD support
+
+`chd/` provides read-only CHDv5 Xbox DVD image support through the normal Xemu
+disc path. Standard DVD CHDs created with `chdman createdvd` can be selected
+from **Machine → Load Disc…** just like ISO/XISO images; no temporary ISO is
+extracted and the CHD is never rewritten.
+
+The feature exposes the CHD's exact logical 2048-byte-sector DVD stream to the
+existing IDE/ATAPI stack. Disc Files & Mods therefore sees the mounted logical
+XDVDFS filesystem regardless of whether the host image is raw ISO/XISO or CHD,
+and extraction plus per-title file overrides continue to operate normally.
+
+The decoder uses bundled libchdr 0.3.0 and an adaptive decompressed-hunk cache.
+Parent/delta CHDs are intentionally rejected by the current implementation.
+
+See [`chd/README.md`](chd/README.md) for format constraints, implementation
+architecture, tests, and provenance.
+
 ## Development feature: Free Camera
 
-`freecam/` contains the renderer-level free-camera work. Milestone 5 remains
+`freecam/` contains the renderer-level free-camera work. Milestone 8 remains
 feature-owned and is wired through the existing Texture Packs/Geometry Dumper
 renderer shim. Its menu item is exposed by the existing `Misc` feature
 aggregator and F10 toggles the camera. Projective compatibility remains intact.
