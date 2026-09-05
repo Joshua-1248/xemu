@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // xemu custom fork - renderer free camera UI/input frontend
 #include "frontend.hh"
 #include "ui/xui/common.hh"

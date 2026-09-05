@@ -23,3 +23,21 @@ feature directory for provenance and source redistribution.
 
 Upstream project: https://github.com/rtissera/libchdr
 License: BSD-3-Clause (see `LICENSE.libchdr.txt` and upstream license files).
+
+
+## Embedded codec licensing
+
+The pinned libchdr source distribution also contains third-party codec material
+that retains its own terms:
+
+- LZMA SDK 25.01 — public domain
+- dr_flac / dr_libs — Public Domain or MIT No Attribution
+- miniz 3.1.1 — MIT; retained for source provenance but not compiled by Xemu's
+  `CHDR_SYSTEM_ZLIB` build
+- zstd 1.5.7 fallback decoder — BSD-style or GPLv2; compiled only when QEMU's
+  zstd dependency is unavailable
+
+The authoritative notices remain in the vendored source. Supplemental copies
+for outbound packaging live under `licenses/` where applicable. The
+Xemu-specific build glue and CHD adapter remain GPL-2.0-or-later and do not
+relicense any of these third-party components.

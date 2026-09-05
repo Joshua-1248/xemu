@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Deterministic guardrails for the adaptive set-associative CHD hunk cache.
 
 This tests replacement/locality behavior rather than codec performance.  It is

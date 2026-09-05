@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * xemu custom fork - NV2A geometry dumper
  *

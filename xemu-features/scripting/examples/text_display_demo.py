@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Xemu custom-fork Python scripting text-display example.
 import xemu
 

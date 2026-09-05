@@ -127,6 +127,25 @@ duplicate codec implementations; the pinned libchdr LZMA source and its zstd
 fallback remain under the feature dependency tree. See
 `licenses/libchdr.license.txt` and the notices retained inside the upstream tree.
 
+Embedded components retained inside the pinned libchdr source are also kept
+under their own terms:
+
+- **LZMA SDK 25.01** — public domain; the original short notice is retained at
+  `xemu-features/dependencies/libchdr/upstream/deps/lzma-25.01/LICENSE` and
+  mirrored as `licenses/lzma-sdk.license.txt` for outbound packaging.
+- **dr_flac / dr_libs** — Public Domain or MIT No Attribution; the complete
+  dual-license notice remains in
+  `xemu-features/dependencies/libchdr/upstream/include/dr_libs/dr_flac.h` and is
+  mirrored as `licenses/dr_flac.license.txt`.
+- **miniz 3.1.1** — MIT; its copyright and permission notice remains directly
+  in the vendored source. Xemu defines `CHDR_SYSTEM_ZLIB`, so this copy is kept
+  for source provenance but is not compiled into the CHD library.
+- **zstd 1.5.7 fallback decoder** — upstream source is dual-licensed under a
+  BSD-style license or GPLv2. Xemu compiles this fallback only when QEMU's zstd
+  dependency is unavailable; for the xemu binary the GPLv2 option is compatible
+  with and covered by the repository's retained `COPYING` text. Original zstd
+  source headers remain intact.
+
 ### `xemu-features/dependencies/` policy
 
 Third-party source vendored specifically for the Joshua-1248 feature layer is
@@ -218,6 +237,9 @@ multi-license terms.
 | libwebp | `licenses/libwebp.license.txt` | BSD-3-Clause plus retained WebM patent grant |
 | Capstone | `licenses/capstone.license.txt` | BSD-3-Clause |
 | libchdr | `licenses/libchdr.license.txt` | BSD-3-Clause |
+| LZMA SDK (libchdr) | `licenses/lzma-sdk.license.txt` | Public domain |
+| dr_flac / dr_libs (libchdr) | `licenses/dr_flac.license.txt` | Public Domain or MIT No Attribution |
+| Zstandard 1.5.7 fallback (libchdr) | `licenses/zstd-1.5.7.license.txt` | BSD-3-Clause; GPLv2 alternative also available upstream |
 | Xemu Cheat Engine and Trainer / `xemu_trainer_lib` | `licenses/xemu_trainer_lib.license.txt` | MIT |
 | RenderDoc in-application API | `licenses/renderdoc.license.txt` | MIT |
 | gloffscreen | `licenses/gloffscreen.license.txt` | MIT |
@@ -233,8 +255,11 @@ multi-license terms.
   a version that silently becomes stale;
 - derive bundled stb_image/stb_image_write versions from their headers instead of carrying stale manual values;
 - include `stb_image_write`, nlohmann/json, genconfig, keycodemapdb, RenderDoc API, gloffscreen, and the MIT trainer-source provenance notice;
-- include libwebp and Capstone when those optional libraries are present on a
-  platform where the build ships them;
+- include libwebp when that optional library is present on a platform where
+  the build ships it;
+- include the bundled Capstone 5.0.9 and libchdr 0.3.0 notices;
+- include the LZMA SDK and dr_flac notices used by the statically built CHD
+  dependency;
 - fix the fallback license-cache write path to use `self.license_path` instead
   of an undefined variable.
 

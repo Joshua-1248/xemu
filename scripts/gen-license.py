@@ -508,6 +508,22 @@ LIBS = [
         version="0.3.0",
     ),
     Lib(
+        "LZMA SDK (libchdr embedded decoder)",
+        "https://www.7-zip.org/sdk.html",
+        unlicense,
+        license_path="licenses/lzma-sdk.license.txt",
+        ships_static=all_platforms,
+        version="25.01",
+    ),
+    Lib(
+        "dr_flac (libchdr embedded decoder)",
+        "https://github.com/mackron/dr_libs",
+        multi,
+        license_path="licenses/dr_flac.license.txt",
+        ships_static=all_platforms,
+        version="embedded in libchdr 0.3.0",
+    ),
+    Lib(
         "glib-2.0",
         "https://gitlab.gnome.org/GNOME/glib",
         lgplv2_1,

@@ -2,9 +2,12 @@
 
 ## This fork
 
-Texture dumping, texture replacement, animated texture replacement, procedural
-texture shaders, cheat/patch engine, and disassembler/debugger by
-**Joshua-1248** (<https://github.com/Joshua-1248/xemu>).
+Custom-fork maintenance and feature development by **Joshua-1248**
+(<https://github.com/Joshua-1248/xemu>), including texture/audio replacement
+and dumping, material enhancements, cheat/patch tooling, debugger/memory tools,
+TAS/scripting, Fast Forward and presentation controls, Geometry Dumper,
+experimental Free Camera, Disc Files & Mods/XDVDFS tooling, and standard
+read-only Xbox DVD CHDv5 support.
 
 ## Upstream
 
@@ -104,6 +107,8 @@ The expanded custom feature work includes areas such as:
 - custom hotkey/notification/UI improvements
 - feature-wide optimization and correctness work
 - XDVDFS/disc-file modding and filesystem-browser development
+- standard CHDv5 Xbox DVD support and libchdr/QEMU block integration
+- CHD-backed extraction and per-title disc-file overrides
 - feature-owned third-party dependency integration and portability work
 
 ### Development assistance
@@ -149,6 +154,14 @@ such as:
 - **libchdr 0.3.0** — pinned CHD decoder under
   `xemu-features/dependencies/libchdr/upstream/`; BSD-licensed upstream source,
   with the QEMU/Xemu adapter kept in `xemu-features/chd/`
+- **LZMA SDK 25.01** — public-domain decoder source embedded in the pinned
+  libchdr dependency and used by the CHD decoder
+- **dr_flac / dr_libs** — embedded libchdr FLAC decoder, offered upstream as
+  Public Domain or MIT No Attribution
+- **miniz 3.1.1** — retained in the pinned libchdr source distribution under
+  its MIT notice; Xemu's CHD build uses QEMU/system zlib instead
+- **zstd 1.5.7 fallback decoder** — retained in the pinned libchdr source;
+  dual BSD/GPLv2 upstream terms, compiled only when QEMU has no zstd dependency
 - **libwebp** — WebP texture replacement/animation support
 - **stb_image / stb_image_write** — image decode/write paths
 - **xxHash / XXH3** — source identities and fingerprints used by asset tooling

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Deterministic differential fuzz for the CHD driver's hunk-slicing math.
 
 This does not test libchdr codecs; it stress-tests the exact offset/length ->

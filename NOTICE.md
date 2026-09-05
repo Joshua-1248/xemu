@@ -28,8 +28,8 @@ work.
 ## Custom feature layer
 
 Additional modding, replacement, dumping, debugger, scripting, TAS,
-free-camera, and related functionality is implemented primarily under
-`xemu-features/`.
+free-camera, Xbox DVD CHD, XDVDFS filesystem-browser/override, and related
+functionality is implemented primarily under `xemu-features/`.
 
 Small integration changes can exist outside `xemu-features/` when access to a
 native emulator, renderer, APU, or UI path is necessary. Such modifications do
@@ -69,8 +69,9 @@ requirements when no more specific notice exists.
 
 Third-party dependencies and vendored components retain their original
 copyright and license notices. Custom features use or interface with components
-including Capstone, libwebp, stb libraries, xxHash/XXH3, glslang, and other
-libraries present in or supported by the wider xemu/QEMU tree.
+including Capstone, libchdr, the LZMA SDK and dr_flac embedded by libchdr,
+libwebp, stb libraries, xxHash/XXH3, glslang, and other libraries present in or
+supported by the wider xemu/QEMU tree.
 
 See `CREDITS.md` and the corresponding in-tree component notices for
 attribution.

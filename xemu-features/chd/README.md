@@ -66,3 +66,14 @@ lower/uppercase `.chd`, boot and gameplay across multiple Xbox titles, XDVDFS
 browsing, individual/full-filesystem extraction, media replacement/eject parity,
 and live per-title file overrides from a CHD-backed game. A `chdman createdvd`
 -> `extractdvd` round trip was also SHA-256 identical to the source logical ISO.
+
+
+## Licensing and provenance
+
+The Xemu-specific CHD block adapter, path helper, tests, and integration code are
+fork-owned GPL-2.0-or-later code unless a file states otherwise. libchdr 0.3.0
+remains BSD-3-Clause third-party code under
+`xemu-features/dependencies/libchdr/upstream/`; its original notice and embedded
+codec notices are preserved there and indexed by `THIRD_PARTY_NOTICES.md`.
+Nothing in the feature layer relicenses upstream Xemu/QEMU code or the bundled
+third-party decoder sources.
